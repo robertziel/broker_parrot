@@ -411,11 +411,13 @@ class ClaimWorker:
                 self.queue, host=self.host, lease_s=self.lease_s,
             )
         if self.queue == "gpu":
+            from queue_workflows import model_registry
             current_model = getattr(self.model_cache, "current_model", None)
             return node_queue.claim_next_gpu_job(
                 0, current_model,
                 host=self.host, lease_s=self.lease_s,
                 host_priority=self.host_priority,
+                known_models=model_registry.known_ids(),
             )
         return node_queue.claim_next_cpu_job(
             0, host=self.host, lease_s=self.lease_s,

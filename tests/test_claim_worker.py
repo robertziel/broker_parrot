@@ -225,6 +225,47 @@ def test_run_once_parks_input_node_via_outbox_not_module_import():
     assert "awaiting_input" in kinds
 
 
+def test_gpu_claim_skips_job_whose_model_worker_cannot_serve():
+    """Capability gate (regression for the gate dropped in the Phase-5
+    extraction): a gpu worker must NOT claim a job whose required_model isn't in
+    its known_models — a capable peer gets it instead."""
+    run_id = _make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="big", node_module="render",
+        queue="gpu", required_model="model_B",
+    )
+    # This worker only serves model_A → must not claim model_B's job.
+    assert node_queue.claim_next_gpu_job(0, host="h1", known_models=["model_A"]) is None
+    assert node_queue.get_node_job(job_id)["status"] == "queued"
+    # A worker that DOES serve model_B claims it.
+    claimed = node_queue.claim_next_gpu_job(
+        0, host="h2", known_models=["model_A", "model_B"],
+    )
+    assert claimed is not None and claimed["id"] == job_id
+
+
+def test_gpu_claim_falls_back_to_claim_any_without_known_models():
+    """No advertised capability set (worker hasn't heartbeated its registry yet)
+    → claim-any, so a cold/unconfigured worker can't wedge the queue."""
+    run_id = _make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="g", node_module="render",
+        queue="gpu", required_model="model_X",
+    )
+    claimed = node_queue.claim_next_gpu_job(0, host="h", known_models=None)
+    assert claimed is not None and claimed["id"] == job_id
+
+
+def test_gpu_claim_serves_modelless_job_regardless_of_capability():
+    """A job with no required_model is claimable by any gpu worker."""
+    run_id = _make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="g", node_module="x", queue="gpu",
+    )
+    claimed = node_queue.claim_next_gpu_job(0, host="h", known_models=["model_A"])
+    assert claimed is not None and claimed["id"] == job_id
+
+
 def test_run_once_skips_job_under_cancelled_run():
     run_id = _make_run(status="cancelled")
     job_id = node_queue.enqueue_node_job(

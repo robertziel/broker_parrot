@@ -210,6 +210,7 @@ WHERE j.id = (
           WHERE r.id = c.run_id
             AND r.status NOT IN ('cancelled', 'failed')
       )
+      {capability}
     ORDER BY {order}
     FOR UPDATE SKIP LOCKED
     LIMIT 1
@@ -245,7 +246,8 @@ def claim_next_cpu_job(
     is ``priority ASC`` then the ``host_priority``-directed creation
     tiebreak."""
     order = f"c.priority ASC, {_HOST_DIR_TERM}"
-    sql = _CLAIM_SQL.format(order=order)
+    # CPU jobs carry no required_model, so no capability gate applies.
+    sql = _CLAIM_SQL.format(order=order, capability="")
     params = {
         "worker_lane": worker_lane,
         "host": host,
@@ -265,22 +267,36 @@ def claim_next_gpu_job(
     host: str | None = None,
     lease_s: int = DEFAULT_LEASE_S,
     host_priority: int = 0,
+    known_models: Iterable[str] | None = None,
 ) -> dict[str, Any] | None:
     """Atomically grab the next queued GPU job (the GPU claim worker's
     claim).
 
-    Same lease + run-cancel guard as :func:`claim_next_cpu_job`, plus the
-    warm-model affinity tiebreak: rows whose ``required_model`` matches
-    the worker's ``current_model`` (``IS NOT DISTINCT FROM``) sort first
-    within their priority band so consecutive same-model jobs don't
-    reload. ``host_priority`` then breaks the creation-order tie exactly
-    as on CPU."""
+    Same lease + run-cancel guard as :func:`claim_next_cpu_job`, plus:
+
+    * **Capability gate** — only claim a job whose ``required_model`` this
+      worker can serve (in ``known_models``) or that needs no model. Restores
+      the gate the old Celery ``_gpu_should_accept`` enforced (reject+requeue),
+      as a cleaner claim-time filter so an incapable worker never grabs the row
+      — a capable peer does. With no ``known_models`` (worker hasn't advertised
+      its registry yet) it falls back to claim-any so a cold worker can't wedge
+      the queue.
+    * **Warm-model affinity tiebreak** — rows whose ``required_model`` matches
+      the worker's ``current_model`` (``IS NOT DISTINCT FROM``) sort first
+      within their priority band so consecutive same-model jobs don't reload.
+      ``host_priority`` then breaks the creation-order tie exactly as on CPU."""
     order = (
         f"{_AFFINITY_TERM}, "
         f"c.priority ASC, "
         f"{_HOST_DIR_TERM}"
     )
-    sql = _CLAIM_SQL.format(order=order)
+    known = [m for m in (known_models or []) if m]
+    capability = (
+        "AND (c.required_model IS NULL "
+        "OR c.required_model = ANY(%(known_models)s::text[]))"
+        if known else ""
+    )
+    sql = _CLAIM_SQL.format(order=order, capability=capability)
     params = {
         "worker_lane": worker_lane,
         "host": host,
@@ -289,6 +305,8 @@ def claim_next_gpu_job(
         "current_model": current_model,
         "host_dir": _host_dir(host_priority),
     }
+    if known:
+        params["known_models"] = known
     with connection() as conn, conn.cursor() as cur:
         cur.execute(sql, params)
         return cur.fetchone()
