@@ -24,9 +24,31 @@ from queue_workflows import node_queue
 log = logging.getLogger(__name__)
 
 
-def _run_task(task_name: str, reason: str) -> dict:
+def _invoke(fn, reason: str, args: dict):
+    """Call a registered ingest callable. Backward-compatible: a 1-arg
+    ``fn(reason)`` stays valid; a callable that also accepts a second
+    positional/keyword parameter (or ``*args``) additionally receives the
+    per-job ``args`` dict (migration 0008). Anything uninspectable (a builtin,
+    some C callables) falls back to the 1-arg call."""
+    import inspect
+    try:
+        params = list(inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError):
+        return fn(reason)
+    accepts_two = (
+        sum(
+            1 for p in params
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+        ) >= 2
+        or any(p.kind == p.VAR_POSITIONAL for p in params)
+    )
+    return fn(reason, args) if accepts_two else fn(reason)
+
+
+def _run_task(task_name: str, reason: str, args: dict | None = None) -> dict:
     """Dispatch a periodic ingest callable by name → its result dict. Looks the
-    name up in the host-registered ingest dispatch map."""
+    name up in the host-registered ingest dispatch map and passes the per-job
+    ``args`` when the callable accepts them."""
     from queue_workflows.config import get_config
     task_map = get_config().ingest_task_map
     fn = task_map.get(task_name)
@@ -36,7 +58,7 @@ def _run_task(task_name: str, reason: str) -> dict:
             f"(registered: {sorted(task_map)}; register via "
             f"queue_workflows.register_ingest_task)"
         )
-    result = fn(reason)
+    result = _invoke(fn, reason, args or {})
     return result if isinstance(result, dict) else {"result": result}
 
 
@@ -52,7 +74,9 @@ def execute_ingest_job(job: dict) -> str:
     job_id = job["id"]
     t0 = time.time()
     try:
-        result = _run_task(job["task_name"], job.get("reason") or "tick")
+        result = _run_task(
+            job["task_name"], job.get("reason") or "tick", job.get("args"),
+        )
     except Exception as exc:
         err = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
         log.error("[ingest-executor] %s %s", job_id, err)

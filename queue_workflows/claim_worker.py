@@ -70,13 +70,16 @@ NOTIFY_POLL_TIMEOUT_S = 1.0                   # safety poll for a dropped NOTIFY
 # comfortably inside that window.
 HEARTBEAT_INTERVAL_S = 10.0
 
-# Lowest engine migration version that creates the table each queue's claim
-# loop reads (the ``queue_schema_version`` ledger). cpu/gpu draw from
-# ``workflow_node_jobs`` and need the migration-0006 lease columns; fetch/load
-# draw from ``ingest_jobs`` created in migration 0007. A claim worker WAITS for
-# its required version before polling — the orchestrator owns the migration run
-# (``db.bootstrap`` takes no advisory lock), the workers must not race it.
-_REQUIRED_SCHEMA_VERSION = {"cpu": 6, "gpu": 6, "fetch": 7, "load": 7}
+# Lowest engine migration version each queue family's claim loop needs before
+# polling (the ``queue_schema_version`` ledger). cpu/gpu draw from
+# ``workflow_node_jobs`` and need the migration-0006 lease columns; ingest queues
+# draw from ``ingest_jobs`` and need migration 0008 (the ``args`` column + the
+# relaxed queue CHECK that lets host-defined queue names exist — without it a
+# custom-queue row can't be inserted). A claim worker WAITS for its version
+# before polling — the orchestrator owns the migration run (``db.bootstrap`` takes
+# no advisory lock), the workers must not race it.
+_NODE_REQUIRED_VERSION = 6
+_INGEST_REQUIRED_VERSION = 8
 
 
 def _host_label() -> str:
@@ -97,7 +100,8 @@ def budget_for(job: dict) -> int:
 
       * GPU job whose ``required_model`` is in the host's video set → 1800 s;
       * any other GPU job → 8100 s;
-      * fetch/load ingest jobs → their generous sweep budgets;
+      * built-in fetch / load ingest jobs → their generous sweep budgets;
+      * any other (host-defined, G1) ingest queue → ``config.ingest_default_budget_s``;
       * an input node (``node_module`` starts ``__input__``) → 120 s;
       * any other CPU job → 2100 s.
     """
@@ -110,6 +114,9 @@ def budget_for(job: dict) -> int:
         return FETCH_BUDGET_S
     if queue == "load":
         return LOAD_BUDGET_S
+    if queue not in _NODE_QUEUES:
+        # host-defined ingest queue (G1) — configurable default budget.
+        return get_config().ingest_default_budget_s
     if (job.get("node_module") or "").startswith("__input__"):
         return INPUT_BUDGET_S
     return CPU_BUDGET_S
@@ -267,15 +274,13 @@ class HeartbeatEmitter:
       * the **GPU** heartbeat reports ``current_model`` read from the worker's
         :class:`ModelCache` on every tick — the gauge's busy signal. The
         **CPU** heartbeat reports ``current_model=None``.
-      * the ``worker_heartbeats`` CHECK only allows ``queue IN ('cpu','gpu')``,
-        so :func:`start` is a no-op for fetch/load.
+      * ingest workers (fetch/load + any host-defined queue) also heartbeat —
+        migration 0008 dropped the cpu/gpu-only CHECK — reporting
+        ``current_model=None`` so a host's queue gauge shows their liveness.
       * honours ``AI_LEADS_DISABLE_WORKER_HEARTBEAT`` (tests).
 
     Upserts once on :meth:`start` (so the row exists immediately) then refreshes
     every ``interval_s`` until :meth:`stop`."""
-
-    #: Only these queues have a ``worker_heartbeats`` row (table CHECK).
-    _HEARTBEAT_QUEUES = frozenset({"cpu", "gpu"})
 
     def __init__(
         self, *, queue: str, host_label: str, model_cache: Any = None,
@@ -290,11 +295,10 @@ class HeartbeatEmitter:
 
     @property
     def _enabled(self) -> bool:
-        """Heartbeat runs only for cpu/gpu and only when the test opt-out env
-        is unset."""
-        if os.environ.get("AI_LEADS_DISABLE_WORKER_HEARTBEAT"):
-            return False
-        return self._queue in self._HEARTBEAT_QUEUES
+        """Heartbeat runs for every queue family — cpu/gpu node workers AND the
+        ingest workers (migration 0008 dropped the cpu/gpu-only CHECK) — unless
+        the test opt-out env is set."""
+        return not bool(os.environ.get("AI_LEADS_DISABLE_WORKER_HEARTBEAT"))
 
     def _current_model(self) -> str | None:
         """The GPU busy signal: the warm-model slot, read live each tick. NULL
@@ -347,9 +351,10 @@ class HeartbeatEmitter:
 
 #: Queues whose claim worker draws DAG node-jobs from ``workflow_node_jobs``.
 _NODE_QUEUES = frozenset({"cpu", "gpu"})
-#: Queues whose claim worker draws standalone ingest jobs from ``ingest_jobs``.
-_INGEST_QUEUES = frozenset({"fetch", "load"})
-_ALL_QUEUES = _NODE_QUEUES | _INGEST_QUEUES
+#: Default ingest queues (ai_leads byte-compat). The LIVE ingest set is
+#: ``config.ingest_queues`` (host-configurable, G1); any queue NOT in
+#: ``_NODE_QUEUES`` is treated as ingest-family (draws from ``ingest_jobs``).
+_DEFAULT_INGEST_QUEUES = frozenset({"fetch", "load"})
 
 
 class ClaimWorker:
@@ -367,8 +372,9 @@ class ClaimWorker:
         host_priority: int | None = None, lease_s: int = LEASE_S,
         model_cache: Any = None,
     ) -> None:
-        if queue not in _ALL_QUEUES:
-            raise ValueError(f"queue must be in {sorted(_ALL_QUEUES)}, got {queue!r}")
+        valid = _NODE_QUEUES | get_config().ingest_queues
+        if queue not in valid:
+            raise ValueError(f"queue must be in {sorted(valid)}, got {queue!r}")
         self.queue = queue
         self.host = host or _host_label()
         self.host_priority = (
@@ -393,7 +399,9 @@ class ClaimWorker:
 
     @property
     def _is_ingest(self) -> bool:
-        return self.queue in _INGEST_QUEUES
+        # __init__ validated queue ∈ _NODE_QUEUES ∪ config.ingest_queues, so any
+        # non-node queue is a (host-configured) ingest queue (G1).
+        return self.queue not in _NODE_QUEUES
 
     # ── claim ────────────────────────────────────────────────────────────
 
@@ -514,7 +522,10 @@ class ClaimWorker:
         which takes no advisory lock); a claim worker WAITS for the schema
         before it starts polling."""
         from queue_workflows import db
-        min_version = _REQUIRED_SCHEMA_VERSION[self.queue]
+        min_version = (
+            _NODE_REQUIRED_VERSION if self.queue in _NODE_QUEUES
+            else _INGEST_REQUIRED_VERSION
+        )
         log.info(
             "[claim-worker:%s] waiting for queue_schema_version >= %d",
             self.queue, min_version,
@@ -585,11 +596,19 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     parser = argparse.ArgumentParser(prog="queue-claim-worker")
-    parser.add_argument(
-        "--queue", required=True, choices=("cpu", "gpu", "fetch", "load"),
-    )
+    parser.add_argument("--queue", required=True)
     parser.add_argument("--lease-seconds", type=int, default=LEASE_S)
     args = parser.parse_args(argv)
+
+    # Custom ingest queue names are accepted when the host configured them
+    # (queue_workflows.configure(ingest_queues=...)) before calling main(); the
+    # bare console script keeps the cpu/gpu/fetch/load default set.
+    valid = _NODE_QUEUES | get_config().ingest_queues
+    if args.queue not in valid:
+        parser.error(
+            f"--queue must be in {sorted(valid)} "
+            "(call queue_workflows.configure(ingest_queues=...) for custom names)"
+        )
 
     if args.queue == "gpu":
         # Register the model registry up front so the first claim's

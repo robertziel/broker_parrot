@@ -61,6 +61,38 @@ def test_next_fire_exactly_on_minute_rolls_forward():
     assert e.next_fire_at(now) == datetime(2026, 5, 24, 11, 37, 0, tzinfo=timezone.utc)
 
 
+# ── hour-restricted cadence (G4) ─────────────────────────────────────────────
+
+
+def test_next_fire_hours_none_is_hourly():
+    # explicit None == original hourly behaviour (backward-compat regression).
+    e = scheduler.ScheduleEntry("x", 37, "run_fetch_all", "fetch", hours=None)
+    now = datetime(2026, 5, 24, 10, 5, 0, tzinfo=timezone.utc)
+    assert e.next_fire_at(now) == datetime(2026, 5, 24, 10, 37, 0, tzinfo=timezone.utc)
+
+
+def test_next_fire_daily_hour_rolls_to_next_day():
+    # daily at 06:30 — from 10:05 the next fire is tomorrow 06:30.
+    e = scheduler.ScheduleEntry("glofas", 30, "run_load_all", "load", hours=frozenset({6}))
+    now = datetime(2026, 5, 24, 10, 5, 0, tzinfo=timezone.utc)
+    assert e.next_fire_at(now) == datetime(2026, 5, 25, 6, 30, 0, tzinfo=timezone.utc)
+
+
+def test_next_fire_daily_hour_same_day_when_before():
+    e = scheduler.ScheduleEntry("glofas", 30, "run_load_all", "load", hours=frozenset({6}))
+    now = datetime(2026, 5, 24, 3, 0, 0, tzinfo=timezone.utc)
+    assert e.next_fire_at(now) == datetime(2026, 5, 24, 6, 30, 0, tzinfo=timezone.utc)
+
+
+def test_next_fire_multiple_hours_picks_next():
+    # four-times-a-day at :00 — from 10:05 the next is 16:00 (10:00 already past).
+    e = scheduler.ScheduleEntry(
+        "icon", 0, "run_fetch_all", "fetch", hours=frozenset({4, 10, 16, 22}),
+    )
+    now = datetime(2026, 5, 24, 10, 5, 0, tzinfo=timezone.utc)
+    assert e.next_fire_at(now) == datetime(2026, 5, 24, 16, 0, 0, tzinfo=timezone.utc)
+
+
 def test_soonest_next_fire_across_schedule():
     now = datetime(2026, 5, 24, 10, 10, 0, tzinfo=timezone.utc)
     soonest, due = scheduler._soonest(_FAKE_SCHEDULE, now)

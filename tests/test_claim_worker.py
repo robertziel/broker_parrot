@@ -11,7 +11,7 @@ Pins the pieces directly, without a live LISTEN loop:
   * the ingest claim path (fetch/load → ``ingest_executor`` via the registered
     task map);
   * the startup schema-readiness gate (``queue_schema_version`` versions
-    cpu/gpu → 6, fetch/load → 7);
+    cpu/gpu → 6, ingest queues → 8);
   * the worker capacity heartbeat.
 """
 
@@ -251,6 +251,44 @@ def test_budget_for_fetch_and_load():
     assert claim_worker.budget_for({"queue": "load"}) == claim_worker.LOAD_BUDGET_S
 
 
+# ── host-configurable ingest queue names (G1) ────────────────────────────────
+
+
+def test_claim_worker_accepts_host_configured_ingest_queue():
+    queue_workflows.configure(ingest_queues=frozenset({"hydro", "hydraulic", "corrdiff"}))
+    w = claim_worker.ClaimWorker(queue="hydraulic", host="beelink")
+    assert w.queue == "hydraulic"
+    assert w._is_ingest is True
+    assert w._wake_channel == "ingest_job_ready"
+
+
+def test_claim_worker_rejects_queue_not_in_configured_set():
+    queue_workflows.configure(ingest_queues=frozenset({"hydraulic"}))
+    with pytest.raises(ValueError):
+        claim_worker.ClaimWorker(queue="fetch", host="h")  # narrowed out
+
+
+def test_configure_rejects_reserved_queue_names():
+    with pytest.raises(ValueError):
+        queue_workflows.configure(ingest_queues=frozenset({"hydro", "gpu"}))
+
+
+def test_budget_for_custom_ingest_queue_uses_config_default():
+    queue_workflows.configure(ingest_default_budget_s=1234)
+    assert claim_worker.budget_for({"queue": "hydraulic"}) == 1234
+
+
+def test_await_schema_custom_ingest_queue_requires_v8(monkeypatch):
+    from queue_workflows import db
+    queue_workflows.configure(ingest_queues=frozenset({"hydro"}))
+    seen: dict = {}
+    monkeypatch.setattr(
+        db, "wait_for_schema", lambda mv, **kw: seen.update(min_version=mv) or mv,
+    )
+    claim_worker.ClaimWorker(queue="hydro", host="h").await_schema()
+    assert seen["min_version"] == 8
+
+
 def test_ingest_lease_renewer_extends_lease():
     queue_workflows.register_ingest_task("run_fetch_all", lambda reason: {})
     job_id = node_queue.enqueue_ingest_job(task_name="run_fetch_all", queue="fetch")
@@ -300,7 +338,7 @@ def test_run_once_gpu_passes_current_model_for_affinity(monkeypatch):
 
 def test_await_schema_waits_for_required_version(monkeypatch):
     """``await_schema`` delegates to ``db.wait_for_schema(min_version)`` with the
-    queue's required engine version (cpu/gpu → 6, fetch/load → 7)."""
+    queue's required engine version (cpu/gpu → 6, ingest queues → 8)."""
     from queue_workflows import db
 
     seen: dict = {}
@@ -316,9 +354,9 @@ def test_await_schema_waits_for_required_version(monkeypatch):
     claim_worker.ClaimWorker(queue="gpu", host="h").await_schema()
     assert seen["min_version"] == 6
     claim_worker.ClaimWorker(queue="fetch", host="h").await_schema()
-    assert seen["min_version"] == 7
+    assert seen["min_version"] == 8
     claim_worker.ClaimWorker(queue="load", host="h").await_schema()
-    assert seen["min_version"] == 7
+    assert seen["min_version"] == 8
 
 
 def test_run_forever_awaits_schema_before_listening(monkeypatch):
@@ -435,13 +473,17 @@ def test_heartbeat_emit_once_gpu_reports_current_model(_heartbeat_enabled):
     assert _heartbeat_row("spark", "gpu")["current_model"] is None
 
 
-@pytest.mark.parametrize("queue", ["fetch", "load"])
-def test_heartbeat_skips_fetch_and_load(queue, _heartbeat_enabled):
+@pytest.mark.parametrize("queue", ["fetch", "load", "hydro"])
+def test_heartbeat_emits_for_ingest_queues(queue, _heartbeat_enabled):
+    # G5 + migration 0008: ingest-family workers heartbeat too (the cpu/gpu-only
+    # CHECK is gone), with current_model NULL, so a host's queue gauge sees them.
     emitter = claim_worker.HeartbeatEmitter(queue=queue, host_label="beelink")
-    assert emitter._enabled is False
-    emitter.start()
-    assert emitter._thread is None
-    assert _heartbeat_row("beelink", queue) is None
+    assert emitter._enabled is True
+    emitter.emit_once()
+    row = _heartbeat_row("beelink", queue)
+    assert row is not None
+    assert row["concurrency"] == 1
+    assert row["current_model"] is None
 
 
 def test_heartbeat_disabled_by_env(monkeypatch):

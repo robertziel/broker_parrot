@@ -303,8 +303,19 @@ def claim_next_gpu_job(
 # claim/lease shape (DRY at the SQL level) minus the run-existence guard —
 # there's no run.
 
-#: Ingest queues — engine constant matching the migration-0007 queue CHECK.
+#: Default ingest queues (ai_leads byte-compat). The LIVE allow-list is
+#: ``config.ingest_queues`` (host-configurable, G1) — see :func:`_ingest_queues`.
+#: Migration 0008 dropped the DB CHECK that pinned ``ingest_jobs.queue`` to these.
 INGEST_QUEUES: frozenset[str] = frozenset({"fetch", "load"})
+
+
+def _ingest_queues() -> frozenset[str]:
+    """The valid ingest queue set — host-configurable via
+    ``queue_workflows.configure(ingest_queues=...)`` (default {'fetch','load'}).
+    Migration 0008 moved this allow-list from a DB CHECK to here (mirrors the
+    task_name gate in :func:`_ingest_tasks`)."""
+    from queue_workflows.config import get_config
+    return get_config().ingest_queues
 
 
 def _ingest_tasks() -> frozenset[str]:
@@ -317,15 +328,29 @@ def _ingest_tasks() -> frozenset[str]:
 
 def enqueue_ingest_job(
     *, task_name: str, queue: str, reason: str = "tick", priority: int = 100,
+    args: dict[str, Any] | None = None, conn: Any = None,
 ) -> str:
     """Insert a fresh ``queued`` ingest-job row. Returns the row id.
 
-    Raises ``ValueError`` before touching the DB on an unknown queue
-    (must be fetch/load) or task_name (must be a registered ingest task),
-    matching :func:`enqueue_node_job`'s fail-before-write contract.
+    Raises ``ValueError`` before touching the DB on an unknown queue or
+    task_name (must be a registered ingest task), matching
+    :func:`enqueue_node_job`'s fail-before-write contract.
+
+    ``args`` (migration 0008) is an optional JSON-able dict of per-job
+    arguments — persisted to the ``args`` column and handed to the registered
+    callable — so a host can enqueue a *parametrised* ingest task (e.g.
+    ``run_scenario`` with a scenario id), not only parameterless periodic
+    sweeps. Defaults to ``{}``.
+
+    ``conn`` is an optional host psycopg connection. When given, the INSERT runs
+    on it so the **caller controls the transaction** — the job row and the
+    host's own domain row (e.g. ``scenario_runs``) commit atomically, and the
+    ``ingest_job_ready`` NOTIFY rides the same txn. When ``None``, a pooled
+    connection is borrowed and autocommits on success.
     """
-    if queue not in INGEST_QUEUES:
-        raise ValueError(f"ingest queue must be in {sorted(INGEST_QUEUES)}, got {queue!r}")
+    iq = _ingest_queues()
+    if queue not in iq:
+        raise ValueError(f"ingest queue must be in {sorted(iq)}, got {queue!r}")
     tasks = _ingest_tasks()
     if task_name not in tasks:
         raise ValueError(
@@ -333,15 +358,18 @@ def enqueue_ingest_job(
             f"{task_name!r} (register via queue_workflows.register_ingest_task)"
         )
     row_id = str(uuid.uuid4())
-    with connection() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO ingest_jobs
-                (id, task_name, queue, reason, status, priority, created_at)
-            VALUES (%s, %s, %s, %s, 'queued', %s, now())
-            """,
-            (row_id, task_name, queue, reason, priority),
-        )
+    sql = """
+        INSERT INTO ingest_jobs
+            (id, task_name, queue, reason, args, status, priority, created_at)
+        VALUES (%s, %s, %s, %s, %s, 'queued', %s, now())
+    """
+    params = (row_id, task_name, queue, reason, _as_json(args or {}), priority)
+    if conn is not None:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+    else:
+        with connection() as own, own.cursor() as cur:
+            cur.execute(sql, params)
     return row_id
 
 
@@ -507,12 +535,12 @@ def upsert_worker_heartbeat(
     """Upsert this worker's ``(host_label, queue)`` capacity row, refreshing
     ``last_seen`` to ``now()``.
 
-    The table's CHECK constraint only permits ``queue IN ('cpu','gpu')`` —
-    callers serving fetch/load must NOT call this (it would raise). The
-    GPU heartbeat passes ``current_model`` (the gauge's busy signal); the
-    CPU heartbeat leaves it NULL. ``known_models`` is the capability list
-    advertised for affinity routing; ``None`` is normalised to an empty
-    array so the column is never left stale.
+    Any queue family may upsert (migration 0008 dropped the cpu/gpu-only
+    CHECK), so ingest workers heartbeat too. The GPU heartbeat passes
+    ``current_model`` (the gauge's busy signal); CPU + ingest heartbeats leave
+    it NULL. ``known_models`` is the capability list advertised for affinity
+    routing; ``None`` is normalised to an empty array so the column is never
+    left stale.
 
     ``update_current_model`` controls whether the ON CONFLICT path
     overwrites ``current_model``.
@@ -821,3 +849,41 @@ def snapshot() -> dict[str, Any]:
                 f"{q}_{s}": n for (q, s), n in counts.items()
             },
         }
+
+
+def ingest_snapshot() -> dict[str, Any]:
+    """Per-queue depth + live-worker counts for the INGEST path — the
+    ``ingest_jobs`` twin of :func:`snapshot` (which covers only the cpu/gpu DAG
+    queues). ``queues[q]`` carries the status counts plus ``workers`` = the
+    number of ``worker_heartbeats`` rows on that queue still fresh (< 30 s,
+    matching the claim worker's 10 s refresh). A host maps queued+running →
+    "messages" and ``workers`` → "consumers" for its queue-indicator UI.
+
+    NB: ``worker_heartbeats`` is keyed ``(host_label, queue)``, so ``workers``
+    counts live worker *hosts* per queue, not processes — enough to drive the
+    "no consumer → starvation" warning."""
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT queue, status, COUNT(*) AS n FROM ingest_jobs "
+            "GROUP BY queue, status"
+        )
+        counts: dict[str, dict[str, int]] = {}
+        for row in cur.fetchall():
+            counts.setdefault(row["queue"], {})[row["status"]] = int(row["n"])
+        cur.execute(
+            "SELECT queue, COUNT(*) AS n FROM worker_heartbeats "
+            "WHERE last_seen > now() - interval '30 seconds' GROUP BY queue"
+        )
+        workers = {row["queue"]: int(row["n"]) for row in cur.fetchall()}
+
+    queues: dict[str, dict[str, int]] = {}
+    for q in set(counts) | set(workers):
+        st = counts.get(q, {})
+        queues[q] = {
+            "queued": st.get("queued", 0),
+            "running": st.get("running", 0),
+            "completed": st.get("completed", 0),
+            "failed": st.get("failed", 0),
+            "workers": workers.get(q, 0),
+        }
+    return {"queues": queues}

@@ -77,6 +77,7 @@ def test_migrations_dir_ships_the_sql():
         "0005_worker_heartbeats.sql",
         "0006_pg_queue_lease.sql",
         "0007_ingest_jobs.sql",
+        "0008_multitenant_ingest.sql",
     ]
 
 

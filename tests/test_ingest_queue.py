@@ -179,3 +179,111 @@ def test_notify_fires_on_queued_insert_and_reclaim():
             reclaim_notifies.append(n)
         assert reclaim_notifies, "reclaim UPDATE must fire ingest_job_ready"
         assert reclaim_notifies[0].payload == "fetch"
+
+
+# ── per-job args payload (migration 0008 / G2) ───────────────────────────────
+
+
+def test_enqueue_persists_args():
+    jid = node_queue.enqueue_ingest_job(
+        task_name="run_fetch_all", queue="fetch", args={"scenario_id": 42},
+    )
+    assert _row(jid)["args"] == {"scenario_id": 42}
+
+
+def test_enqueue_defaults_args_to_empty():
+    jid = node_queue.enqueue_ingest_job(task_name="run_fetch_all", queue="fetch")
+    assert _row(jid)["args"] == {}
+
+
+def test_execute_passes_args_to_two_arg_callable():
+    seen: dict = {}
+
+    def scenario_task(reason, args):
+        seen.update(args)
+        return {"ran": reason}
+
+    queue_workflows.register_ingest_task("scenario_task", scenario_task)
+    jid = node_queue.enqueue_ingest_job(
+        task_name="scenario_task", queue="load", args={"scenario_id": 7},
+    )
+    job = node_queue.claim_next_ingest_job("load", host="h")
+    from queue_workflows import ingest_executor
+    assert ingest_executor.execute_ingest_job(job) == "completed"
+    assert seen == {"scenario_id": 7}
+    assert node_queue.get_ingest_job(jid)["status"] == "completed"
+
+
+def test_execute_one_arg_callable_ignores_args():
+    # run_fetch_all is registered (autouse) as a 1-arg lambda; args are dropped.
+    jid = node_queue.enqueue_ingest_job(
+        task_name="run_fetch_all", queue="fetch", args={"ignored": 1},
+    )
+    job = node_queue.claim_next_ingest_job("fetch", host="h")
+    from queue_workflows import ingest_executor
+    assert ingest_executor.execute_ingest_job(job) == "completed"
+
+
+# ── caller-supplied transaction (G3) ─────────────────────────────────────────
+
+
+def test_enqueue_with_conn_commits_with_caller():
+    with connection() as conn:
+        jid = node_queue.enqueue_ingest_job(
+            task_name="run_fetch_all", queue="fetch", conn=conn,
+        )
+        with conn.cursor() as cur:  # visible inside the caller's own txn
+            cur.execute("SELECT status FROM ingest_jobs WHERE id = %s", (jid,))
+            assert cur.fetchone()["status"] == "queued"
+    assert node_queue.get_ingest_job(jid) is not None  # committed on clean exit
+
+
+def test_enqueue_with_conn_rolls_back_with_caller():
+    holder: dict = {}
+    with pytest.raises(RuntimeError):
+        with connection() as conn:
+            holder["id"] = node_queue.enqueue_ingest_job(
+                task_name="run_fetch_all", queue="fetch", conn=conn,
+            )
+            raise RuntimeError("boom")  # context exit rolls the txn back
+    assert node_queue.get_ingest_job(holder["id"]) is None
+
+
+# ── host-configurable queue names (G1) ───────────────────────────────────────
+
+
+def test_enqueue_accepts_host_configured_queue():
+    queue_workflows.configure(ingest_queues=frozenset({"hydraulic", "corrdiff"}))
+    queue_workflows.register_ingest_task("run_scenario", lambda r, a: {"ok": True})
+    jid = node_queue.enqueue_ingest_job(
+        task_name="run_scenario", queue="hydraulic", args={"scenario_id": 1},
+    )
+    assert _row(jid)["queue"] == "hydraulic"
+
+
+def test_enqueue_rejects_queue_outside_configured_set():
+    queue_workflows.configure(ingest_queues=frozenset({"hydraulic"}))
+    queue_workflows.register_ingest_task("run_scenario", lambda r, a: {"ok": True})
+    with pytest.raises(ValueError):
+        node_queue.enqueue_ingest_job(task_name="run_scenario", queue="fetch")
+
+
+# ── ingest snapshot for the host queue-indicator UI (G5) ──────────────────────
+
+
+def test_ingest_snapshot_reports_depth_and_workers():
+    queue_workflows.configure(ingest_queues=frozenset({"hydro", "hydraulic"}))
+    queue_workflows.register_ingest_task("t", lambda r, a: {})
+    node_queue.enqueue_ingest_job(task_name="t", queue="hydro")
+    node_queue.enqueue_ingest_job(task_name="t", queue="hydro")
+    node_queue.enqueue_ingest_job(task_name="t", queue="hydraulic")
+    node_queue.claim_next_ingest_job("hydraulic", host="h")  # → running
+    node_queue.upsert_worker_heartbeat(
+        host_label="beelink", queue="hydro", concurrency=1,
+    )
+
+    snap = node_queue.ingest_snapshot()
+    assert snap["queues"]["hydro"]["queued"] == 2
+    assert snap["queues"]["hydro"]["workers"] == 1
+    assert snap["queues"]["hydraulic"]["running"] == 1
+    assert snap["queues"]["hydraulic"]["workers"] == 0
