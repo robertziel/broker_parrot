@@ -30,25 +30,37 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ScheduleEntry:
-    """One hourly periodic fire. ``minute`` is the minute-of-hour it fires
-    (mirroring ``crontab(minute=N)``); ``task_name`` / ``queue`` name the
-    claim-able ingest job it enqueues."""
+    """One periodic fire. ``minute`` is the minute-of-hour it fires (mirroring
+    ``crontab(minute=N)``); ``task_name`` / ``queue`` name the claim-able ingest
+    job it enqueues. ``hours`` optionally restricts firing to those hours-of-day
+    (UTC): ``None`` (default) fires every hour — the original behaviour;
+    ``frozenset({6})`` is daily at ``06:<minute>``; ``frozenset({4,10,16,22})``
+    fires four times a day. This lets a host express sub-daily/daily cadences
+    (e.g. a model run at fixed hours) without firing 24×/day (G4)."""
 
     name: str
     minute: int
     task_name: str
     queue: str
+    hours: frozenset[int] | None = None
 
     def next_fire_at(self, now: datetime) -> datetime:
         """The next instant strictly AFTER ``now`` at which this entry fires.
         Strict-after so a fire that just happened at exactly ``self.minute``
-        rolls to the next hour rather than re-firing in a tight loop."""
-        candidate = now.replace(
-            minute=self.minute, second=0, microsecond=0,
-        )
+        rolls forward rather than re-firing in a tight loop. When ``hours`` is
+        set, advance hour-by-hour to the next allowed hour-of-day."""
+        candidate = now.replace(minute=self.minute, second=0, microsecond=0)
         if candidate <= now:
             candidate = candidate + timedelta(hours=1)
-        return candidate
+        if self.hours is None:
+            return candidate
+        # Walk forward to the next allowed hour (bounded: hours repeat daily, so
+        # at most 24 single-hour steps from the fixed-minute candidate).
+        for _ in range(24):
+            if candidate.hour in self.hours:
+                return candidate
+            candidate = candidate + timedelta(hours=1)
+        return candidate  # empty/unsatisfiable hours — effectively never fires
 
 
 def _configured_schedule() -> list[ScheduleEntry]:

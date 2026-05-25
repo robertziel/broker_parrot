@@ -64,6 +64,8 @@ def configure(
     host_label_env: str | None = None,
     host_priority_env: str | None = None,
     container_prefix: str | None = None,
+    ingest_queues: frozenset[str] | None = None,
+    ingest_default_budget_s: int | None = None,
 ) -> EngineConfig:
     """Set engine configuration values. Only the passed keyword args are
     mutated; the rest keep their (ai_leads-byte-compatible) defaults. Returns
@@ -86,6 +88,18 @@ def configure(
             cfg.host_priority_env = host_priority_env
         if container_prefix is not None:
             cfg.container_prefix = container_prefix
+        if ingest_queues is not None:
+            iq = frozenset(ingest_queues)
+            reserved = iq & {"cpu", "gpu"}
+            if reserved:
+                raise ValueError(
+                    f"ingest_queues must not reuse the reserved DAG queue names "
+                    f"{sorted(reserved)} (cpu/gpu draw from workflow_node_jobs); "
+                    "use distinct names for non-DAG ingest queues."
+                )
+            cfg.ingest_queues = iq
+        if ingest_default_budget_s is not None:
+            cfg.ingest_default_budget_s = int(ingest_default_budget_s)
     return cfg
 
 

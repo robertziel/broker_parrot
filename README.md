@@ -58,6 +58,42 @@ as package data). `queue_workflows.migrations.dir()` returns the directory;
 `queue_schema_version` ledger. A host with its own domain tables runs a second
 chain via `db.bootstrap(migrations_dir=..., version_table=...)`.
 
+## Host-defined queues + parametrised jobs (multi-tenant)
+
+The ingest path is not limited to ai_leads' `fetch`/`load`. A second consumer (a
+non-DAG app — e.g. a forecast service) can route its **own** queue names and
+carry **per-job arguments** — migration `0008` moved the queue allow-list from a
+DB CHECK to host-side validation (mirroring `task_name`), added an `args` column,
+and dropped the cpu/gpu-only `worker_heartbeats` CHECK.
+
+```python
+queue_workflows.configure(
+    db_url_env="MY_DB_URL",
+    ingest_queues=frozenset({"ingest", "hydro", "hydraulic", "corrdiff"}),  # NOT cpu/gpu (reserved for the DAG path)
+    ingest_default_budget_s=3600,            # watchdog budget for these queues
+)
+queue_workflows.register_ingest_task("run_scenario", run_scenario)   # fn(reason) OR fn(reason, args) -> dict
+
+# parametrised + atomic with the host's own row (NOTIFY rides the caller's txn):
+with my_pool.connection() as conn:
+    my_create_scenario(conn, scenario_id)
+    node_queue.enqueue_ingest_job(
+        task_name="run_scenario", queue="hydraulic",
+        args={"scenario_id": scenario_id}, conn=conn,
+    )
+
+# hour-restricted cadence (no longer fires 24×/day):
+ScheduleEntry("glofas", minute=30, task_name="run_glofas", queue="ingest", hours=frozenset({6}))
+
+# queue-indicator data for the non-cpu/gpu queues:
+node_queue.ingest_snapshot()   # {"queues": {q: {queued, running, completed, failed, workers}}}
+```
+
+A registered callable may be `fn(reason)` (args ignored, back-compat) or
+`fn(reason, args)`. Ingest workers now emit `worker_heartbeats`, so
+`ingest_snapshot()[...]["workers"]` reflects live workers per queue. `cpu`/`gpu`
+stay reserved for the DAG node path; ingest queues require migration version 8.
+
 ## Tests
 
 ```

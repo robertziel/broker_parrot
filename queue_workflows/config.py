@@ -94,6 +94,16 @@ class EngineConfig:
     #: (wired lazily in ``get_resolve_ref`` to keep this module a leaf).
     resolve_ref: Callable[[Any, dict], Any] | None = None
 
+    # ── ingest queue names + budget (host-configurable; G1) ────────────────────
+    #: Ingest-family queue names. Migration 0008 dropped the fetch/load DB CHECK;
+    #: the host validates ``queue`` against THIS set before enqueue (mirroring the
+    #: task_name gate). Default {'fetch','load'} keeps ai_leads byte-compat; a
+    #: different project (lm_flood) sets e.g. {'ingest','hydro','hydraulic','gpu'}.
+    ingest_queues: frozenset[str] = frozenset({"fetch", "load"})
+    #: Wall-clock budget (s) the claim worker applies to ingest queues OTHER than
+    #: the built-in fetch/load (``claim_worker.budget_for``). Host-tunable.
+    ingest_default_budget_s: int = 3600
+
     # ── ingest task seam (periodic work) ───────────────────────────────────────
     #: ``task_name -> Callable[[str], dict]`` — the periodic ingest callables the
     #: claim worker runs. The callable takes the ``reason`` string and returns a
