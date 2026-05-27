@@ -60,7 +60,7 @@ import threading
 import time
 from typing import Any, Callable
 
-from queue_workflows import node_executor, node_queue
+from queue_workflows import node_executor, node_queue, worker_control
 from queue_workflows.config import get_config
 from queue_workflows.db import connection, db_url
 
@@ -1251,6 +1251,9 @@ class ClaimWorker:
         # This host's hw-metrics sampler — started in ``run_forever`` ONLY when
         # ``queue == 'gpu'`` (one gpu container per host ⇒ one sampler per host).
         self._hw_sampler: Any = None
+        # Operator ON/OFF control watcher — started in ``run_forever`` after the
+        # boot park-gate (None until then; stopped in the finally).
+        self._control_watcher: Any = None
 
     @property
     def _is_ingest(self) -> bool:
@@ -1473,6 +1476,23 @@ class ClaimWorker:
             renewer.stop()
         return True
 
+    # ── operator control (ON/OFF) ────────────────────────────────────────────
+
+    def requeue_inflight_for_control(self) -> int:
+        """Re-queue any job this worker is currently running back to the queue and
+        clear its GPU busy-ghost — the DB cleanup a control HARD stop does just
+        before the process exits.
+
+        ``os._exit`` skips ``_run_node``'s ``finally`` (exactly like a watchdog
+        trip), so this mirrors the trip path's pre-exit bookkeeping: release the
+        in-flight row (resume-style, NO ``watchdog_retries`` increment — an operator
+        turning a machine off is redistribution, not a node failure) so it
+        redistributes at once, and null this worker's ``current_model`` busy-ghost
+        so the GPU-busy gauge drops it immediately. Returns the rows re-queued."""
+        n = node_queue.requeue_running_for_worker(self.host, self.queue)
+        _clear_busy_ghost(self.host, self.queue)
+        return n
+
     # ── the loop ───────────────────────────────────────────────────────────
 
     @property
@@ -1499,6 +1519,55 @@ class ClaimWorker:
         )
         db.wait_for_schema(min_version)
 
+    def _park_until_enabled(self) -> bool:
+        """Boot-time gate: while this worker's control row is OFF, do NOT claim and
+        do NOT advertise capacity — sit idle until an operator turns it back ON.
+
+        Entered from :meth:`run_forever` before the claim loop; returns when the
+        control state is ON (or the worker is stopped). RAM is already free here —
+        a freshly (re)started process holds no model — so parking is just "stay
+        idle, out of the gauge": a parked worker does NOT heartbeat, so it ages out
+        of Rails' fresh-heartbeat window within ~30 s and an OFF machine correctly
+        shows zero capacity. LISTENs ``worker_control`` for an instant wake on the
+        ON flip, with the same safety-poll timeout the watcher uses.
+
+        This is the ONLY place a worker parks: a RUNNING worker that's turned OFF
+        hard-exits (the WorkerControlWatcher) and the supervisor restarts it back
+        through this gate — there is no in-process running→parked transition.
+
+        Returns ``True`` if the worker should proceed to its claim loop (control
+        state is ON — never parked, or parked then turned back ON); ``False`` if it
+        was stopped while parked (e.g. SIGTERM during park), so run_forever exits
+        without starting the heartbeat / claim loop."""
+        import psycopg
+
+        if (
+            worker_control.desired_state_for(self.host, self.queue)
+            != worker_control.STATE_OFF
+        ):
+            return True
+        log.warning(
+            "[claim-worker:%s] control state OFF for host=%s — PARKED (not "
+            "claiming, not advertising capacity) until turned back ON",
+            self.queue, self.host,
+        )
+        poll_s = worker_control._worker_control_poll_s()
+        with psycopg.connect(db_url(), autocommit=True) as listen_conn:
+            listen_conn.execute(f"LISTEN {worker_control.NOTIFY_CHANNEL}")
+            while not self._stop.is_set():
+                if (
+                    worker_control.desired_state_for(self.host, self.queue)
+                    != worker_control.STATE_OFF
+                ):
+                    log.info(
+                        "[claim-worker:%s] control state ON for host=%s — resuming",
+                        self.queue, self.host,
+                    )
+                    return True
+                for _ in listen_conn.notifies(timeout=poll_s, stop_after=1):
+                    break
+        return False
+
     def run_forever(self) -> None:
         """Block on ``LISTEN <wake_channel>`` and drain the queue greedily on
         each wake (and on the 1 s safety poll for a dropped NOTIFY). Uses a
@@ -1508,6 +1577,12 @@ class ClaimWorker:
         # Gate on schema readiness FIRST so the loop never polls a table the
         # orchestrator's bootstrap hasn't created yet.
         self.await_schema()
+        # Boot-gate: if an operator has this worker turned OFF, PARK (no claim, no
+        # heartbeat) until it's turned back ON. A fresh process holds no model so
+        # RAM is already free; parking keeps us idle + out of the capacity gauge.
+        # Returns False only if stopped while parked ⇒ exit without starting up.
+        if not self._park_until_enabled():
+            return
         log.info(
             "[claim-worker:%s] starting (host=%s priority=%d lease=%ds channel=%s)",
             self.queue, self.host, self.host_priority, self.lease_s,
@@ -1522,6 +1597,11 @@ class ClaimWorker:
         if self.queue == "gpu":
             from queue_workflows import hw_metrics
             self._hw_sampler = hw_metrics.start_hw_metrics_sampler_flocked()
+        # Operator control watcher: HARD-stop this worker the instant it's turned
+        # OFF (re-queue in-flight + os._exit to free RAM; the supervisor restart
+        # re-enters the park gate above). Honours AI_LEADS_DISABLE_WORKER_CONTROL.
+        self._control_watcher = worker_control.WorkerControlWatcher(worker=self)
+        self._control_watcher.start()
         try:
             with psycopg.connect(db_url(), autocommit=True) as listen_conn:
                 listen_conn.execute(f"LISTEN {self._wake_channel}")
@@ -1540,6 +1620,9 @@ class ClaimWorker:
                     ):
                         break
         finally:
+            if self._control_watcher is not None:
+                self._control_watcher.stop()
+                self._control_watcher = None
             self.heartbeat.stop()
             # Stop the sampler iff THIS process won the flock.
             if self._hw_sampler is not None:

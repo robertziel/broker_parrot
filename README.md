@@ -13,7 +13,11 @@ Postgres is the only hard dependency. The engine provides:
   (`model_cache` / `gpu_model_cache` / `model_registry`);
 - periodic "ingest" work on a dedicated `ingest_jobs` table + a PG-native
   ticker (`scheduler` / `ingest_executor`);
-- per-host CPU/GPU/RAM telemetry → `pg_notify('hw_metrics', …)` (`hw_metrics`).
+- per-host CPU/GPU/RAM telemetry → `pg_notify('hw_metrics', …)` (`hw_metrics`);
+- an operator worker ON/OFF control plane: a `worker_controls` table + a
+  per-`(host, queue)` `WorkerControlWatcher` that hard-stops (kill in-flight +
+  free RAM/VRAM) or parks a worker on command (`worker_control`; see
+  `docs/worker_control.md`).
 
 ## Quick start
 
