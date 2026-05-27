@@ -3,6 +3,13 @@
 A standalone, pip-installable **Postgres-as-queue workflow engine**, extracted
 from the ai_leads stack so the ~35 sibling projects can share one DRY source.
 
+**The point:** quickly stand up a workflow plane across a *local, self-hosted HPC*
+setup — a handful of heterogeneous CPU/GPU machines — and get the most out of
+limited resources. Turn a given machine's worker **ON/OFF** on demand, and
+**load/unload models** across different boxes as work shifts, so jobs land on
+whatever capacity is free instead of being pinned to one host that's busy or
+down — all on hardware you already own, with no cluster scheduler to run.
+
 Postgres is the only hard dependency. The engine provides:
 
 - a `SELECT … FOR UPDATE SKIP LOCKED` claim loop woken by `LISTEN node_job_ready`
