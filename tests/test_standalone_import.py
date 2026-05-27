@@ -80,6 +80,8 @@ def test_migrations_dir_ships_the_sql():
         "0008_multitenant_ingest.sql",
         "0009_worker_heartbeats_dead_flag.sql",
         "0010_node_job_watchdog_retries.sql",
+        "0011_node_events.sql",
+        "0012_worker_controls.sql",
     ]
 
 

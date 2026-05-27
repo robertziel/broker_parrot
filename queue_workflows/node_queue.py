@@ -727,6 +727,53 @@ def reclaim_all_running_for_resume() -> list[dict[str, Any]]:
         return list(cur.fetchall())
 
 
+def requeue_running_for_worker(host_label: str, queue: str) -> int:
+    """Re-queue every ``running`` row a SPECIFIC worker still owns — the
+    per-``(host_label, queue)``-scoped twin of
+    :func:`reclaim_all_running_for_resume`.
+
+    Used when an operator turns a machine's cpu/gpu (or ingest) worker OFF via the
+    ``worker_controls`` hard-stop: the in-flight job is released back to the queue
+    so a healthy peer (or this worker once it's turned back ON) picks it up — the
+    point is to stop the WORKER, not to fail the WORK.
+
+    RESUME-STYLE, not a watchdog retry: flips ``running`` → ``queued``, clears the
+    lease bookkeeping, and bumps priority to the front (``LEAST(priority, 10)``)
+    WITHOUT incrementing ``watchdog_retries`` (turning a machine off is an
+    operational redistribution, not a node failure — it must not burn the retry
+    cap). The status flip fires the migration-0006/0007 ``node_job_ready`` /
+    ``ingest_job_ready`` NOTIFY so an idle worker re-claims at once.
+
+    Targets ``ingest_jobs`` when ``queue`` is a host-configured ingest queue
+    (``config.ingest_queues``), else ``workflow_node_jobs`` (cpu/gpu) — matching
+    the table that worker draws from. The table is chosen by this fixed branch
+    (never interpolated from caller data); ``host_label`` / ``queue`` are bound
+    params. Returns the number of rows re-queued.
+
+    SAFETY (no double-run): clearing ``claimed_by`` is exactly what trips a
+    still-running worker's :class:`~queue_workflows.claim_worker.JobStatusWatcher`
+    (it hard-exits the instant its row is no longer claimed-by-it) — the same
+    guarantee :func:`reclaim_all_running_for_resume` relies on, so the row is never
+    run twice across the hand-off."""
+    table = "ingest_jobs" if queue in _ingest_queues() else "workflow_node_jobs"
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            f"""
+            UPDATE {table}
+            SET status = 'queued',
+                started_at = NULL,
+                claimed_by = NULL,
+                lease_expires_at = NULL,
+                priority = LEAST(priority, 10)
+            WHERE status = 'running'
+              AND claimed_by = %s
+              AND queue = %s
+            """,
+            (host_label, queue),
+        )
+        return cur.rowcount or 0
+
+
 # ── Worker capacity heartbeat (DRY upsert) ──────────────────────────────────
 #
 # Single home for the ``worker_heartbeats`` INSERT … ON CONFLICT so the two

@@ -17,9 +17,10 @@ metrics = ["psutil"]               # hw_metrics CPU/RAM probe (GPU probe shells 
 test = ["pytest", "pytest-cov"]
 
 [project.scripts]
-queue-claim-worker = "queue_workflows.claim_worker:main"   # generic CLIs (used standalone / other projects)
-queue-scheduler    = "queue_workflows.scheduler:main"
-queue-orchestrator = "queue_workflows.orchestrator:main"
+queue-claim-worker   = "queue_workflows.claim_worker:main"   # generic CLIs (used standalone / other projects)
+queue-scheduler      = "queue_workflows.scheduler:main"
+queue-orchestrator   = "queue_workflows.orchestrator:main"
+queue-worker-control = "queue_workflows.worker_control:main"  # turn a (host,queue) worker ON/OFF
 
 [tool.hatch.build.targets.wheel]
 packages = ["queue_workflows"]

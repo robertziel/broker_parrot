@@ -75,6 +75,7 @@ _ENGINE_TABLES = (
     "workflow_input_submissions",
     "workflow_runs",
     "worker_heartbeats",
+    "worker_controls",
     "ingest_jobs",
 )
 
