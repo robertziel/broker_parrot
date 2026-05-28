@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `paint_mask` gains an optional `initial_mask_opacity` field (0.0-1.0) —
+  when a workflow step ships it, the dispatcher passes it through on the
+  input spec so the host widget can render the pre-painted mask at that
+  alpha (visual cue: "this is a suggestion, your strokes overwrite it").
+  Default unset preserves the 100%-opaque pre-paint.
 - New `pick_fence` input widget — `_build_input_spec` resolves both `source`
   (the image to display as background) and `detections` (a `detections.json`
   index of per-detection masks) into `source_options` / `source_rel_path` /

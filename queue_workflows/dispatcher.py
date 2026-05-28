@@ -603,6 +603,17 @@ def _build_input_spec(step: dict[str, Any], run: dict[str, Any]) -> dict[str, An
             if im_options:
                 spec["initial_mask_rel_path"] = im_options[0].get("rel_path")
                 spec["initial_mask_abs_path"] = im_options[0].get("abs_path")
+        # Optional ``initial_mask_opacity`` (0.0 — 1.0) — when set, the widget
+        # renders the pre-painted mask at that alpha so the operator can tell
+        # it's a SUGGESTION rather than a committed selection. User strokes
+        # are still drawn at 100% on top. Default unset ⇒ widget keeps the
+        # historical 100%-opaque pre-paint.
+        op = step.get("initial_mask_opacity")
+        if op is not None:
+            try:
+                spec["initial_mask_opacity"] = max(0.0, min(1.0, float(op)))
+            except (TypeError, ValueError):
+                pass
     elif widget == "assign_walls":
         # Operator-facing wall-assignment widget for the facade-merge workflow.
         import json
