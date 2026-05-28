@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dispatcher.start_run` resumes a failed run from exactly the failed
   branch instead of re-doing the completed prefix. Caller-policy
   in-flight guard is documented in the docstring.
+- `paint_mask` widget gains an optional `initial_mask` ref — when a workflow
+  step declares it (same `$from`/`$filter` shape as `source`), the
+  dispatcher resolves it into `initial_mask_options` /
+  `initial_mask_rel_path` / `initial_mask_abs_path` on the input spec so
+  the host widget can pre-paint the overlay from an upstream auto-mask
+  (e.g. a GroundingDINO+SAM2 detection pre-pass). Default unset preserves
+  the existing blank-canvas behaviour.
 - `paint_mask` input widget — the dispatcher's `_build_input_spec` resolves
   the step's `source` ref into `source_options` / `source_rel_path` /
   `source_abs_path` so a host-side canvas widget can display the upstream
