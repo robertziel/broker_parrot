@@ -535,6 +535,30 @@ def _build_input_spec(step: dict[str, Any], run: dict[str, Any]) -> dict[str, An
         if options:
             spec["source_rel_path"] = options[0].get("rel_path")
             spec["source_abs_path"] = options[0].get("abs_path")
+        # Optional ``initial_mask`` ref — when set, the widget pre-paints the
+        # resolved PNG onto the overlay so the operator starts from an
+        # auto-detected mask instead of a blank canvas (e.g. the
+        # multi-erase fence experiment seeds this from a GroundingDINO+SAM2
+        # pre-pass). Same shape as ``source`` — a $from/$filter ref against
+        # the run context — to keep the resolver symmetrical.
+        initial_mask = step.get("initial_mask")
+        if initial_mask is not None:
+            try:
+                im_options = _resolve_ref(initial_mask, context)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "[dispatcher] failed to resolve paint_mask initial_mask "
+                    "for %s: %s", step["id"], exc,
+                )
+                im_options = []
+            if isinstance(im_options, dict):
+                im_options = [im_options]
+            elif not isinstance(im_options, list):
+                im_options = []
+            spec["initial_mask_options"] = im_options
+            if im_options:
+                spec["initial_mask_rel_path"] = im_options[0].get("rel_path")
+                spec["initial_mask_abs_path"] = im_options[0].get("abs_path")
     elif widget == "assign_walls":
         # Operator-facing wall-assignment widget for the facade-merge workflow.
         import json
