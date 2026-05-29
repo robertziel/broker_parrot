@@ -126,11 +126,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AI_LEADS_ORPHAN_CANCEL_SWEEP_INTERVAL_S` (default 30 s).
 
 ### Changed
-- The GPU worker's capacity heartbeat now advertises `concurrency = 1 + PAR`
-  (one inline diffusion slot + the PAR-sized VLM pool) instead of the hardcoded
-  `1`, so Rails' used/total queue pill reflects the worker's real concurrent
-  capacity. Read live via a `HeartbeatEmitter(concurrency_fn=...)` seam; CPU and
-  ingest workers keep the constant `1`.
+- The GPU worker's capacity heartbeat advertises `concurrency = 1` (the single
+  structural warm-model diffusion slot), same as CPU/ingest. The PAR-sized VLM
+  pool's capacity is a per-machine VLM-request-batching property surfaced to the
+  consumer UI via `worker_controls.llm_parallelism` (a "PAR" field) — deliberately
+  NOT folded into this gauge, so the consumer's GPU pill counts the heavy
+  warm-model slot (1/box), not the lightweight no-model VLM pool that rides
+  beside it. (A `HeartbeatEmitter(concurrency_fn=...)` seam remains for a future
+  caller wanting a live per-tick value; unused today.)
 
 ### Fixed
 - `VLLMBackend.ensure_ready` now FAILS LOUD on a served-model mismatch. After the
