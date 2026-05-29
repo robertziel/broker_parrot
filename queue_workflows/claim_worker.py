@@ -1682,6 +1682,27 @@ class ClaimWorker:
                     pool = self._ensure_pool(par)
                     claimed_any = False
                     while not self._stop.is_set():
+                        # FILL-BEFORE-SPILL gate (additive): if a fresh
+                        # higher-ranked vLLM/ollama peer still has free VLM
+                        # capacity, DEFER this cycle — let that machine fill its
+                        # PAR slots first so light load consolidates onto one box
+                        # (others stay free for diffusion / idle-unload). We do
+                        # NOT claim-then-release: just don't claim. Failure-safe
+                        # — a query blip falls through to today's spread behaviour
+                        # (claim now), never crashes the feeder. The single-box /
+                        # no-fresh-higher-peer case returns False ⇒ byte-identical
+                        # to today. Checked BEFORE reserving a slot so a deferral
+                        # leaves the in-flight counter untouched.
+                        try:
+                            defer = node_queue.vlm_pool_should_defer(self.host, par)
+                        except Exception:
+                            log.exception(
+                                "[claim-worker:gpu:pool] defer check failed; "
+                                "claiming (spread fallback)"
+                            )
+                            defer = False
+                        if defer:
+                            break
                         with self._pool_lock:
                             if self._pool_inflight >= par:
                                 break

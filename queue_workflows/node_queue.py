@@ -349,6 +349,77 @@ def claim_next_gpu_job(
         return cur.fetchone()
 
 
+def vlm_pool_should_defer(
+    host_label: str, par: int, *, stale_s: int = STALE_WORKER_AFTER_S,
+) -> bool:
+    """FILL-BEFORE-SPILL gate for the no-model GPU (VLM) pool lane.
+
+    A vLLM/ollama machine's pool feeder calls this BEFORE each no-model claim to
+    decide whether to *defer* this cycle. The fleet ranks GPU machines by
+    advertised PAR — ``(worker_heartbeats.concurrency DESC, host_label ASC)`` —
+    so a high-`--max-num-seqs` vLLM box ranks first and a PAR-1 ollama box ranks
+    last. This machine ``M = (host_label, par)`` defers IFF some FRESH gpu worker
+    ``R`` ranked STRICTLY ABOVE it still has free VLM capacity:
+
+      * ranked above:  ``R.concurrency > M.par
+                         OR (R.concurrency = M.par AND R.host_label < M.host)``
+      * free capacity: ``(running no-model gpu jobs claimed_by R) < R.concurrency``
+
+    The effect is bin-packing: VLM jobs fill the highest-ranked box's PAR slots
+    first and spill to the next box only when the higher one is full — under
+    light load they consolidate onto one machine (freeing the others for
+    diffusion / idle-unload), under heavy load they still spill (no throughput
+    loss). Invariants (all enforced by the EXISTS query, no Python branching):
+
+      * **Top-ranked never defers.** The max-PAR / earliest-host machine has no
+        ``R`` above it → the EXISTS is empty → it always fills first. No global
+        starvation.
+      * **Single box / no fresh higher peer → never defers** (returns ``False``)
+        ⇒ behaviour byte-identical to today. SAFE default that protects
+        single-box fleets and other library consumers.
+      * **Stale peers don't count.** ``R`` must be fresh
+        (``last_seen > now() - stale_s``); a dead top box can't block everyone.
+      * **Pool lane only.** Capacity counts ``queue='gpu' AND status='running'
+        AND required_model IS NULL`` — the inline diffusion lane (a warm-model
+        job) is neither counted nor affected.
+
+    A single cheap query: ``worker_heartbeats`` (fresh gpu rows ranked above M)
+    LEFT JOINed to a per-``claimed_by`` COUNT of its running no-model gpu jobs,
+    short-circuited by ``EXISTS``. ``stale_s`` mirrors the heartbeat freshness
+    window (default :data:`STALE_WORKER_AFTER_S` = 30 s)."""
+    sql = """
+        SELECT EXISTS (
+            SELECT 1
+              FROM worker_heartbeats r
+              LEFT JOIN (
+                  SELECT claimed_by, COUNT(*) AS running_no_model
+                    FROM workflow_node_jobs
+                   WHERE queue = 'gpu'
+                     AND status = 'running'
+                     AND required_model IS NULL
+                   GROUP BY claimed_by
+              ) j ON j.claimed_by = r.host_label
+             WHERE r.queue = 'gpu'
+               AND r.last_seen > now() - make_interval(secs => %(stale_s)s)
+               -- ranked STRICTLY above M = (host_label, par)
+               AND (
+                    r.concurrency > %(par)s
+                 OR (r.concurrency = %(par)s AND r.host_label < %(host)s)
+               )
+               -- R still has free VLM capacity
+               AND COALESCE(j.running_no_model, 0) < r.concurrency
+        ) AS should_defer
+    """
+    params = {
+        "host": host_label,
+        "par": int(par),
+        "stale_s": max(1, int(stale_s)),
+    }
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(sql, params)
+        return bool(cur.fetchone()["should_defer"])
+
+
 # ── Ingest queue ────────────────────────────────────────────────────────────
 #
 # The periodic ingest work rides a DEDICATED ``ingest_jobs`` table (migration

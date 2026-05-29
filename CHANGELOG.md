@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **FILL-BEFORE-SPILL packing for the no-model GPU (VLM) pool lane** — VLM jobs now
+  bin-pack onto the highest-ranked vLLM machine before spilling, instead of every
+  vLLM box claiming independently (which SPREAD VLM work across the fleet). New
+  `node_queue.vlm_pool_should_defer(host_label, par, *, stale_s=30)` runs one cheap
+  `EXISTS` over `worker_heartbeats` (fresh gpu rows only) LEFT JOINed to a
+  per-`claimed_by` COUNT of running no-model gpu jobs, returning `True` iff a FRESH
+  gpu peer ranked strictly ABOVE M — by `(concurrency DESC, host_label ASC)` —
+  still has free VLM capacity (`R.concurrency > M.par OR (R.concurrency = M.par AND
+  R.host_label < M.host)` AND its running-no-model count `< R.concurrency`). The
+  GPU pool feeder (`_pool_feeder_loop`) consults it before each no-model claim and
+  DEFERS the cycle (does not claim — no claim-then-release) when it returns `True`,
+  letting the higher-ranked machine fill its PAR slots first. Under light load this
+  consolidates VLM onto one box (freeing the others for diffusion / idle-unload);
+  under heavy load it still spills (no throughput loss). Invariants: the top-ranked
+  machine has no peer above it → never defers → fills first (no global starvation);
+  a single box / no fresh higher peer → `False` ⇒ behaviour byte-identical to today
+  (SAFE default for single-box fleets + other library consumers); a STALE higher
+  peer (heartbeat older than `stale_s`) is ignored so a dead top box can't block
+  everyone; capacity counts `queue='gpu' AND status='running' AND required_model IS
+  NULL` only — the inline diffusion lane is neither counted nor affected. A
+  defer-query blip in the feeder falls through to the legacy spread behaviour
+  (claim now), never crashes the lane. Additive: the inline diffusion lane
+  (`_claim`, `require_model=True`) is UNCHANGED and never consults the gate.
 - **PAR-driven GPU two-lane concurrency** — the GPU claim worker now runs no-model
   GPU jobs (VLM facade work: HTTP to a per-host vLLM server that batches up to
   `--max-num-seqs` = PAR requests on the GPU) in a PAR-sized `ThreadPoolExecutor`
