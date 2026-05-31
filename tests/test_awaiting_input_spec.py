@@ -608,3 +608,61 @@ def test_paint_fence_regions_source_wraps_scalar_abs_path_like_paint_mask(tmp_pa
     assert options[0]["abs_path"] == str(picked)
     assert spec.get("source_abs_path") == str(picked)
     assert spec.get("source_rel_path") == "remove_fence/lane_qwen_erase/no_fence.jpg"
+
+
+def test_paint_fence_regions_initial_mask_wraps_scalar_from_pick(tmp_path, provider):
+    """The paint_fence_regions SEED: ``initial_mask`` = the scalar
+    ``$from: pick_fence.selected_mask_path`` (the remove-fence mask) must
+    surface as ``initial_mask_abs_path`` so the widget pre-paints the MAIN
+    fence from it. Pins the scalar-wrap on the initial_mask block — it
+    previously only handled dict/list and a scalar string fell into ``[]``,
+    so the seed silently vanished and the operator got a blank main fence.
+    """
+    from queue_workflows import dispatcher, node_queue
+
+    name = "_paint_fence_seeded"
+    provider.workflows[name] = {
+        "name": name, "mode": "node",
+        "steps": [
+            {"id": "pick_fence", "kind": "input", "widget": "pick_fence",
+             "prompt": "pick", "target": "selected_mask_path", "depends_on": []},
+            {"id": "paint_fence", "kind": "input", "widget": "paint_fence_regions",
+             "prompt": "paint", "target": "labeled_mask_path",
+             "initial_mask": {"$from": "pick_fence.selected_mask_path"},
+             "depends_on": ["pick_fence"]},
+        ],
+    }
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    mask_dir = out_dir / "pick_fence"
+    mask_dir.mkdir(parents=True)
+    picked = mask_dir / "fence_mask.png"
+    picked.write_bytes(b"\x89PNG fake")
+
+    run_id = _insert_run(name, out_dir)
+    pick_job = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="pick_fence",
+        node_module="__input__pick_fence", queue="cpu",
+        inputs={"widget": "pick_fence", "target": "selected_mask_path"},
+        priority=50,
+    )
+    import json
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE workflow_node_jobs SET status='completed', "
+            "context_delta=%s::jsonb, finished_at=now() WHERE id=%s",
+            (json.dumps({"selected_mask_path": str(picked)}), pick_job),
+        )
+        conn.commit()
+
+    _insert_awaiting_job(run_id, "paint_fence", target="labeled_mask_path")
+    dispatcher.on_node_awaiting_input(run_id, "paint_fence")
+
+    spec = _job_spec(run_id, "paint_fence")
+    assert spec is not None
+    im = spec.get("initial_mask_options") or []
+    assert len(im) == 1, f"initial_mask must wrap the scalar pick into ONE option, got {im!r}"
+    assert im[0]["abs_path"] == str(picked)
+    assert spec.get("initial_mask_abs_path") == str(picked)
+    assert spec.get("initial_mask_rel_path") == "pick_fence/fence_mask.png"

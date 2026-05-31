@@ -613,6 +613,12 @@ def _build_input_spec(step: dict[str, Any], run: dict[str, Any]) -> dict[str, An
                 im_options = []
             if isinstance(im_options, dict):
                 im_options = [im_options]
+            elif isinstance(im_options, str):
+                # Scalar abs_path — e.g. ``$from: pick_fence.selected_mask_path``,
+                # the operator's chosen fence mask from an upstream pick widget
+                # (the paint_fence_regions seed). Mirror the source block's wrap
+                # so a single-path ref pre-paints rather than vanishing into [].
+                im_options = [_file_info_for_abs_path(im_options, run.get("out_dir"))]
             elif not isinstance(im_options, list):
                 im_options = []
             spec["initial_mask_options"] = im_options
