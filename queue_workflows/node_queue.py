@@ -812,35 +812,54 @@ def flag_stale_workers_holding_running_jobs(
 
 
 def reclaim_all_running_for_resume() -> list[dict[str, Any]]:
-    """Re-queue EVERY ``running`` node job back to ``queued`` — the restart
-    hook, not the lease-expiry path (:func:`reclaim_expired_leases`).
+    """Re-queue ``running`` node jobs whose CLAIMING WORKER is gone — the
+    orchestrator-boot recovery hook, not the lease-expiry path
+    (:func:`reclaim_expired_leases`).
 
-    Called on orchestrator boot: a force-recreate restart (or a crash) has just
-    bounced the whole fleet, so any ``running`` row is orphaned — its worker is
-    gone. Flip them all back to ``queued`` immediately (clearing the lease
-    bookkeeping, jumping the queue via ``LEAST(priority, 10)``) instead of
-    waiting up to the full 600 s lease for the expiry sweep, so the fresh
-    workers pick the work straight back up. The status flip fires the
-    ``node_job_ready`` NOTIFY so an idle worker grabs it at once.
+    Scoped to jobs whose ``claimed_by`` host has **no fresh heartbeat** on the
+    job's queue (last beat older than ``STALE_WORKER_AFTER_S``, or no row at
+    all). Such a row is genuinely orphaned — its worker died across the restart
+    — so flip it back to ``queued`` at once (clearing the lease bookkeeping,
+    jumping the queue via ``LEAST(priority, 10)``) instead of idling out its
+    up-to-600 s lease. The status flip fires the ``node_job_ready`` NOTIFY so a
+    fresh worker grabs it immediately.
 
-    Safe against a worker that somehow survived the restart and still holds a
-    row: clearing ``claimed_by`` trips that worker's :class:`JobStatusWatcher`
-    (it polls its row and hard-exits the instant the row is no longer
-    claimed-by-it), so the row is never run twice.
+    Why the heartbeat scope (was: re-queue EVERY running row): the original
+    assumed a force-recreate had bounced the WHOLE fleet. But the orchestrator/
+    dispatcher container restarts independently of the GPU claim workers
+    (deploys, hot-fixes, a single-container bounce). Re-queuing *all* running
+    rows then yanked HEALTHY in-flight jobs on workers that never restarted
+    (e.g. box-a2 mid-diffusion) — clearing ``claimed_by`` trips that live
+    worker's :class:`JobStatusWatcher`, which hard-exits it (operator report:
+    "box-a2 stopped taking GPU tasks" after an unrelated dispatcher restart). A
+    live worker beats every ``HEARTBEAT_INTERVAL_S`` (10 s), so a fresh
+    heartbeat reliably means "still running its job — leave it alone".
+
+    Correctness doesn't hinge on perfect timing: any orphan this skips (e.g. a
+    full-fleet restart where the new workers beat before this runs) is still
+    caught by :func:`reclaim_expired_leases` once the dead lease lapses. So this
+    is a fast-path optimisation that is now also SAFE for partial restarts.
 
     Returns the reclaimed rows' ``id`` / ``run_id`` / ``node_id``."""
     with connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            UPDATE workflow_node_jobs
+            UPDATE workflow_node_jobs j
             SET status = 'queued',
                 started_at = NULL,
                 claimed_by = NULL,
                 lease_expires_at = NULL,
-                priority = LEAST(priority, 10)
-            WHERE status = 'running'
+                priority = LEAST(j.priority, 10)
+            WHERE j.status = 'running'
+              AND NOT EXISTS (
+                SELECT 1 FROM worker_heartbeats h
+                WHERE h.host_label = j.claimed_by
+                  AND h.queue = j.queue
+                  AND h.last_seen > now() - make_interval(secs => %(stale_s)s)
+              )
             RETURNING id, run_id, node_id
             """,
+            {"stale_s": float(STALE_WORKER_AFTER_S)},
         )
         return list(cur.fetchall())
 

@@ -266,17 +266,17 @@ def test_ingest_sweep_does_not_reclaim_fresh_lease():
 # ── reclaim ALL running (the restart-resume hook, NOT lease-expiry) ──────────
 
 
-def test_reclaim_all_requeues_running_regardless_of_lease():
-    """``reclaim_all_running_for_resume`` re-queues EVERY running row — even one
-    with a FRESH lease the expiry sweep deliberately leaves alone. That's the
-    restart case: the fleet was just bounced, so the worker is gone even though
-    the lease hasn't lapsed yet — don't make the row wait out 600s."""
+def test_reclaim_all_requeues_dead_workers_running_row():
+    """``reclaim_all_running_for_resume`` re-queues a running row whose claiming
+    worker is GONE — even with a FRESH lease the expiry sweep leaves alone.
+    ``host-x`` has no heartbeat here, so it counts as dead and the row is
+    reclaimed at once instead of waiting out the 600s lease."""
     run_id = _make_run()
     job_id = node_queue.enqueue_node_job(
         run_id=run_id, node_id="a", node_module="x", queue="gpu",
         required_model="qwen_edit", priority=100,
     )
-    force_lease(job_id, expires_in_s=600)  # fresh — the expiry sweep won't touch it
+    force_lease(job_id, expires_in_s=600)  # fresh lease, but host-x has no heartbeat → dead
     assert node_queue.reclaim_expired_leases() == []  # sanity: not yet expired
 
     rows = node_queue.reclaim_all_running_for_resume()
@@ -287,6 +287,31 @@ def test_reclaim_all_requeues_running_regardless_of_lease():
     assert row["lease_expires_at"] is None
     assert row["started_at"] is None
     assert row["priority"] <= 10
+
+
+def test_reclaim_all_leaves_live_workers_running_row():
+    """Regression — "box-a2 stopped taking GPU tasks". A running row whose
+    claiming worker is STILL ALIVE (fresh heartbeat on the job's queue) must NOT
+    be reclaimed on orchestrator boot: re-queuing it clears ``claimed_by`` and
+    trips the live worker's JobStatusWatcher into a hard-exit. The orchestrator/
+    dispatcher container restarts independently of the GPU claim workers, so its
+    boot recovery must only touch genuinely-orphaned (dead-worker) rows; the
+    lease sweep backstops anything it skips."""
+    run_id = _make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="a", node_module="x", queue="gpu",
+        required_model="qwen_edit", priority=100,
+    )
+    force_lease(job_id, expires_in_s=600)  # claimed_by='host-x', running
+    node_queue.upsert_worker_heartbeat(
+        host_label="host-x", queue="gpu", concurrency=1,
+    )  # host-x is ALIVE
+
+    rows = node_queue.reclaim_all_running_for_resume()
+    assert all(r["id"] != job_id for r in rows), "a live worker's job must not be reclaimed"
+    row = node_queue.get_node_job(job_id)
+    assert row["status"] == "running"
+    assert row["claimed_by"] == "host-x"
 
 
 def test_reclaim_all_noop_when_nothing_running():
