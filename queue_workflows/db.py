@@ -128,6 +128,71 @@ def cursor() -> Iterator[psycopg.Cursor]:
             yield cur
 
 
+_LISTEN_RECONNECT_BASE_S = 1.0
+_LISTEN_RECONNECT_MAX_S = 30.0
+
+
+def listen_with_reconnect(
+    channel: str,
+    stop_event: "object",
+    loop_body: Callable[[psycopg.Connection], None],
+    *,
+    base_s: float = _LISTEN_RECONNECT_BASE_S,
+    max_s: float = _LISTEN_RECONNECT_MAX_S,
+    connect_fn: Callable[[], psycopg.Connection] | None = None,
+) -> None:
+    """Run ``loop_body(listen_conn)`` against a freshly-opened autocommit
+    psycopg connection that has issued ``LISTEN <channel>``. If
+    ``psycopg.OperationalError`` escapes ``loop_body`` (e.g. PG was bounced
+    and severed the connection mid ``.notifies()``), reconnect with exponential
+    backoff and call ``loop_body`` against the fresh connection. Returns when
+    ``loop_body`` returns cleanly (caller's stop signal fired) or when
+    ``stop_event.wait(...)`` returns True during a backoff sleep.
+
+    This is the durable fix for the documented "PG-restart strands workers"
+    pattern: every restart of the central Postgres used to crash every worker's
+    ``run_forever`` because psycopg's ``.notifies()`` raises OperationalError
+    when the server closes the connection, and ``run_forever`` had no retry
+    around it. The five LISTEN sites in the engine (claim_worker × 3,
+    worker_control × 1, llm_backends/factory × 1) all funnel through this
+    helper so any of them can survive a transient PG outage.
+
+    Parameters:
+      channel:     PG NOTIFY channel to LISTEN on.
+      stop_event:  threading.Event-like (.is_set(), .wait(s)). When the event
+                   fires, the helper returns at the next backoff boundary
+                   without trying to reconnect.
+      loop_body:   The work to do against the live LISTEN connection. It
+                   should respect ``stop_event`` and return when it fires.
+      base_s/max_s: Exponential backoff floor/ceiling between reconnect
+                   attempts. Successful connect resets backoff to base_s.
+      connect_fn:  Test seam — defaults to ``psycopg.connect(db_url(),
+                   autocommit=True)``. Tests inject a generator of fake
+                   connections so the reconnect path can be exercised
+                   without a live PG.
+    """
+    if connect_fn is None:
+        def connect_fn():
+            return psycopg.connect(db_url(), autocommit=True)
+
+    backoff = base_s
+    while not stop_event.is_set():
+        try:
+            with connect_fn() as listen_conn:
+                listen_conn.execute(f"LISTEN {channel}")
+                backoff = base_s        # successful connect → reset backoff
+                loop_body(listen_conn)
+            return                       # loop_body returned cleanly (stop)
+        except psycopg.OperationalError as exc:
+            log.warning(
+                "[listen-reconnect:%s] %s: %s — reconnecting in %.1fs",
+                channel, exc.__class__.__name__, exc, backoff,
+            )
+            if stop_event.wait(backoff):
+                return                   # stop fired during the backoff sleep
+            backoff = min(backoff * 2.0, max_s)
+
+
 def _forward_migrations(migrations_dir: Path) -> list[tuple[int, Path]]:
     """Sorted list of (version, path) for every forward migration,
     skipping the ``.down.sql`` pairs."""

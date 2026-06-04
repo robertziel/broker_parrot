@@ -372,21 +372,26 @@ class BackendFactory:
         keyed entry on each NOTIFY. MIRRORS ``WorkerControlWatcher._loop``: a
         ``notifies(timeout=…, stop_after=1)`` wait so ``stop()`` is observed within
         one poll; the whole loop swallows + logs on crash (a dropped LISTEN must not
-        take down the worker — the TTL re-read still keeps configs fresh)."""
-        import psycopg
+        take down the worker — the TTL re-read still keeps configs fresh).
 
+        PG-reconnect: a PG bounce mid-watch used to crash the daemon (only the
+        TTL re-read kept configs fresh from then on); the helper now reconnects
+        so instant config invalidation survives a PG restart."""
+        from queue_workflows.db import listen_with_reconnect
+
+        def _body(listen_conn):
+            while not self._listener_stop.is_set():
+                for notify in listen_conn.notifies(
+                    timeout=self._ttl_s, stop_after=1,
+                ):
+                    self._handle_notify(notify.payload)
+                if self._listener_stop.is_set():
+                    return
         try:
-            with psycopg.connect(db_url(), autocommit=True) as listen_conn:
-                listen_conn.execute(
-                    f"LISTEN {worker_control.LLM_CONFIG_NOTIFY_CHANNEL}"
-                )
-                while not self._listener_stop.is_set():
-                    for notify in listen_conn.notifies(
-                        timeout=self._ttl_s, stop_after=1,
-                    ):
-                        self._handle_notify(notify.payload)
-                    if self._listener_stop.is_set():
-                        return
+            listen_with_reconnect(
+                worker_control.LLM_CONFIG_NOTIFY_CHANNEL,
+                self._listener_stop, _body,
+            )
         except Exception:
             log.exception("[BackendFactory] config-invalidator loop crashed")
 

@@ -435,24 +435,30 @@ class WorkerControlWatcher:
         self._thread.start()
 
     def _loop(self) -> None:
-        import psycopg
+        from queue_workflows.db import listen_with_reconnect
 
         # Catch a row written BEFORE we subscribed (e.g. set OFF while this worker
         # was mid-boot) before blocking on the NOTIFY.
         if self.check_once():
             return
+        # PG-reconnect: this watcher is a long-lived daemon thread; a PG
+        # bounce mid-watch used to crash it silently and the operator's
+        # on/off control no longer reached the worker until restart.
+        done = {"stop": False}
+        def _body(listen_conn):
+            while not self._stop.is_set():
+                for _ in listen_conn.notifies(
+                    timeout=self._poll_s, stop_after=1,
+                ):
+                    break
+                if self._stop.is_set():
+                    done["stop"] = True
+                    return
+                if self.check_once():
+                    done["stop"] = True
+                    return
         try:
-            with psycopg.connect(db_url(), autocommit=True) as listen_conn:
-                listen_conn.execute(f"LISTEN {NOTIFY_CHANNEL}")
-                while not self._stop.is_set():
-                    for _ in listen_conn.notifies(
-                        timeout=self._poll_s, stop_after=1,
-                    ):
-                        break
-                    if self._stop.is_set():
-                        return
-                    if self.check_once():
-                        return
+            listen_with_reconnect(NOTIFY_CHANNEL, self._stop, _body)
         except Exception:
             log.exception("[worker-control:%s] watcher loop crashed", self._queue)
 

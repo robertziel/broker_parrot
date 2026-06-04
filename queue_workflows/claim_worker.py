@@ -1726,82 +1726,87 @@ class ClaimWorker:
              block on the wake NOTIFY with the safety-poll timeout, then re-loop.
 
         Stops cleanly when ``self._stop`` is set (the run_forever finally also
-        shuts the pool down)."""
-        import psycopg
+        shuts the pool down).
+
+        PG-reconnect: the LISTEN connection is opened via
+        :func:`db.listen_with_reconnect`, so a PG bounce no longer kills the
+        feeder loop — the helper reopens the connection with exponential
+        backoff and re-runs the body."""
+        def _body(listen_conn):
+            while not self._stop.is_set():
+                par = self._pool_parallelism()
+                pool = self._ensure_pool(par)
+                claimed_any = False
+                while not self._stop.is_set():
+                    # FILL-BEFORE-SPILL gate (additive): if a fresh
+                    # higher-ranked vLLM/ollama peer still has free VLM
+                    # capacity, DEFER this cycle — let that machine fill its
+                    # PAR slots first so light load consolidates onto one box
+                    # (others stay free for diffusion / idle-unload). We do
+                    # NOT claim-then-release: just don't claim. Failure-safe
+                    # — a query blip falls through to today's spread behaviour
+                    # (claim now), never crashes the feeder. The single-box /
+                    # no-fresh-higher-peer case returns False ⇒ byte-identical
+                    # to today. Checked BEFORE reserving a slot so a deferral
+                    # leaves the in-flight counter untouched.
+                    try:
+                        defer = node_queue.vlm_pool_should_defer(self.host, par)
+                    except Exception:
+                        log.exception(
+                            "[claim-worker:gpu:pool] defer check failed; "
+                            "claiming (spread fallback)"
+                        )
+                        defer = False
+                    if defer:
+                        break
+                    with self._pool_lock:
+                        # Budget = PAR minus the inline diffusion slot when
+                        # busy, so the machine's TOTAL node-jobs (inline + pool)
+                        # stays ≤ PAR (the diffusion takes one of the PAR slots).
+                        if self._pool_inflight >= self._pool_budget(par):
+                            break
+                        # Reserve the slot BEFORE the claim/submit so a
+                        # concurrent decrement can't let us exceed the budget.
+                        self._pool_inflight += 1
+                    try:
+                        job = self._claim_pool()
+                    except Exception:
+                        log.exception(
+                            "[claim-worker:gpu:pool] claim failed"
+                        )
+                        job = None
+                    if job is None:
+                        # Nothing to run — release the reserved slot.
+                        with self._pool_lock:
+                            self._pool_inflight -= 1
+                        break
+                    claimed_any = True
+                    try:
+                        pool.submit(self._pool_run_and_release, job)
+                    except Exception:
+                        # Submit failed (pool shutting down) — release the
+                        # slot and finalise the row's fate to lease reclaim.
+                        log.exception(
+                            "[claim-worker:gpu:pool] submit failed for %s",
+                            job.get("id"),
+                        )
+                        with self._pool_lock:
+                            self._pool_inflight -= 1
+                        break
+                if self._stop.is_set():
+                    break
+                # Drained or PAR-full: block on the wake NOTIFY (short
+                # safety-poll timeout) before the next cycle. A claim this
+                # cycle ⇒ loop straight back to drain greedily.
+                if not claimed_any:
+                    for _ in listen_conn.notifies(
+                        timeout=NOTIFY_POLL_TIMEOUT_S, stop_after=1,
+                    ):
+                        break
 
         try:
-            with psycopg.connect(db_url(), autocommit=True) as listen_conn:
-                listen_conn.execute(f"LISTEN {self._wake_channel}")
-                while not self._stop.is_set():
-                    par = self._pool_parallelism()
-                    pool = self._ensure_pool(par)
-                    claimed_any = False
-                    while not self._stop.is_set():
-                        # FILL-BEFORE-SPILL gate (additive): if a fresh
-                        # higher-ranked vLLM/ollama peer still has free VLM
-                        # capacity, DEFER this cycle — let that machine fill its
-                        # PAR slots first so light load consolidates onto one box
-                        # (others stay free for diffusion / idle-unload). We do
-                        # NOT claim-then-release: just don't claim. Failure-safe
-                        # — a query blip falls through to today's spread behaviour
-                        # (claim now), never crashes the feeder. The single-box /
-                        # no-fresh-higher-peer case returns False ⇒ byte-identical
-                        # to today. Checked BEFORE reserving a slot so a deferral
-                        # leaves the in-flight counter untouched.
-                        try:
-                            defer = node_queue.vlm_pool_should_defer(self.host, par)
-                        except Exception:
-                            log.exception(
-                                "[claim-worker:gpu:pool] defer check failed; "
-                                "claiming (spread fallback)"
-                            )
-                            defer = False
-                        if defer:
-                            break
-                        with self._pool_lock:
-                            # Budget = PAR minus the inline diffusion slot when
-                            # busy, so the machine's TOTAL node-jobs (inline + pool)
-                            # stays ≤ PAR (the diffusion takes one of the PAR slots).
-                            if self._pool_inflight >= self._pool_budget(par):
-                                break
-                            # Reserve the slot BEFORE the claim/submit so a
-                            # concurrent decrement can't let us exceed the budget.
-                            self._pool_inflight += 1
-                        try:
-                            job = self._claim_pool()
-                        except Exception:
-                            log.exception(
-                                "[claim-worker:gpu:pool] claim failed"
-                            )
-                            job = None
-                        if job is None:
-                            # Nothing to run — release the reserved slot.
-                            with self._pool_lock:
-                                self._pool_inflight -= 1
-                            break
-                        claimed_any = True
-                        try:
-                            pool.submit(self._pool_run_and_release, job)
-                        except Exception:
-                            # Submit failed (pool shutting down) — release the
-                            # slot and finalise the row's fate to lease reclaim.
-                            log.exception(
-                                "[claim-worker:gpu:pool] submit failed for %s",
-                                job.get("id"),
-                            )
-                            with self._pool_lock:
-                                self._pool_inflight -= 1
-                            break
-                    if self._stop.is_set():
-                        break
-                    # Drained or PAR-full: block on the wake NOTIFY (short
-                    # safety-poll timeout) before the next cycle. A claim this
-                    # cycle ⇒ loop straight back to drain greedily.
-                    if not claimed_any:
-                        for _ in listen_conn.notifies(
-                            timeout=NOTIFY_POLL_TIMEOUT_S, stop_after=1,
-                        ):
-                            break
+            from queue_workflows.db import listen_with_reconnect
+            listen_with_reconnect(self._wake_channel, self._stop, _body)
         except Exception:
             log.exception(
                 "[claim-worker:gpu:pool] feeder loop crashed (pool lane down; "
@@ -1936,8 +1941,12 @@ class ClaimWorker:
             self.queue, self.host,
         )
         poll_s = worker_control._worker_control_poll_s()
-        with psycopg.connect(db_url(), autocommit=True) as listen_conn:
-            listen_conn.execute(f"LISTEN {worker_control.NOTIFY_CHANNEL}")
+        # PG-reconnect: park loop is long-lived (can be parked for hours), so a
+        # PG bounce mid-park must NOT exit the worker — the helper reconnects
+        # and the body resumes waiting for the ON flip.
+        from queue_workflows.db import listen_with_reconnect
+        result = {"on": False}
+        def _body(listen_conn):
             while not self._stop.is_set():
                 if (
                     worker_control.desired_state_for(self.host, self.queue)
@@ -1947,10 +1956,12 @@ class ClaimWorker:
                         "[claim-worker:%s] control state ON for host=%s — resuming",
                         self.queue, self.host,
                     )
-                    return True
+                    result["on"] = True
+                    return
                 for _ in listen_conn.notifies(timeout=poll_s, stop_after=1):
                     break
-        return False
+        listen_with_reconnect(worker_control.NOTIFY_CHANNEL, self._stop, _body)
+        return result["on"]
 
     def run_forever(self) -> None:
         """Block on ``LISTEN <wake_channel>`` and drain the queue greedily on
@@ -2010,23 +2021,29 @@ class ClaimWorker:
         # The inline loop below now claims require_model=True (diffusion) only;
         # the two lanes' claim sets are disjoint so neither steals the other's.
         self._start_pool_lane()
+        # PG-reconnect: the central claim loop is the highest-impact LISTEN
+        # site — a PG bounce mid-run_forever used to exit(1) the worker
+        # process and the documented "PG-restart strands workers" pattern
+        # would leave it Exited until ops re-bounced the container. The
+        # helper now reconnects with backoff and resumes claim_once.
+        from queue_workflows.db import listen_with_reconnect
+        def _body(listen_conn):
+            while not self._stop.is_set():
+                # Drain greedily until the queue is empty.
+                try:
+                    while not self._stop.is_set() and self.run_once():
+                        pass
+                except Exception:
+                    log.exception("[claim-worker:%s] run_once failed", self.queue)
+                if self._stop.is_set():
+                    break
+                # Idle: block on the wake NOTIFY with a safety-poll timeout.
+                for _ in listen_conn.notifies(
+                    timeout=NOTIFY_POLL_TIMEOUT_S, stop_after=1,
+                ):
+                    break
         try:
-            with psycopg.connect(db_url(), autocommit=True) as listen_conn:
-                listen_conn.execute(f"LISTEN {self._wake_channel}")
-                while not self._stop.is_set():
-                    # Drain greedily until the queue is empty.
-                    try:
-                        while not self._stop.is_set() and self.run_once():
-                            pass
-                    except Exception:
-                        log.exception("[claim-worker:%s] run_once failed", self.queue)
-                    if self._stop.is_set():
-                        break
-                    # Idle: block on the wake NOTIFY with a safety-poll timeout.
-                    for _ in listen_conn.notifies(
-                        timeout=NOTIFY_POLL_TIMEOUT_S, stop_after=1,
-                    ):
-                        break
+            listen_with_reconnect(self._wake_channel, self._stop, _body)
         finally:
             # Stop the GPU VLM pool lane FIRST so the feeder stops claiming new
             # work before the rest of the teardown (no-op for cpu/ingest).
