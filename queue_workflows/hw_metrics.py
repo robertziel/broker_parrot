@@ -78,23 +78,55 @@ def _gpu_probe() -> list[dict[str, Any]]:
     return _GPU_PROBE()
 
 
+# Below this, a probed "total VRAM" is treated as UNKNOWN, not as a real cap.
+# Unified-memory GPUs make the smi "dedicated VRAM total" meaningless: an AMD
+# APU's rocm-smi reports a tiny carveout (observed 512 MB on box-b) while the
+# real model memory comes from shared system RAM, and a Grace-Blackwell box-c
+# reports none at all. A reading this small can only be a carveout/parse
+# artifact — never a GPU that actually runs multi-GB diffusion models — so we
+# FAIL OPEN (return None ⇒ "capacity unknown" ⇒ the claim gate falls back to
+# claim-any) rather than gate the worker to "fits nothing". Env-overridable.
+MIN_PLAUSIBLE_VRAM_MB = 2048
+
+#: Operator override for total GPU VRAM (MB). The RELIABLE source on this fleet's
+#: unified-memory hardware, where the smi probe can't report a meaningful total.
+#: Set per host (e.g. in compose) to ACTIVATE capacity-aware assignment; unset ⇒
+#: the probe is used, and an implausible/absent probe ⇒ unknown ⇒ claim-any.
+_VRAM_TOTAL_ENV = "AI_LEADS_GPU_VRAM_TOTAL_MB"
+
+
 def total_vram_mb() -> int | None:
     """The machine's TOTAL GPU VRAM in MB — the capacity a single model load is
     measured against.
 
-    A model's weights load onto ONE device, so capacity is the LARGEST single
-    GPU's ``vram_total_mb`` (not the sum across cards). Returns ``None`` when no
-    GPU is detected or the probe fails / reports zero — callers treat ``None`` as
-    "capacity unknown" (advertise nothing, fall back to claim-any). Best-effort:
-    never raises."""
+    Resolution order:
+      1. ``AI_LEADS_GPU_VRAM_TOTAL_MB`` if set (operator-declared truth — the
+         reliable source on unified-memory GPUs where the smi total is bogus).
+      2. else the LARGEST single GPU's probed ``vram_total_mb`` (a model loads on
+         ONE device, so capacity is the max single card, not the sum) — but only
+         if it is at least :data:`MIN_PLAUSIBLE_VRAM_MB`.
+      3. else ``None`` — "capacity unknown". Callers FAIL OPEN on ``None`` (claim
+         any model), so a missing/bogus probe never wedges a worker to "fits
+         nothing". Best-effort: never raises.
+    """
+    raw = (os.environ.get(_VRAM_TOTAL_ENV, "") or "").strip()
+    if raw:
+        try:
+            v = int(float(raw))
+            return v if v > 0 else None
+        except (TypeError, ValueError):
+            log.warning("[hw_metrics] %s=%r is not an int; ignoring", _VRAM_TOTAL_ENV, raw)
     try:
         gpus = _gpu_probe()
     except Exception:
         log.exception("[hw_metrics] total_vram_mb probe failed; treating as unknown")
         return None
     totals = [int(g.get("vram_total_mb") or 0) for g in (gpus or [])]
-    totals = [t for t in totals if t > 0]
-    return max(totals) if totals else None
+    best = max(totals) if totals else 0
+    if best < MIN_PLAUSIBLE_VRAM_MB:
+        # Implausibly small (unified-memory carveout) or no GPU ⇒ unknown.
+        return None
+    return best
 
 
 def _select_gpu_probe() -> typing.Callable[[], list[dict[str, Any]]]:

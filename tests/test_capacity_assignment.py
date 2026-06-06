@@ -77,6 +77,28 @@ def test_total_vram_mb_none_when_no_gpu(monkeypatch):
     assert hw_metrics.total_vram_mb() is None
 
 
+def test_total_vram_mb_implausibly_small_is_unknown(monkeypatch):
+    # An AMD APU's rocm-smi carveout (observed 512 MB) must read as UNKNOWN
+    # (None ⇒ fail-open / claim-any), NOT as a 512 MB cap that fits nothing.
+    monkeypatch.delenv("AI_LEADS_GPU_VRAM_TOTAL_MB", raising=False)
+    monkeypatch.setattr(hw_metrics, "_gpu_probe", lambda: [{"vram_total_mb": 512}])
+    assert hw_metrics.total_vram_mb() is None
+
+
+def test_total_vram_mb_env_override_wins(monkeypatch):
+    # Operator-declared capacity is the reliable source on unified-memory GPUs;
+    # it overrides whatever the (bogus) probe says.
+    monkeypatch.setenv("AI_LEADS_GPU_VRAM_TOTAL_MB", "131072")
+    monkeypatch.setattr(hw_metrics, "_gpu_probe", lambda: [{"vram_total_mb": 512}])
+    assert hw_metrics.total_vram_mb() == 131072
+
+
+def test_total_vram_mb_env_override_invalid_falls_back(monkeypatch):
+    monkeypatch.setenv("AI_LEADS_GPU_VRAM_TOTAL_MB", "not-a-number")
+    monkeypatch.setattr(hw_metrics, "_gpu_probe", lambda: [{"vram_total_mb": 81920}])
+    assert hw_metrics.total_vram_mb() == 81920
+
+
 def test_total_vram_mb_swallows_probe_error(monkeypatch):
     def _boom():
         raise RuntimeError("nvidia-smi gone")
