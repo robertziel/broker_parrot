@@ -73,6 +73,7 @@ def configure(
     db_namespace: str | None = None,
     cancel_orphan_queued_jobs: bool | None = None,
     vlm_pool_node_modules: frozenset[str] | None = None,
+    gpu_self_load_node_modules: frozenset[str] | None = None,
 ) -> EngineConfig:
     """Set engine configuration values. Only the passed keyword args are
     mutated; the rest keep their (ai_leads-byte-compatible) defaults. Returns
@@ -119,6 +120,8 @@ def configure(
             cfg.cancel_orphan_queued_jobs = bool(cancel_orphan_queued_jobs)
         if vlm_pool_node_modules is not None:
             cfg.vlm_pool_node_modules = frozenset(vlm_pool_node_modules)
+        if gpu_self_load_node_modules is not None:
+            cfg.gpu_self_load_node_modules = frozenset(gpu_self_load_node_modules)
     return cfg
 
 

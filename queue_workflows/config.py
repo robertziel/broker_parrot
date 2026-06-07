@@ -84,6 +84,15 @@ class EngineConfig:
     #: Empty (default) ⇒ legacy behaviour: every no-model GPU job is pool-eligible
     #: (keeps other consumers byte-identical).
     vlm_pool_node_modules: frozenset[str] = frozenset()
+    #: GPU node modules that intentionally run WITHOUT a cache-managed ``model``
+    #: and are therefore EXEMPT from the required-model guard
+    #: (:func:`dispatcher._assert_gpu_nodes_declare_model`). Genuine VLM-facade
+    #: nodes already live in ``vlm_pool_node_modules``; this set is for in-process
+    #: self-loaders not yet migrated onto the warm cache (they manage their own
+    #: load/unload). A ``gpu:true`` node whose module is in NEITHER set MUST
+    #: declare a ``model`` — else the run is rejected at expansion (no more silent
+    #: ``required_model=NULL`` → wrong lane / no warm cache / blank heartbeat).
+    gpu_self_load_node_modules: frozenset[str] = frozenset()
     #: Dotted package the node-module resolver imports under (e.g.
     #: ``"workflows.nodes"``). Empty ⇒ the stored ``node_module`` is treated as
     #: a fully-qualified importable module name.

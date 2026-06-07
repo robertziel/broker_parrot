@@ -231,6 +231,40 @@ def _required_model(node: dict[str, Any]) -> str | None:
     return None
 
 
+def _assert_gpu_nodes_declare_model(
+    workflow: dict[str, Any], run: dict[str, Any] | None = None
+) -> None:
+    """Guard: every ``gpu:true`` node MUST resolve to a ``required_model`` unless
+    its module is explicitly exempt — a VLM-facade node (``vlm_pool_node_modules``)
+    or an in-process self-loader pending migration (``gpu_self_load_node_modules``).
+
+    A ``gpu:true`` node with no ``model`` enqueues with ``required_model=NULL`` →
+    routed to the no-model pool lane, no warm-cache affinity, no VRAM/capacity
+    accounting, blank ``worker_heartbeats.current_model``. That used to happen
+    SILENTLY (``_required_model`` just returned None); here it is a LOUD error at
+    run expansion so a mis-declared schema can't ship a model-blind GPU node.
+    """
+    cfg = get_config()
+    exempt = set(cfg.vlm_pool_node_modules) | set(
+        getattr(cfg, "gpu_self_load_node_modules", frozenset())
+    )
+    offenders: list[str] = []
+    for n in _nodes_of(workflow, run=run):
+        if not n.get("gpu") or n.get("model"):
+            continue
+        module = n.get("node") or n.get("id")
+        if module in exempt:
+            continue
+        offenders.append(f"{n.get('id')} (module={module!r})")
+    if offenders:
+        raise ValueError(
+            "gpu:true node(s) without a declared 'model' would enqueue with "
+            "required_model=NULL — declare a registered model in the schema, or "
+            "add the module to vlm_pool_node_modules / gpu_self_load_node_modules "
+            "if it intentionally self-manages its model: " + ", ".join(offenders)
+        )
+
+
 # ── Ready-node search ────────────────────────────────────────────────────
 
 
@@ -361,6 +395,16 @@ def start_run(run_id: str) -> int:
     if not run:
         raise KeyError(run_id)
     wf = _load_workflow(run["workflow_name"])
+    try:
+        _assert_gpu_nodes_declare_model(wf, run)
+    except ValueError as exc:
+        # Fail the run LOUDLY (operator-visible) instead of raising into the
+        # NodePool tick, which would re-select the still-``queued`` run forever.
+        run_store.update_run(
+            run_id, status="failed", finished_at=_now(), error=str(exc)
+        )
+        log.error("[dispatcher] start_run %s rejected: %s", run_id, exc)
+        return 0
     return _process_ready(run_id, wf, run)
 
 
