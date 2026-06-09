@@ -45,6 +45,8 @@ def resolve_ref(value: Any, context: dict) -> Any:
         return value
     if "$value" in value:
         return value["$value"]
+    if "$coalesce" in value:
+        return _coalesce(value, context)
     if "$from" in value:
         result = _dig(context, value["$from"])
         if "$filter" in value:
@@ -60,6 +62,40 @@ def resolve_ref(value: Any, context: dict) -> Any:
         return result
     # Plain dict → recurse so nested $from work as object values
     return {k: resolve_ref(v, context) for k, v in value.items()}
+
+
+def _coalesce(value: dict, context: dict) -> Any:
+    """Resolve ``{"$coalesce": [ref1, ref2, …], "$default": X?}`` to the FIRST
+    candidate that resolves to a non-None value — SKIPPING candidates whose ref
+    is missing from the context (a ``KeyError`` from ``$from``).
+
+    This is the lane-CONVERGENCE primitive: N mutually-exclusive lanes feed one
+    shared downstream step (``depends_on`` all of them; the unchosen lanes are
+    ``skip_if``-skipped and write no context), and the step reads
+    ``{"$coalesce": [{"$from": "lane_a.out"}, {"$from": "lane_b.out"}]}`` to pick
+    whichever lane actually ran — without the duplicated-tail workaround. A
+    skipped lane's ``$from`` raises ``KeyError`` (the step isn't in the context);
+    ``$coalesce`` swallows that and tries the next candidate.
+
+    All candidates missing/None → return ``$default`` if given, else raise
+    ``KeyError`` (a genuinely unresolved ref is still an error)."""
+    candidates = value["$coalesce"]
+    if not isinstance(candidates, list):
+        raise TypeError(
+            f"$coalesce expects a list, got {type(candidates).__name__}"
+        )
+    for cand in candidates:
+        try:
+            resolved = resolve_ref(cand, context)
+        except KeyError:
+            continue
+        if resolved is not None:
+            return resolved
+    if "$default" in value:
+        return value["$default"]
+    raise KeyError(
+        f"$coalesce: no candidate resolved (and no $default): {candidates!r}"
+    )
 
 
 def _dig(obj: Any, dotted_path: str) -> Any:

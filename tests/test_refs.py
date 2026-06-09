@@ -140,3 +140,54 @@ def test_filter_on_non_list_raises():
             {"$from": "parcel", "$filter": {"kind:eq": "x"}},
             {"parcel": {"lat": 1.0}},
         )
+
+
+# ── $coalesce (lane convergence) ──────────────────────────────────────────────
+
+def test_coalesce_returns_first_resolvable():
+    ctx = {"a": {"x": 1}, "b": {"x": 2}}
+    assert resolve_ref({"$coalesce": [{"$from": "a.x"}, {"$from": "b.x"}]}, ctx) == 1
+
+
+def test_coalesce_skips_missing_lane():
+    # The lane-convergence case: lane "a" was SKIPPED (absent from context), so its
+    # $from raises KeyError; $coalesce swallows it and returns lane "b".
+    ctx = {"b": {"collage_path": "/runs/x/paint_fence_gf/collage.png"}}
+    out = resolve_ref(
+        {"$coalesce": [
+            {"$from": "a.collage_path"},     # skipped lane → KeyError, skipped
+            {"$from": "b.collage_path"},     # the lane that ran
+        ]},
+        ctx,
+    )
+    assert out == "/runs/x/paint_fence_gf/collage.png"
+
+
+def test_coalesce_skips_none_values():
+    ctx = {"a": {"x": None}, "b": {"x": 7}}
+    assert resolve_ref({"$coalesce": [{"$from": "a.x"}, {"$from": "b.x"}]}, ctx) == 7
+
+
+def test_coalesce_all_missing_raises():
+    with pytest.raises(KeyError, match="no candidate resolved"):
+        resolve_ref({"$coalesce": [{"$from": "a.x"}, {"$from": "b.x"}]}, {})
+
+
+def test_coalesce_all_missing_uses_default():
+    out = resolve_ref(
+        {"$coalesce": [{"$from": "a.x"}, {"$from": "b.x"}], "$default": "fallback"},
+        {},
+    )
+    assert out == "fallback"
+
+
+def test_coalesce_non_list_raises():
+    with pytest.raises(TypeError, match="\\$coalesce expects a list"):
+        resolve_ref({"$coalesce": {"$from": "a.x"}}, {"a": {"x": 1}})
+
+
+def test_coalesce_supports_value_and_filter_candidates():
+    # Candidates are full refs — a $value literal works as a final fallback.
+    assert resolve_ref(
+        {"$coalesce": [{"$from": "missing.x"}, {"$value": "lit"}]}, {}
+    ) == "lit"

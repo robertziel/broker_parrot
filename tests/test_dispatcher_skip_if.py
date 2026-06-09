@@ -103,6 +103,60 @@ def test_find_ready_blocks_on_running_dep():
     assert "b" not in ids
 
 
+# ── lane CONVERGENCE: a step depending on N mutually-exclusive lanes ──────
+
+
+def _converge_wf():
+    """Two mutually-exclusive lanes (a/b) gated by a turnout, both feeding ONE
+    converging step (the DRY merge pattern, replacing per-lane duplicated tails)."""
+    return {
+        "name": "wf",
+        "mode": "node",
+        "steps": [
+            {"id": "pick", "kind": "input", "widget": "turnout"},
+            {"id": "a_lane", "kind": "input", "widget": "confirm",
+             "depends_on": ["pick"], "skip_if": {"$from": "pick.lane", "$ne": "a"}},
+            {"id": "b_lane", "kind": "input", "widget": "confirm",
+             "depends_on": ["pick"], "skip_if": {"$from": "pick.lane", "$ne": "b"}},
+            {"id": "merge", "kind": "input", "widget": "confirm",
+             "depends_on": ["a_lane", "b_lane"]},
+        ],
+    }
+
+
+def test_converging_step_ready_when_lane_a_ran_lane_b_skipped():
+    # a ran, b skipped → the converging step (depends on BOTH) must become ready.
+    existing = {
+        "pick": {"status": "completed"},
+        "a_lane": {"status": "completed"},
+        "b_lane": {"status": "skipped"},
+    }
+    ready = dispatcher._find_ready_nodes(_converge_wf(), existing)
+    assert "merge" in [n["id"] for n in ready]
+
+
+def test_converging_step_ready_when_lane_b_ran_lane_a_skipped():
+    existing = {
+        "pick": {"status": "completed"},
+        "a_lane": {"status": "skipped"},
+        "b_lane": {"status": "completed"},
+    }
+    ready = dispatcher._find_ready_nodes(_converge_wf(), existing)
+    assert "merge" in [n["id"] for n in ready]
+
+
+def test_converging_step_NOT_ready_while_a_lane_still_pending():
+    # Only becomes ready once BOTH lanes are terminal (completed/skipped) — a
+    # lane still in flight must hold the merge back.
+    existing = {
+        "pick": {"status": "completed"},
+        "a_lane": {"status": "running"},
+        "b_lane": {"status": "skipped"},
+    }
+    ready = dispatcher._find_ready_nodes(_converge_wf(), existing)
+    assert "merge" not in [n["id"] for n in ready]
+
+
 # ── _nodes_of propagates skip_if ──────────────────────────────────────────
 
 
