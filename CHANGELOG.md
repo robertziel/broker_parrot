@@ -19,6 +19,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   routing the live scheduler / claim worker / reclaim sweep through the seam (so
   the ingest **worker process** runs on redis) is a follow-up.
 
+### Changed
+- **Default per-box CPU-worker count is now the box's available cores** (was a
+  hardcoded `5`). `node_pool.cpu_worker_count()` defaults to a new cgroup-aware
+  `_available_cpus()` — cgroup-v2 `cpu.max` quota → cgroup-v1 CFS quota → CPU
+  affinity/cpuset (`sched_getaffinity`) → `os.cpu_count()` → floor 1 — so each
+  box scales to its own capacity and a CPU-limited container counts its real
+  share, not the host's cores. The `AI_LEADS_WORKFLOW_CPU_WORKERS` override is
+  unchanged and `gpu_worker_count()` still defaults to `1`. NB: this is the
+  engine's *intended* per-box count (it backs the queue-snapshot fallback and a
+  deployment can read it); the engine does not itself spawn workers — running
+  that many `claim_worker` processes per box remains a deployment concern.
+
 ### Fixed
 - `db.reset_for_tests()` now keys its `*_test` safety guard on the parsed
   database **name** instead of a suffix of the whole DSN. A socket DSN
