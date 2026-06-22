@@ -56,10 +56,76 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _read_text(path: str) -> str:
+    with open(path) as f:
+        return f.read().strip()
+
+
+def _affinity_count() -> int:
+    # CPUs this process may actually run on (respects cpuset / taskset). Raises
+    # AttributeError on platforms without sched_getaffinity (e.g. macOS).
+    return len(os.sched_getaffinity(0))
+
+
+def _available_cpus(
+    *,
+    read_text: Callable[[str], str] = _read_text,
+    affinity_fn: Callable[[], int] = _affinity_count,
+    cpu_count_fn: Callable[[], "int | None"] = os.cpu_count,
+) -> int:
+    """Best-effort count of CPU cores AVAILABLE to this box — **cgroup-aware**,
+    because workers run in containers (a CFS-quota- or cpuset-limited container
+    must count its real share, not the host's cores). Detection order, first hit
+    wins, floored at 1:
+
+      1. cgroup **v2** ``/sys/fs/cgroup/cpu.max`` (``"<quota> <period>"``, or
+         ``"max …"`` = unlimited → skip). A set quota is authoritative — a
+         sub-1-cpu container yields 1, never the host count.
+      2. cgroup **v1** CFS quota (``cpu.cfs_quota_us`` / ``cpu.cfs_period_us``;
+         ``-1`` = unlimited → skip).
+      3. CPU **affinity** / cpuset (``sched_getaffinity``).
+      4. ``os.cpu_count()``.
+      5. ``1``.
+
+    The seams are test injection points; production uses the real fs / os calls.
+    """
+    # 1) cgroup v2 quota
+    try:
+        parts = read_text("/sys/fs/cgroup/cpu.max").split()
+        if len(parts) >= 2 and parts[0] != "max" and int(parts[1]) > 0:
+            return max(1, int(parts[0]) // int(parts[1]))
+    except (OSError, ValueError):
+        pass
+    # 2) cgroup v1 quota
+    try:
+        quota = int(read_text("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"))
+        period = int(read_text("/sys/fs/cgroup/cpu/cpu.cfs_period_us"))
+        if quota > 0 and period > 0:
+            return max(1, quota // period)
+    except (OSError, ValueError):
+        pass
+    # 3) CPU affinity (cpuset)
+    try:
+        n = affinity_fn()
+        if n and n >= 1:
+            return int(n)
+    except (OSError, AttributeError):
+        pass
+    # 4) reported count, 5) floor 1
+    return max(1, cpu_count_fn() or 1)
+
+
 def cpu_worker_count() -> int:
-    """Configured CPU-worker count (for the Rails queue snapshot fallback when
-    no worker_heartbeats rows exist yet)."""
-    return _int_env("AI_LEADS_WORKFLOW_CPU_WORKERS", 5)
+    """Intended per-box CPU-worker count. **Defaults to the box's available CPU
+    cores** (cgroup-aware, see :func:`_available_cpus`) so each box scales to its
+    own capacity; override with ``AI_LEADS_WORKFLOW_CPU_WORKERS``.
+
+    NOTE: the engine does NOT spawn workers from this — each ``claim_worker`` is
+    its own concurrency-1 process. This value backs the Rails queue-snapshot
+    fallback (before heartbeats exist) and is the engine's notion of the per-box
+    count a deployment can read to decide how many claim-worker processes to
+    launch; actually running that many is a deployment (compose/ansible) concern."""
+    return _int_env("AI_LEADS_WORKFLOW_CPU_WORKERS", _available_cpus())
 
 
 def gpu_worker_count() -> int:
