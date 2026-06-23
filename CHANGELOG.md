@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fleet view consumes — the per-worker counterpart to the count-only
   `snapshot`/`ingest_snapshot`; surfaces stale and dead-flagged workers rather
   than filtering them.
+- **`queue-conductor` console script — the operator-facing read side of the
+  GO-half conductor.** A single-DB, read-only fleet capacity view that renders
+  `fleet_snapshot()` for the configured database (`--queue` filter,
+  `--stale-after`, `--json`). Like every other console script it points at one
+  DSN via `db_url_env` (no stored fleet credentials, no networked service);
+  worker ON/OFF control stays in `queue-worker-control` (no duplication). The
+  multi-DB aggregating daemon + web UI that would wrap it are a separate,
+  out-of-band build.
 - **`gpu_pool` — shared GPU fleet (a namespace-scoped pool of self-contained GPU
   tasks).** A new module lets pooled GPU workers across apps claim + execute work
   from one shared store while each app keeps its own Postgres for run/DAG state.

@@ -35,6 +35,7 @@ queue-claim-worker   = "queue_workflows.claim_worker:main"   # generic CLIs (use
 queue-scheduler      = "queue_workflows.scheduler:main"
 queue-orchestrator   = "queue_workflows.orchestrator:main"
 queue-worker-control = "queue_workflows.worker_control:main"  # turn a (host,queue) worker ON/OFF
+queue-conductor      = "queue_workflows.conductor:cli"        # read-only fleet capacity view (worker_heartbeats)
 
 [tool.hatch.build.targets.wheel]
 packages = ["queue_workflows"]
