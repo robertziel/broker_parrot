@@ -60,6 +60,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   standalone redis-only worker process cannot yet boot without Postgres.
 
 ### Changed
+- **Docs: README + new `docs/conductor.md` and `docs/gpu_pool.md`** document the
+  architecture shipped this cycle — the shared GPU fleet (`gpu_pool`), the
+  fleet-observability read model (`fleet_snapshot` / `queue-conductor`), and the
+  client/conductor packaging split.
+- **Genericized example identifiers** in code comments, tests, and worklogs (real
+  machine/container names replaced with neutral `box-a`/`box-b`/… so the public
+  library carries no deployment-specific infra names). No behavior change.
 - **Project rebranded to `broker_parrot`** (README, docs, GitHub repo). This is a
   **display-only** rebrand: the Python **import package and distribution name stay
   `queue_workflows`**, the console scripts stay `queue-*`, and the env vars are

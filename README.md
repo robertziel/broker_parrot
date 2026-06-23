@@ -32,7 +32,7 @@ Orchestrate model jobs across the machines you already own — keep each model w
 
 ## Table of Contents
 
-- [Why queue_workflows?](#-why-queue_workflows)
+- [Why broker_parrot?](#-why-broker_parrot)
 - [How it compares (vs. Triton Inference Server)](#-how-it-compares-vs-triton-inference-server)
 - [Highlights](#-highlights)
 - [Installation](#installation)
@@ -52,7 +52,7 @@ Orchestrate model jobs across the machines you already own — keep each model w
 
 ---
 
-## ✨ Why queue_workflows?
+## ✨ Why broker_parrot?
 
 The pitch in one line: **your Postgres is already the most durable thing you run — so let it _be_ the queue.** No second broker to babysit, no scheduler cluster to operate. You `INSERT` a row inside your own transaction and the work is enqueued; a dead worker's lease lapses and the row is re‑queued. Purpose‑built for a **small, self‑hosted, heterogeneous CPU/GPU fleet you already own** — not a 1,000‑node cloud.
 
@@ -290,6 +290,30 @@ Collapsing the bus into Postgres buys you:
 - **Transactional enqueue.** Work appears exactly when the writer's transaction commits — `pg_notify` rides the same commit, so there's no lost-wake or premature-wake race (the "queued but no wake" gap is closed by construction).
 - **Crash-safe by default.** Leases + the reclaim sweep turn any worker death or hang into an automatic re-queue; the outbox makes terminal fan-out replay-safe.
 - **Operational simplicity.** `psycopg` is the only hard dependency. If you already run Postgres, you already run the bus — nothing else to deploy on the fleet.
+
+</details>
+
+<details>
+<summary>🛰️ <b>Scaling across machines — the shared GPU fleet (<code>gpu_pool</code>)</b></summary>
+
+A DAG node-job is bound to its app's Postgres (run row, outbox, leases) and a local filesystem — it can't simply hop to another box. So when several apps want to **share a pool of GPU machines**, the engine trades the DB-bound node-job for a self-contained **`PoolTask`** `{model, handler, inputs, output_dir, params}` whose inputs/outputs live on **shared NFS**. Pooled GPU workers claim these from **one shared store** (a `StorageBackend`, addressed independently of any app's `db_backend`), so any app can use any box without that box touching the app's database.
+
+Routing is by **capability queue name**: a worker serves an *ordered* set of queues — its warm-model queue first (so consecutive same-model tasks don't reload), then box-class queues (e.g. `gpu:box-a` / `gpu:box-b`) that keep work on machines that can run it. Submit with `submit_pool_task(...)` / `await_pool_result(...)`; register handlers on each box with `register_pool_handler(...)`. See **[`docs/gpu_pool.md`](docs/gpu_pool.md)**.
+
+</details>
+
+<details>
+<summary>🛰️ <b>Seeing + steering the fleet — <code>queue-conductor</code></b></summary>
+
+Every worker continuously publishes its capacity to `worker_heartbeats` (warm model, advertised LLM servers, VRAM, fresh/dead). **`node_queue.fleet_snapshot()`** returns that observed per-worker fleet view, and the **`queue-conductor`** console script renders it (table or `--json`) for whatever database you point it at:
+
+```bash
+queue-conductor --queue gpu      # which boxes are up, what each is warm on, who's stale/dead
+```
+
+Steering is the desired-state twin: **`queue-worker-control --queue gpu --off`** writes a `worker_controls` row that hard-stops + parks a `(host, queue)` worker (see the operator control plane below).
+
+**Packaging:** the control plane ships as a **separate `queue-workflows-conductor` distribution** that *depends on* the client (`queue_workflows`) — the dependency edge points one way (conductor → client), so a per-app worker never drags in the conductor. See **[`docs/conductor.md`](docs/conductor.md)**.
 
 </details>
 
@@ -689,6 +713,8 @@ The multi-backend contract suite additionally reads `QUEUE_WORKFLOWS_TEST_REDIS_
 - [`docs/worker_control.md`](docs/worker_control.md) — the operator ON/OFF control plane (hard-stop vs park a `(host, queue)` worker), the `os._exit(79)` contract, and the extensible stop-policy seam.
 - [`docs/storage_backends.md`](docs/storage_backends.md) — the pluggable `StorageBackend` SPI (`pg` / `redis` / `mongodb`): the contract, the capability matrix, and the integration boundary.
 - [`docs/llm_backends.md`](docs/llm_backends.md) — the per-machine ollama / vLLM server abstraction: the `LLMBackend` port, the idle supervisor, the config-synced factory, and the two-lane GPU concurrency model.
+- [`docs/gpu_pool.md`](docs/gpu_pool.md) — the shared GPU fleet: self-contained `PoolTask`s on a namespaced store + shared NFS, capability-queue routing, and the submit/handler API for sharing GPU machines across apps.
+- [`docs/conductor.md`](docs/conductor.md) — fleet observability + the client/conductor packaging split: `fleet_snapshot()`, the `queue-conductor` view, and the one-way conductor → client dependency.
 
 ## 📦 Background
 

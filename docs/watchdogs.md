@@ -440,7 +440,7 @@ acts on it. Two equivalent host-side consumers:
   SELECT 1 FROM worker_heartbeats
    WHERE host_label = :this_host AND queue = 'gpu'
      AND last_flagged_dead_at > now() - interval '90 seconds';
-  -- non-empty ⇒  docker restart app-worker-workers-gpu-1
+  -- non-empty ⇒  docker restart app-worker-gpu-1
   ```
 
   Safe because the JOB is already re-queued (the displaced worker's

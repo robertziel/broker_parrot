@@ -70,7 +70,7 @@ def test_submit_claim_execute_await_roundtrip(pool):
     assert gpu_pool.get_pool_task(tid)["status"] == "queued"
 
     # A pooled worker (separate box in prod; here: same process) claims + runs it.
-    assert gpu_pool.run_pool_worker_once(queues=["gpu:box-a"], worker="box-a1") == "completed"
+    assert gpu_pool.run_pool_worker_once(queues=["gpu:box-a"], worker="box-a-1") == "completed"
     assert ran == [{"inputs": {"src": "/nfs/runs/123/in.png"},
                     "output_dir": "/nfs/runs/123/out", "params": {"scale": 4}}]
 
@@ -90,18 +90,18 @@ def test_pool_is_independent_of_db_backend(pool):
 
 def test_capability_routing_by_queue(pool):
     """A box-a box serving only gpu:box-a must NOT claim a box-b task."""
-    box-a_t = gpu_pool.submit_pool_task(queue="gpu:box-a", handler="upscale",
+    box_a_t = gpu_pool.submit_pool_task(queue="gpu:box-a", handler="upscale",
                                         inputs={}, output_dir="/o", params={})
-    box-b_t = gpu_pool.submit_pool_task(queue="gpu:box-b", handler="upscale",
+    box_b_t = gpu_pool.submit_pool_task(queue="gpu:box-b", handler="upscale",
                                           inputs={}, output_dir="/o", params={})
     # box-a worker drains its lane only.
-    assert gpu_pool.run_pool_worker_once(queues=["gpu:box-a"], worker="box-a1") == "completed"
-    assert gpu_pool.run_pool_worker_once(queues=["gpu:box-a"], worker="box-a1") is None
-    assert gpu_pool.get_pool_task(box-a_t)["status"] == "completed"
-    assert gpu_pool.get_pool_task(box-b_t)["status"] == "queued"   # untouched
+    assert gpu_pool.run_pool_worker_once(queues=["gpu:box-a"], worker="box-a-1") == "completed"
+    assert gpu_pool.run_pool_worker_once(queues=["gpu:box-a"], worker="box-a-1") is None
+    assert gpu_pool.get_pool_task(box_a_t)["status"] == "completed"
+    assert gpu_pool.get_pool_task(box_b_t)["status"] == "queued"   # untouched
     # A box-b worker then takes its own.
     assert gpu_pool.run_pool_worker_once(queues=["gpu:box-b"], worker="bl1") == "completed"
-    assert gpu_pool.get_pool_task(box-b_t)["status"] == "completed"
+    assert gpu_pool.get_pool_task(box_b_t)["status"] == "completed"
 
 
 def test_warm_model_affinity_is_queue_order(pool):
