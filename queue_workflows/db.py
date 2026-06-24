@@ -29,13 +29,16 @@ production.
 
 from __future__ import annotations
 
+import json as _json
 import logging
 import os
 import re
+import sqlite3
 import threading
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Any, Callable, Iterator
 
 import psycopg
 from psycopg.rows import dict_row
@@ -104,18 +107,306 @@ def get_pool() -> ConnectionPool:
 
 
 def close_pool() -> None:
-    """Drain the pool. Used by orchestrator shutdown + test teardown."""
+    """Drain the pool. Used by orchestrator shutdown + test teardown. Also drops
+    the shared SQLite connection (if any), so a reconfigure/reset starts fresh."""
     global _pool
     with _pool_lock:
         if _pool is not None:
             _pool.close()
             _pool = None
+    _close_sqlite_conn()
+
+
+# ── SQLite engine backend (db_backend="sqlite") ─────────────────────────────
+#
+# The same engine SQL runs on a single SQLite file (a local, daemon-less, low
+# RAM/disk deploy) via a thin compatibility layer:
+#   * a string-literal-AWARE pyformat→sqlite paramstyle translator (so ``%s``
+#     placeholders convert to ``?`` but ``strftime('%s')`` survives),
+#   * ``now()``→``datetime('now')``, ``::cast`` strip, ``FOR UPDATE [SKIP
+#     LOCKED]`` strip, ``LEAST``/``GREATEST``→``MIN``/``MAX`` — the universal
+#     mechanical rewrites (the structural ones — intervals, EXTRACT(EPOCH),
+#     ANY(array) — are produced per-call by :mod:`queue_workflows.dialect`),
+#   * an explicit row factory that restores psycopg parity: JSONB→dict,
+#     text[]→list, TIMESTAMPTZ→aware-UTC ``datetime`` (keyed by the engine's
+#     KNOWN column names, so it's robust under ``RETURNING *`` / joins where
+#     ``PARSE_DECLTYPES`` is unreliable),
+#   * WAL + busy_timeout so multiple worker PROCESSES on one file serialize
+#     safely; a per-process shared connection under an RLock serializes THREADS.
+
+def _engine_is_sqlite() -> bool:
+    return _config.get_config().db_backend == "sqlite"
+
+
+def sqlite_path() -> str:
+    """Resolve the SQLite file path from the DSN env (``config.db_url_env``).
+    Accepts ``sqlite:///rel.db`` / ``sqlite:////abs/path.db`` / a bare path /
+    ``:memory:``."""
+    raw = (os.environ.get(_config.get_config().db_url_env) or "").strip()
+    if not raw:
+        raise RuntimeError(
+            f"{_config.get_config().db_url_env} is not set; cannot open SQLite. "
+            "Set it to a file path (or sqlite:///path, or :memory:)."
+        )
+    if raw == ":memory:":
+        return raw
+    if raw.startswith("sqlite://"):
+        rest = raw[len("sqlite://"):]
+        # sqlite:////abs → /abs ; sqlite:///rel → rel
+        return rest[1:] if rest.startswith("///") else rest.lstrip("/") if rest.startswith("//") else rest or ":memory:"
+    return raw
+
+
+# Columns the engine stores as JSON / arrays / timestamps — used by the row
+# factory to restore psycopg-equivalent python types on read.
+_JSON_OBJ_COLS = frozenset({
+    "context", "steps_done", "input_spec", "inputs", "resolved_inputs",
+    "context_delta", "args", "result", "detail", "value",
+})
+_JSON_ARRAY_COLS = frozenset({"known_models", "fits_models", "llm_servers_available"})
+_TS_COLS = frozenset({
+    "created_at", "updated_at", "queued_at", "started_at", "finished_at",
+    "lease_expires_at", "last_seen", "last_flagged_dead_at", "claimed_at",
+    "applied_at", "unassignable_at", "processed_at",
+})
+
+
+def _parse_ts(value: Any) -> Any:
+    """Parse a SQLite TEXT timestamp (``YYYY-MM-DD HH:MM:SS`` UTC, the
+    ``datetime('now')`` format) into an aware UTC ``datetime`` — matching what
+    psycopg returns for a ``timestamptz`` column."""
+    if not isinstance(value, str):
+        return value
+    s = value.strip()
+    if not s:
+        return value
+    s = s.replace("T", " ")
+    # drop a trailing tz designator if present
+    if s.endswith("Z"):
+        s = s[:-1]
+    fmt = "%Y-%m-%d %H:%M:%S.%f" if "." in s else "%Y-%m-%d %H:%M:%S"
+    try:
+        return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return value
+
+
+def _sqlite_row_to_dict(cursor: sqlite3.Cursor, row: tuple) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for idx, col in enumerate(cursor.description):
+        name = col[0]
+        val = row[idx]
+        if val is not None and isinstance(val, str):
+            if name in _JSON_OBJ_COLS or name in _JSON_ARRAY_COLS:
+                try:
+                    val = _json.loads(val)
+                except (ValueError, TypeError):
+                    pass
+            elif name in _TS_COLS:
+                val = _parse_ts(val)
+        out[name] = val
+    return out
+
+
+_SQLITE_ADAPTERS_REGISTERED = False
+
+
+def _register_sqlite_adapters() -> None:
+    """Adapt python write-params to SQLite text: psycopg ``Jsonb`` → JSON text,
+    aware/naive ``datetime`` → ``YYYY-MM-DD HH:MM:SS`` UTC (matching
+    ``datetime('now')`` so stored timestamps compare correctly)."""
+    global _SQLITE_ADAPTERS_REGISTERED
+    if _SQLITE_ADAPTERS_REGISTERED:
+        return
+    from psycopg.types.json import Jsonb
+
+    def _adapt_jsonb(j: Jsonb) -> str:
+        return _json.dumps(j.obj)
+
+    def _adapt_dt(dt: datetime) -> str:
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    sqlite3.register_adapter(Jsonb, _adapt_jsonb)
+    sqlite3.register_adapter(datetime, _adapt_dt)
+    _SQLITE_ADAPTERS_REGISTERED = True
+
+
+# Module-level shared connection per process + RLock (SQLite serializes writers;
+# this serializes threads within the process; cross-process safety is WAL +
+# busy_timeout on the file).
+_sqlite_conn: sqlite3.Connection | None = None
+_sqlite_lock = threading.RLock()
+
+
+def _get_sqlite_conn() -> sqlite3.Connection:
+    global _sqlite_conn
+    if _sqlite_conn is None:
+        _register_sqlite_adapters()
+        path = sqlite_path()
+        conn = sqlite3.connect(
+            path, check_same_thread=False, isolation_level=None,  # autocommit; we manage txns
+            timeout=float(os.environ.get("QUEUE_WORKFLOWS_SQLITE_TIMEOUT_S", "30")),
+        )
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=30000")
+        _sqlite_conn = conn
+    return _sqlite_conn
+
+
+def _close_sqlite_conn() -> None:
+    global _sqlite_conn
+    with _sqlite_lock:
+        if _sqlite_conn is not None:
+            _sqlite_conn.close()
+            _sqlite_conn = None
+
+
+# ── pyformat → sqlite translator (string-literal aware) ──────────────────────
+
+def _split_sql_literals(sql: str) -> list[tuple[bool, str]]:
+    """Split ``sql`` into ``(is_literal, chunk)`` segments, where a literal is a
+    single-quoted string (with ``''`` escapes). Transforms apply only to
+    non-literal chunks so e.g. ``strftime('%s', …)`` is never rewritten."""
+    segs: list[tuple[bool, str]] = []
+    buf: list[str] = []
+    in_str = False
+    i, n = 0, len(sql)
+    while i < n:
+        c = sql[i]
+        if not in_str:
+            if c == "'":
+                if buf:
+                    segs.append((False, "".join(buf))); buf = []
+                buf.append(c); in_str = True
+            else:
+                buf.append(c)
+        else:
+            buf.append(c)
+            if c == "'":
+                if i + 1 < n and sql[i + 1] == "'":  # '' escape
+                    buf.append("'"); i += 2; continue
+                segs.append((True, "".join(buf))); buf = []; in_str = False
+        i += 1
+    if buf:
+        segs.append((in_str, "".join(buf)))
+    return segs
+
+
+_CAST_RE = re.compile(r"::[A-Za-z_][A-Za-z0-9_]*(\s*\[\s*\])?")
+_NOW_RE = re.compile(r"\bnow\(\)")
+_LEAST_RE = re.compile(r"\bLEAST\s*\(")
+_GREATEST_RE = re.compile(r"\bGREATEST\s*\(")
+_FORUPDATE_RE = re.compile(r"\bFOR\s+UPDATE(\s+SKIP\s+LOCKED)?", re.IGNORECASE)
+_NAMED_PARAM_RE = re.compile(r"%\(([A-Za-z_][A-Za-z0-9_]*)\)s")
+
+
+def _rewrite_chunk(chunk: str) -> str:
+    chunk = _FORUPDATE_RE.sub("", chunk)
+    chunk = _NOW_RE.sub("datetime('now')", chunk)
+    chunk = _CAST_RE.sub("", chunk)
+    chunk = _LEAST_RE.sub("MIN(", chunk)
+    chunk = _GREATEST_RE.sub("MAX(", chunk)
+    # paramstyle: named first, then positional, then unescape %%
+    chunk = _NAMED_PARAM_RE.sub(r":\1", chunk)
+    chunk = chunk.replace("%s", "?")
+    chunk = chunk.replace("%%", "%")
+    return chunk
+
+
+def _translate_sql_for_sqlite(sql: str) -> str:
+    return "".join(
+        seg if is_lit else _rewrite_chunk(seg)
+        for is_lit, seg in _split_sql_literals(sql)
+    )
+
+
+class _SqliteCursor:
+    """psycopg-cursor-shaped wrapper: context manager, ``execute(sql, params)``
+    with pyformat translation, dict ``fetchone``/``fetchall``, ``rowcount``."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._cur = conn.cursor()
+
+    def __enter__(self) -> "_SqliteCursor":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._cur.close()
+
+    def execute(self, sql: str, params: Any = None) -> "_SqliteCursor":
+        sql2 = _translate_sql_for_sqlite(sql)
+        if params is None:
+            self._cur.execute(sql2)
+        else:
+            self._cur.execute(sql2, params)
+        return self
+
+    def fetchone(self) -> dict[str, Any] | None:
+        row = self._cur.fetchone()
+        return None if row is None else _sqlite_row_to_dict(self._cur, row)
+
+    def fetchall(self) -> list[dict[str, Any]]:
+        rows = self._cur.fetchall()
+        return [_sqlite_row_to_dict(self._cur, r) for r in rows]
+
+    @property
+    def rowcount(self) -> int:
+        return self._cur.rowcount
+
+
+class _SqliteConn:
+    """psycopg-connection-shaped wrapper over the shared sqlite connection."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def cursor(self) -> _SqliteCursor:
+        return _SqliteCursor(self._conn)
+
+    def execute(self, sql: str, params: Any = None) -> _SqliteCursor:
+        cur = self.cursor()
+        cur.execute(sql, params)
+        return cur
+
+    def commit(self) -> None:
+        self._conn.commit()
+
+    def rollback(self) -> None:
+        self._conn.rollback()
+
+    def executescript(self, sql: str) -> None:
+        self._conn.executescript(sql)
+
+
+@contextmanager
+def _sqlite_connection() -> Iterator[_SqliteConn]:
+    """SQLite analogue of the pooled ``connection()``: a per-process shared conn
+    under an RLock, BEGIN on entry, commit on clean exit / rollback on error."""
+    with _sqlite_lock:
+        raw = _get_sqlite_conn()
+        raw.execute("BEGIN")
+        wrapper = _SqliteConn(raw)
+        try:
+            yield wrapper
+        except BaseException:
+            raw.rollback()
+            raise
+        else:
+            raw.commit()
 
 
 @contextmanager
 def connection() -> Iterator[psycopg.Connection]:
-    """Borrow a pooled connection. Auto-commits on clean exit, rolls
-    back on exception (psycopg's default for ``with conn:``)."""
+    """Borrow a connection for the engine's relational store. Auto-commits on
+    clean exit, rolls back on exception. Postgres (default) → pooled psycopg;
+    ``db_backend="sqlite"`` → the shared SQLite connection."""
+    if _engine_is_sqlite():
+        with _sqlite_connection() as conn:
+            yield conn
+        return
     with get_pool().connection() as conn:
         yield conn
 

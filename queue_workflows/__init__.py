@@ -116,11 +116,19 @@ def configure(
         if ingest_default_budget_s is not None:
             cfg.ingest_default_budget_s = int(ingest_default_budget_s)
         if db_backend is not None:
-            # Validate against the backend registry (source of truth), imported
-            # lazily so the package root stays import-light and config a leaf.
-            from queue_workflows.backends import canonical_backend_name
+            if db_backend == "sqlite":
+                # SQLite is a RELATIONAL engine backend (it hosts the full DAG
+                # engine via the dialect seam), not a flat-queue StorageBackend
+                # SPI provider — so it bypasses the SPI registry validation. The
+                # engine's relational store is "pg" (default) or "sqlite";
+                # "redis"/"mongodb" select the SPI flat queue instead.
+                cfg.db_backend = "sqlite"
+            else:
+                # Validate against the backend registry (source of truth),
+                # imported lazily so the package root stays import-light.
+                from queue_workflows.backends import canonical_backend_name
 
-            cfg.db_backend = canonical_backend_name(db_backend)
+                cfg.db_backend = canonical_backend_name(db_backend)
         if db_namespace is not None:
             cfg.db_namespace = str(db_namespace)
         if cancel_orphan_queued_jobs is not None:

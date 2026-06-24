@@ -46,8 +46,11 @@ from queue_workflows.node_queue import DEFAULT_LEASE_S
 
 
 def _use_spi() -> bool:
-    """True when ``db_backend`` is a non-pg StorageBackend (redis/mongodb)."""
-    return get_config().db_backend != "pg"
+    """True when ``db_backend`` selects a flat-queue StorageBackend SPI provider
+    (redis/mongodb). The RELATIONAL engine backends (``pg`` and ``sqlite``) use
+    the direct ``node_queue`` path — sqlite speaks the same SQL via the dialect
+    seam — so they are NOT routed through the SPI."""
+    return get_config().db_backend in ("redis", "mongodb")
 
 
 def _backend():
