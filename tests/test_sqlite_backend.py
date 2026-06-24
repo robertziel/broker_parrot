@@ -39,6 +39,13 @@ def sqlite_engine(tmp_path):
     queue_workflows.configure(db_backend="pg", db_url_env="QUEUE_WORKFLOWS_TEST_DB_URL")
 
 
+@pytest.fixture
+def sqlite_ready(sqlite_engine):
+    """A SQLite engine with the full migration chain applied (v17)."""
+    db.bootstrap()
+    return sqlite_engine
+
+
 def test_dialect_selected_for_sqlite(sqlite_engine):
     assert dialect.is_sqlite() is True
     assert dialect.get_dialect().name == "sqlite"
@@ -155,6 +162,95 @@ def test_migration_chain_bootstraps_and_roundtrips(sqlite_engine):
     assert db.current_schema_version() == 0
     db.bootstrap()
     assert db.current_schema_version() == 17
+
+
+# ── Phase 3: real engine queue round-trips on SQLite ────────────────────────
+
+
+def _mk_run(project="", status="running"):
+    import uuid
+    from queue_workflows import run_store
+    rid = str(uuid.uuid4())
+    run_store.insert_run(run_id=rid, workflow_name="_wf", out_dir="/tmp/o",
+                         status=status, mode="node", project=project)
+    return rid
+
+
+def test_cpu_enqueue_claim_complete_roundtrip(sqlite_ready):
+    from datetime import datetime, timezone
+    from queue_workflows import node_queue
+    rid = _mk_run()
+    jid = node_queue.enqueue_node_job(
+        run_id=rid, node_id="n1", node_module="m", queue="cpu",
+        inputs={"a": 1},
+    )
+    claimed = node_queue.claim_next_cpu_job(host="boxA", lease_s=600)
+    assert claimed is not None and claimed["id"] == jid
+    assert claimed["status"] == "running" and claimed["claimed_by"] == "boxA"
+    assert claimed["inputs"] == {"a": 1}                       # JSON parity
+    assert isinstance(claimed["lease_expires_at"], datetime)   # TS parity
+    assert claimed["lease_expires_at"] > datetime.now(timezone.utc)
+    # nothing left to claim
+    assert node_queue.claim_next_cpu_job(host="boxA") is None
+    done = node_queue.mark_completed(jid, context_delta={"out": 7}, seconds=1.0)
+    assert done["status"] == "completed" and done["context_delta"] == {"out": 7}
+    # idempotent terminal
+    assert node_queue.mark_completed(jid, context_delta={}, seconds=0.0) is None
+
+
+def test_gpu_claim_with_model_affinity_and_capability(sqlite_ready):
+    from queue_workflows import node_queue
+    rid = _mk_run()
+    jid = node_queue.enqueue_node_job(
+        run_id=rid, node_id="g", node_module="m", queue="gpu", required_model="sdxl",
+    )
+    # capability gate: a worker that knows sdxl claims it; warm-model affinity ok
+    claimed = node_queue.claim_next_gpu_job(
+        0, current_model="sdxl", host="gpu1", known_models=["sdxl"],
+    )
+    assert claimed is not None and claimed["id"] == jid
+
+
+def test_ingest_enqueue_claim_roundtrip(sqlite_ready):
+    import queue_workflows
+    from queue_workflows import node_queue
+    queue_workflows.register_ingest_task("noop", lambda reason: {})
+    iid = node_queue.enqueue_ingest_job(task_name="noop", queue="fetch")
+    got = node_queue.claim_next_ingest_job("fetch", host="w")
+    assert got is not None and got["id"] == iid and got["status"] == "running"
+    done = node_queue.mark_ingest_completed(iid, result={"n": 3}, seconds=0.5)
+    assert done["status"] == "completed" and done["result"] == {"n": 3}
+
+
+def test_heartbeat_and_fleet_snapshot_array_parity(sqlite_ready):
+    from queue_workflows import node_queue
+    node_queue.upsert_worker_heartbeat(
+        host_label="gpu1", queue="gpu", concurrency=2,
+        known_models=["sdxl", "qwen"], fits_models=["sdxl"],
+        llm_servers_available=["ollama", "vllm"],
+    )
+    fleet = node_queue.fleet_snapshot()
+    assert len(fleet) == 1
+    row = fleet[0]
+    assert row["known_models"] == ["sdxl", "qwen"]            # text[]→list parity
+    assert row["fits_models"] == ["sdxl"]
+    assert row["llm_servers_available"] == ["ollama", "vllm"]
+    assert row["fresh"] in (True, 1)                          # derived flag
+
+
+def test_unassignable_sweep_on_sqlite(sqlite_ready):
+    from queue_workflows import node_queue
+    # a gpu worker that fits nothing; a queued model-job needing 'big'
+    node_queue.upsert_worker_heartbeat(
+        host_label="small", queue="gpu", concurrency=1, fits_models=[],
+        vram_total_mb=8000,
+    )
+    rid = _mk_run()
+    jid = node_queue.enqueue_node_job(
+        run_id=rid, node_id="g", node_module="m", queue="gpu", required_model="big",
+    )
+    flagged = node_queue.flag_unassignable_gpu_jobs()
+    assert [r["id"] for r in flagged] == [jid]                 # json_each ANY path
 
 
 def test_commit_and_rollback_semantics(sqlite_engine):

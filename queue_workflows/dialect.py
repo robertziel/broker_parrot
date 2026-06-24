@@ -75,6 +75,11 @@ class Dialect:
         """Row-level skip-locked clause for the claim subselect."""
         return "FOR UPDATE SKIP LOCKED"
 
+    def not_distinct_from(self, a: str, b: str) -> str:
+        """Null-safe equality (``NULL`` equals ``NULL``) — the warm-model
+        affinity tiebreak. pg: ``a IS NOT DISTINCT FROM b``."""
+        return f"{a} IS NOT DISTINCT FROM {b}"
+
     # ── arrays (text[] on pg; JSON text on sqlite) ────────────────────────
     def array_contains_value(self, array_col: str, value_expr: str) -> str:
         """True iff the array COLUMN ``array_col`` contains ``value_expr``
@@ -144,6 +149,10 @@ class SqliteDialect(Dialect):
         # UPDATE…WHERE id=(SELECT … LIMIT 1) claim is already atomic; there is no
         # row-level skip-locked clause.
         return ""
+
+    def not_distinct_from(self, a: str, b: str) -> str:
+        # SQLite's IS / IS NOT are already null-safe.
+        return f"{a} IS {b}"
 
     def array_contains_value(self, array_col: str, value_expr: str) -> str:
         return (

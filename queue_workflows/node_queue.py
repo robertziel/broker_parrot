@@ -262,7 +262,7 @@ SET status = 'running',
     started_at = now(),
     worker_lane = %(worker_lane)s,
     claimed_by = %(host)s,
-    lease_expires_at = now() + make_interval(secs => %(lease_s)s)
+    lease_expires_at = {lease_expr}
 WHERE j.id = (
     SELECT c.id FROM workflow_node_jobs c
     WHERE c.queue = %(queue)s
@@ -275,22 +275,31 @@ WHERE j.id = (
       )
       {capability}
     ORDER BY {order}
-    FOR UPDATE SKIP LOCKED
+    {skip_locked}
     LIMIT 1
 )
 RETURNING *
 """
 
-# Warm-model affinity tiebreak (GPU): rows whose ``required_model``
-# equals the worker's currently-loaded model jump to the head of their
-# priority band so consecutive same-model jobs don't reload. ``IS NOT
-# DISTINCT FROM`` (not ``=``) so NULL=NULL counts as a match.
-_AFFINITY_TERM = "(c.required_model IS NOT DISTINCT FROM %(current_model)s) DESC"
 
-# host_priority tiebreak: multiply the creation epoch by ±1 so a
-# high-priority host takes the oldest (head) and an overflow host takes
-# the newest (tail). See :func:`_host_dir`.
-_HOST_DIR_TERM = "(EXTRACT(EPOCH FROM c.created_at) * %(host_dir)s) ASC"
+def _affinity_term() -> str:
+    """Warm-model affinity tiebreak (GPU): rows whose ``required_model`` equals
+    the worker's currently-loaded model jump to the head of their priority band
+    so consecutive same-model jobs don't reload. Null-safe (NULL=NULL matches)
+    via the dialect (``IS NOT DISTINCT FROM`` on pg, ``IS`` on sqlite)."""
+    from queue_workflows.dialect import get_dialect
+    return (
+        f"({get_dialect().not_distinct_from('c.required_model', '%(current_model)s')})"
+        " DESC"
+    )
+
+
+def _host_dir_term() -> str:
+    """host_priority tiebreak: multiply the creation epoch by ±1 so a high-
+    priority host takes the oldest (head) and an overflow host the newest (tail).
+    See :func:`_host_dir`. ``EXTRACT(EPOCH …)`` on pg / ``strftime`` on sqlite."""
+    from queue_workflows.dialect import get_dialect
+    return f"({get_dialect().epoch('c.created_at')} * %(host_dir)s) ASC"
 
 
 def claim_next_cpu_job(
@@ -310,9 +319,14 @@ def claim_next_cpu_job(
     is ``is_priority DESC`` (the operator "run next" flag jumps the queue),
     then ``priority ASC``, then the ``host_priority``-directed creation
     tiebreak."""
-    order = f"c.is_priority DESC, c.priority ASC, {_HOST_DIR_TERM}"
+    from queue_workflows.dialect import get_dialect
+    _d = get_dialect()
+    order = f"c.is_priority DESC, c.priority ASC, {_host_dir_term()}"
     # CPU jobs carry no required_model, so no capability gate applies.
-    sql = _CLAIM_SQL.format(order=order, capability="")
+    sql = _CLAIM_SQL.format(
+        order=order, capability="",
+        lease_expr=_d.future_seconds("%(lease_s)s"), skip_locked=_d.skip_locked,
+    )
     params = {
         "worker_lane": worker_lane,
         "host": host,
@@ -371,14 +385,16 @@ def claim_next_gpu_job(
       set, so heavy in-process GPU work (erasers, detectors, builders) runs on
       the conc-1 serial lane instead of PAR-concurrently in the pool. Empty /
       unset ⇒ legacy split (every no-model GPU job is pool-eligible)."""
+    from queue_workflows.dialect import get_dialect
+    _d = get_dialect()
     order = (
         # The operator "run next" flag jumps the whole queue — ahead of the
         # warm-model affinity tiebreak too (a flagged cold-model node preempts a
         # warm one; the reload is the accepted cost of "run this next").
         f"c.is_priority DESC, "
-        f"{_AFFINITY_TERM}, "
+        f"{_affinity_term()}, "
         f"c.priority ASC, "
-        f"{_HOST_DIR_TERM}"
+        f"{_host_dir_term()}"
     )
     known = [m for m in (known_models or []) if m]
     pool = [m for m in (pool_modules or []) if m]
@@ -386,7 +402,7 @@ def claim_next_gpu_job(
     if known:
         capability_terms.append(
             "AND (c.required_model IS NULL "
-            "OR c.required_model = ANY(%(known_models)s::text[]))"
+            "OR " + _d.value_in_param_array("c.required_model", "%(known_models)s") + ")"
         )
     if require_model is True:
         if pool:
@@ -396,7 +412,7 @@ def claim_next_gpu_job(
             # pool.
             capability_terms.append(
                 "AND (c.required_model IS NOT NULL "
-                "OR NOT (c.node_module = ANY(%(pool_modules)s::text[])))"
+                "OR NOT (" + _d.value_in_param_array("c.node_module", "%(pool_modules)s") + "))"
             )
         else:
             capability_terms.append("AND c.required_model IS NOT NULL")
@@ -405,12 +421,15 @@ def claim_next_gpu_job(
             # Pool lane: no-model jobs whose module IS VLM-pool-eligible only.
             capability_terms.append(
                 "AND c.required_model IS NULL "
-                "AND c.node_module = ANY(%(pool_modules)s::text[])"
+                "AND " + _d.value_in_param_array("c.node_module", "%(pool_modules)s")
             )
         else:
             capability_terms.append("AND c.required_model IS NULL")
     capability = " ".join(capability_terms)
-    sql = _CLAIM_SQL.format(order=order, capability=capability)
+    sql = _CLAIM_SQL.format(
+        order=order, capability=capability,
+        lease_expr=_d.future_seconds("%(lease_s)s"), skip_locked=_d.skip_locked,
+    )
     params = {
         "worker_lane": worker_lane,
         "host": host,
@@ -421,9 +440,9 @@ def claim_next_gpu_job(
         "host_dir": _host_dir(host_priority),
     }
     if known:
-        params["known_models"] = known
+        params["known_models"] = _d.array_param(known)
     if pool:
-        params["pool_modules"] = pool
+        params["pool_modules"] = _d.array_param(pool)
     with connection() as conn, conn.cursor() as cur:
         cur.execute(sql, params)
         return cur.fetchone()
@@ -737,7 +756,7 @@ def reclaim_expired_leases() -> list[dict[str, Any]]:
         # is-parent-active check and the lease flip.
         cur.execute(
             """
-            UPDATE workflow_node_jobs j
+            UPDATE workflow_node_jobs AS j
             SET status = CASE WHEN r.status = 'running'
                               THEN 'queued'
                               ELSE 'cancelled'
@@ -895,7 +914,7 @@ def flag_stale_workers_holding_running_jobs(
                    )
                  GROUP BY wh.host_label, wh.queue, wh.project, wh.last_seen
             )
-            UPDATE worker_heartbeats wh
+            UPDATE worker_heartbeats AS wh
                SET last_flagged_dead_at = now()
               FROM stale
              WHERE wh.host_label = stale.host_label
@@ -952,7 +971,7 @@ def reclaim_all_running_for_resume(
     with connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            UPDATE workflow_node_jobs j
+            UPDATE workflow_node_jobs AS j
             SET status = 'queued',
                 started_at = NULL,
                 claimed_by = NULL,
@@ -1098,6 +1117,8 @@ def upsert_worker_heartbeat(
     model_set = (
         "current_model = EXCLUDED.current_model," if update_current_model else ""
     )
+    from queue_workflows.dialect import get_dialect
+    _d = get_dialect()
     with connection() as conn, conn.cursor() as cur:
         cur.execute(
             f"""
@@ -1117,7 +1138,8 @@ def upsert_worker_heartbeat(
                     last_flagged_dead_at = NULL
             """,
             (host_label, queue, _project(project), int(concurrency), current_model,
-             known, llm_servers, vram, fits),
+             _d.array_literal(known), _d.array_literal(llm_servers), vram,
+             _d.array_literal(fits)),
         )
 
 
@@ -1516,6 +1538,11 @@ def flag_unassignable_gpu_jobs(
     """
     window = int(stale_s) if stale_s is not None else _stale_worker_after_s()
     proj = _project(project)
+    from queue_workflows.dialect import get_dialect
+    # Array-column membership: pg ``= ANY(fits_models)`` ; sqlite json_each. The pg
+    # rendering equals the literal below, so ``.replace`` is a no-op on pg.
+    _contains = get_dialect().array_contains_value("lg.fits_models", "j.required_model")
+    _ANY = "j.required_model = ANY(lg.fits_models)"
     with connection() as conn, conn.cursor() as cur:
         # CLEAR first: un-flag any flagged job that is now fittable, or that has
         # left the queued state (claimed / cancelled / terminal) — so a red flag
@@ -1532,7 +1559,7 @@ def flag_unassignable_gpu_jobs(
                   AND project = %(project)s
                   AND last_seen > now() - make_interval(secs => %(window)s)
             )
-            UPDATE workflow_node_jobs j
+            UPDATE workflow_node_jobs AS j
             SET unassignable_at = NULL, unassignable_reason = NULL
             WHERE j.unassignable_at IS NOT NULL
               AND j.project = %(project)s
@@ -1543,7 +1570,7 @@ def flag_unassignable_gpu_jobs(
                         WHERE j.required_model = ANY(lg.fits_models)
                     )
               )
-            """,
+            """.replace(_ANY, _contains),
             {"window": window, "project": proj},
         )
         # FLAG: queued gpu model-jobs that no fresh GPU worker can hold. Guarded
@@ -1560,7 +1587,7 @@ def flag_unassignable_gpu_jobs(
                 SELECT count(*) AS n, max(vram_total_mb) AS max_vram
                 FROM live_gpu
             )
-            UPDATE workflow_node_jobs j
+            UPDATE workflow_node_jobs AS j
             SET unassignable_at = now(),
                 unassignable_reason =
                     'no live GPU machine can hold model ' || j.required_model
@@ -1578,9 +1605,9 @@ def flag_unassignable_gpu_jobs(
                     SELECT 1 FROM live_gpu lg
                     WHERE j.required_model = ANY(lg.fits_models)
               )
-            RETURNING j.id, j.run_id, j.node_id, j.required_model,
-                      j.unassignable_reason
-            """,
+            RETURNING id, run_id, node_id, required_model,
+                      unassignable_reason
+            """.replace(_ANY, _contains),
             {"window": window, "project": proj},
         )
         return list(cur.fetchall())
@@ -1666,7 +1693,7 @@ def cancel_orphaned_queued_jobs(*, project: str | None = None) -> int:
     with connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            UPDATE workflow_node_jobs j
+            UPDATE workflow_node_jobs AS j
                SET status = 'cancelled', finished_at = now()
               FROM workflow_runs r
              WHERE j.run_id = r.id
@@ -1778,7 +1805,7 @@ def ingest_snapshot(*, project: str | None = None) -> dict[str, Any]:
             counts.setdefault(row["queue"], {})[row["status"]] = int(row["n"])
         cur.execute(
             "SELECT queue, COUNT(*) AS n FROM worker_heartbeats "
-            "WHERE last_seen > now() - interval '30 seconds'" + hpred
+            "WHERE last_seen > now() - make_interval(secs => 30)" + hpred
             + " GROUP BY queue",
             pf,
         )
@@ -1830,7 +1857,7 @@ def fleet_snapshot(
         cur.execute(
             f"""
             SELECT *,
-                   (last_seen > now() - (%(stale)s * interval '1 second')) AS fresh,
+                   (last_seen > now() - make_interval(secs => %(stale)s)) AS fresh,
                    (last_flagged_dead_at IS NOT NULL)               AS flagged_dead
             FROM worker_heartbeats{pred}
             ORDER BY queue, host_label

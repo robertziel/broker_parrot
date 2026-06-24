@@ -311,8 +311,36 @@ _FORUPDATE_RE = re.compile(r"\bFOR\s+UPDATE(\s+SKIP\s+LOCKED)?", re.IGNORECASE)
 _NAMED_PARAM_RE = re.compile(r"%\(([A-Za-z_][A-Za-z0-9_]*)\)s")
 
 
+# Interval arithmetic — SQLite has no make_interval / interval-subtraction
+# operator; ``now() ± <n> <unit>`` must FUSE into a single ``datetime('now',
+# modifier)`` call. These run BEFORE now()->datetime so they can match ``now()``.
+# Placeholders inside the modifier (``%(x)s`` / ``%s``) survive to the paramstyle
+# step. (pg never reaches here — the translator runs only on the sqlite path.)
+# An interval magnitude is a named param ``%(x)s`` (contains parens!), a
+# positional ``%s``, an integer literal, or a bare column/identifier. The engine
+# uses ONLY ``now() ± make_interval(<unit> => <n>)`` for interval arithmetic (no
+# ``interval 'literal'``, which the string-literal splitter would break apart) —
+# so the translator only needs the two make_interval shapes.
+_EXPR = r"%\([A-Za-z_]\w*\)s|%s|\d+|[A-Za-z_][\w.]*"
+_MI_SECS_RE = re.compile(rf"now\(\)\s*([+-])\s*make_interval\(\s*secs\s*=>\s*({_EXPR})\s*\)")
+_MI_DAYS_RE = re.compile(rf"now\(\)\s*([+-])\s*make_interval\(\s*days\s*=>\s*({_EXPR})\s*\)")
+
+
+def _rewrite_intervals(chunk: str) -> str:
+    chunk = _MI_SECS_RE.sub(
+        lambda m: f"datetime('now', ('{m.group(1)}' || ({m.group(2)}) || ' seconds'))",
+        chunk,
+    )
+    chunk = _MI_DAYS_RE.sub(
+        lambda m: f"datetime('now', ('{m.group(1)}' || ({m.group(2)}) || ' days'))",
+        chunk,
+    )
+    return chunk
+
+
 def _rewrite_chunk(chunk: str) -> str:
     chunk = _FORUPDATE_RE.sub("", chunk)
+    chunk = _rewrite_intervals(chunk)
     # Parenthesized so it is valid in EVERY context, incl. a column
     # ``DEFAULT (datetime('now'))`` (SQLite rejects a bare function DEFAULT).
     chunk = _NOW_RE.sub("(datetime('now'))", chunk)
