@@ -28,7 +28,8 @@ dependencies = [
 ]
 
 [project.scripts]
-queue-conductor = "queue_workflows_conductor.conductor:cli"  # read-only fleet capacity view
+queue-conductor = "queue_workflows_conductor.conductor:cli"  # read-only fleet capacity view (CLI)
+queue-conductor-web = "queue_workflows_conductor.web:main"   # read-only fleet + shared-queue web view
 
 [tool.hatch.build.targets.wheel]
 packages = ["queue_workflows_conductor"]

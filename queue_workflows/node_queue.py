@@ -1750,6 +1750,24 @@ def set_resolved_inputs(job_id: str, resolved_inputs: dict[str, Any]) -> None:
 # ── Snapshot for Rails ───────────────────────────────────────────────────
 
 
+def list_projects() -> list[str]:
+    """Distinct ``project`` tenant tags seen across the queue records (migration
+    0017) — the option list for a multi-tenant queue/fleet view's project filter.
+
+    Union over runs, node-jobs, ingest jobs, and worker heartbeats; sorted. The
+    single-tenant sentinel ``''`` is included when present. Plain SQL — works on
+    both the Postgres and SQLite backends."""
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT project FROM workflow_runs "
+            "UNION SELECT project FROM workflow_node_jobs "
+            "UNION SELECT project FROM ingest_jobs "
+            "UNION SELECT project FROM worker_heartbeats "
+            "ORDER BY project"
+        )
+        return [r["project"] for r in cur.fetchall()]
+
+
 def snapshot(*, project: str | None = None) -> dict[str, Any]:
     """Return counts and running/queued rows per queue, for the
     queue-indicator UI. Keeps the payload small — at most 50 rows per
