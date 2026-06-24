@@ -52,8 +52,16 @@ _HERE = Path(__file__).resolve().parent
 #: The engine's own migration chain (queue tables only). Public via
 #: ``queue_workflows.migrations.dir()``.
 ENGINE_MIGRATIONS_DIR = _HERE / "migrations"
+#: The SQLite-dialect twin of the engine chain (same version numbers; DDL
+#: translated, triggers/NOTIFY omitted). Selected when ``db_backend="sqlite"``.
+ENGINE_MIGRATIONS_DIR_SQLITE = _HERE / "migrations_sqlite"
 ENGINE_VERSION_TABLE = "queue_schema_version"
 _ENGINE_SCHEMA_SNAPSHOT = ENGINE_MIGRATIONS_DIR / "schema.sql"
+
+
+def _engine_migrations_dir() -> Path:
+    """The engine migration dir for the active relational backend."""
+    return ENGINE_MIGRATIONS_DIR_SQLITE if _engine_is_sqlite() else ENGINE_MIGRATIONS_DIR
 
 _pool: ConnectionPool | None = None
 _pool_lock = threading.Lock()
@@ -305,7 +313,9 @@ _NAMED_PARAM_RE = re.compile(r"%\(([A-Za-z_][A-Za-z0-9_]*)\)s")
 
 def _rewrite_chunk(chunk: str) -> str:
     chunk = _FORUPDATE_RE.sub("", chunk)
-    chunk = _NOW_RE.sub("datetime('now')", chunk)
+    # Parenthesized so it is valid in EVERY context, incl. a column
+    # ``DEFAULT (datetime('now'))`` (SQLite rejects a bare function DEFAULT).
+    chunk = _NOW_RE.sub("(datetime('now'))", chunk)
     chunk = _CAST_RE.sub("", chunk)
     chunk = _LEAST_RE.sub("MIN(", chunk)
     chunk = _GREATEST_RE.sub("MAX(", chunk)
@@ -547,19 +557,30 @@ def _applied_versions(conn: psycopg.Connection, version_table: str) -> list[int]
         return [r["version"] for r in cur.fetchall()]
 
 
+def _apply_migration_sql(conn: Any, cur: Any, sql_text: str) -> None:
+    """Apply a (possibly multi-statement) migration file. psycopg sends the whole
+    string via the simple-query protocol; SQLite needs ``executescript``."""
+    if _engine_is_sqlite():
+        conn.executescript(sql_text)
+    else:
+        cur.execute(sql_text)
+
+
 def bootstrap(
     *,
-    migrations_dir: Path = ENGINE_MIGRATIONS_DIR,
+    migrations_dir: Path | None = None,
     version_table: str = ENGINE_VERSION_TABLE,
 ) -> None:
     """Apply pending migrations from ``migrations_dir`` against the version
     ledger ``version_table``. Idempotent — safe to call on every boot.
 
-    The engine's own bootstrap defaults to its migration dir +
-    ``queue_schema_version``. A host applies its domain chain by calling this
-    a SECOND time with its own dir + ``schema_version``.
+    ``migrations_dir`` defaults to the engine chain for the active relational
+    backend (``migrations/`` for Postgres, ``migrations_sqlite/`` for SQLite). A
+    host applies its domain chain by calling this a SECOND time with its own dir
+    + ``schema_version``.
     """
     _check_identifier(version_table)
+    mdir = migrations_dir or _engine_migrations_dir()
     with connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -570,12 +591,12 @@ def bootstrap(
             )
         applied = set(_applied_versions(conn, version_table))
 
-        for n, path in _forward_migrations(migrations_dir):
+        for n, path in _forward_migrations(mdir):
             if n in applied:
                 continue
             log.info("[queue_workflows.db] applying %s", path.name)
             with conn.cursor() as cur:
-                cur.execute(path.read_text())
+                _apply_migration_sql(conn, cur, path.read_text())
                 cur.execute(
                     f"INSERT INTO {version_table} (version) VALUES (%s)",
                     (n,),
@@ -641,8 +662,10 @@ def current_schema_version(*, version_table: str = ENGINE_VERSION_TABLE) -> int:
     bootstrapped). Never raises ``UndefinedTable`` — the ``to_regclass``
     guard returns NULL instead, which we map to 0."""
     _check_identifier(version_table)
+    from queue_workflows.dialect import get_dialect
+    exists_sql = "SELECT " + get_dialect().table_exists("%s") + " AS t"
     with connection() as conn, conn.cursor() as cur:
-        cur.execute("SELECT to_regclass(%s) AS t", (f"public.{version_table}",))
+        cur.execute(exists_sql, (version_table,))
         if cur.fetchone()["t"] is None:
             return 0
         cur.execute(f"SELECT COALESCE(MAX(version), 0) AS v FROM {version_table}")
@@ -695,37 +718,41 @@ def wait_for_schema(
 def downgrade(
     *,
     to_version: int = 0,
-    migrations_dir: Path = ENGINE_MIGRATIONS_DIR,
+    migrations_dir: Path | None = None,
     version_table: str = ENGINE_VERSION_TABLE,
 ) -> list[int]:
     """Roll back every migration whose version is greater than ``to_version``
     in ``migrations_dir`` / ``version_table``. Each step runs the paired
     ``NNNN_*.down.sql`` and removes the row from the version table.
 
-    Returns the list of reverted versions (highest-first). Raises
+    ``migrations_dir`` defaults to the engine chain for the active relational
+    backend. Returns the list of reverted versions (highest-first). Raises
     ``RuntimeError`` when a step has no ``.down.sql`` file.
     """
     _check_identifier(version_table)
+    from queue_workflows.dialect import get_dialect
+    mdir = migrations_dir or _engine_migrations_dir()
+    exists_sql = "SELECT " + get_dialect().table_exists("%s") + " AS t"
     reverted: list[int] = []
     with connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT to_regclass(%s) AS t", (f"public.{version_table}",))
+            cur.execute(exists_sql, (version_table,))
             if cur.fetchone()["t"] is None:
                 return reverted  # Nothing applied, nothing to revert.
         applied_desc = list(reversed(_applied_versions(conn, version_table)))
         for version in applied_desc:
             if version <= to_version:
                 break
-            down_path = _down_migration(migrations_dir, version)
+            down_path = _down_migration(mdir, version)
             if down_path is None:
                 raise RuntimeError(
                     f"cannot revert version {version}: no "
-                    f"{version:04d}_*.down.sql file found in {migrations_dir}. "
+                    f"{version:04d}_*.down.sql file found in {mdir}. "
                     f"Add a paired down migration or bump ``to_version``."
                 )
             log.info("[queue_workflows.db] reverting %s", down_path.name)
             with conn.cursor() as cur:
-                cur.execute(down_path.read_text())
+                _apply_migration_sql(conn, cur, down_path.read_text())
                 cur.execute(
                     f"DELETE FROM {version_table} WHERE version = %s",
                     (version,),

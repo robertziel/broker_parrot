@@ -128,6 +128,35 @@ def test_dialect_fragments_render_for_sqlite(sqlite_engine):
     assert d.array_param(["a", "b"]) == '["a", "b"]'   # list → JSON text for sqlite
 
 
+def test_migration_chain_bootstraps_and_roundtrips(sqlite_engine):
+    # The SQLite migration chain (migrations_sqlite/) applies to v17, creates the
+    # full engine schema, and survives a full downgrade→0→re-bootstrap roundtrip.
+    db.bootstrap()
+    assert db.current_schema_version() == 17
+
+    with db.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        )
+        tables = {r["name"] for r in cur.fetchall()}
+        cur.execute("PRAGMA table_info(worker_heartbeats)")
+        hb_pk = [r["name"] for r in cur.fetchall() if r["pk"]]
+
+    assert {
+        "workflow_runs", "workflow_node_jobs", "ingest_jobs", "worker_heartbeats",
+        "worker_controls", "workflow_dispatch_events", "workflow_node_events",
+        "workflow_input_submissions", "workflow_run_files",
+    } <= tables
+    assert hb_pk == ["host_label", "queue", "project"]   # migration 0017 PK rebuild
+
+    reverted = db.downgrade(to_version=0)
+    assert len(reverted) == 17
+    assert db.current_schema_version() == 0
+    db.bootstrap()
+    assert db.current_schema_version() == 17
+
+
 def test_commit_and_rollback_semantics(sqlite_engine):
     with db.connection() as conn, conn.cursor() as cur:
         _create(cur)
