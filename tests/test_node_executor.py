@@ -174,6 +174,88 @@ def test_execute_node_model_load_failure_marks_failed():
     assert len(evts) == 1 and evts[0]["kind"] == "failed"
 
 
+# ── transient GPU error: re-queue (don't fail the run), bounded by the watchdog cap ──────────
+
+
+def _set_running(job_id: str, *, retries: int = 0) -> None:
+    with connection() as c, c.cursor() as cur:
+        cur.execute(
+            "UPDATE workflow_node_jobs SET status='running', watchdog_retries=%s WHERE id=%s",
+            (retries, job_id),
+        )
+
+
+class _BusyGpuCache:
+    """A model_cache whose load raises a transient GPU error (device busy/unavailable)."""
+    current_model = None
+
+    def require_model(self, _model_id):
+        raise RuntimeError(
+            "AcceleratorError: CUDA error: CUDA-capable device(s) is/are busy or unavailable"
+        )
+
+
+def test_execute_node_requeues_on_transient_gpu_error_under_cap():
+    run_id = _make_run()
+    _install_fake_node("_ne_gpu_busy", lambda **_k: {"context_delta": {}})  # must NOT run
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="g", node_module="_ne_gpu_busy", queue="gpu",
+        required_model="qwen_erase",
+    )
+    _set_running(job_id, retries=0)
+
+    result = node_executor.execute_node(
+        node_queue.get_node_job(job_id), model_cache=_BusyGpuCache(),
+    )
+    assert result == "requeued"
+
+    row = node_queue.get_node_job(job_id)
+    assert row["status"] == "queued"                # re-queued, NOT failed
+    assert int(row["watchdog_retries"] or 0) == 1   # retry counter bumped
+    assert _events(run_id) == []                    # NO failed dispatch event -> run stays alive
+
+
+def test_execute_node_fails_transient_gpu_error_at_cap(monkeypatch):
+    monkeypatch.setenv("AI_LEADS_WATCHDOG_MAX_RETRIES", "3")
+    run_id = _make_run()
+    _install_fake_node("_ne_gpu_busy2", lambda **_k: {"context_delta": {}})
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="g", node_module="_ne_gpu_busy2", queue="gpu",
+        required_model="qwen_erase",
+    )
+    _set_running(job_id, retries=3)                 # already at the cap
+
+    result = node_executor.execute_node(
+        node_queue.get_node_job(job_id), model_cache=_BusyGpuCache(),
+    )
+    assert result == "failed"                       # cap reached -> a real failure
+    assert node_queue.get_node_job(job_id)["status"] == "failed"
+    evts = _events(run_id)
+    assert len(evts) == 1 and evts[0]["kind"] == "failed"
+
+
+def test_execute_node_non_gpu_model_load_error_still_fails():
+    run_id = _make_run()
+    _install_fake_node("_ne_nongpu", lambda **_k: {"context_delta": {}})
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="g", node_module="_ne_nongpu", queue="gpu",
+        required_model="m",
+    )
+    _set_running(job_id, retries=0)
+
+    class _MissingWeightsCache:
+        current_model = None
+
+        def require_model(self, _m):
+            raise FileNotFoundError("weights file not found: /models/m.safetensors")
+
+    result = node_executor.execute_node(
+        node_queue.get_node_job(job_id), model_cache=_MissingWeightsCache(),
+    )
+    assert result == "failed"                       # not a GPU error -> NOT requeued
+    assert node_queue.get_node_job(job_id)["status"] == "failed"
+
+
 def test_execute_node_noop_on_already_terminal_row():
     run_id = _make_run()
     ran = {"n": 0}

@@ -286,6 +286,8 @@ def execute_node(
         except Exception as exc:
             err = f"model load failed: {type(exc).__name__}: {exc}"
             log.exception("[execute_node] %s %s", job_id, err)
+            if _is_transient_gpu_error(err):
+                return _requeue_for_transient_gpu(job, err, t0)
             return _finalise_failed(job, err, t0)
         # Model is warm — beat the stall watchdog so its no-progress window
         # opens HERE (after the multi-minute cold load), not at claim time. From
@@ -329,8 +331,13 @@ def execute_node(
                 status_callback=status_callback,
             )
         except Exception as exc:
-            err = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+            short = f"{type(exc).__name__}: {exc}"
+            err = f"{short}\n{traceback.format_exc()}"
             log.error(err)
+            # Check only the type+message (not the traceback) so an incidental marker in a stack
+            # frame can't misclassify a content error as a transient GPU one.
+            if _is_transient_gpu_error(short):
+                return _requeue_for_transient_gpu(job, err, t0)
             return _finalise_failed(job, err, t0)
 
         context_delta = result.get("context_delta", {})
@@ -379,6 +386,55 @@ def _event_base(job: dict) -> dict[str, Any]:
         "queue": job.get("queue"),
         "model": job.get("required_model"),
     }
+
+
+# Transient GPU/accelerator failures (device busy/unavailable, OOM, wedged context) are a
+# worker/host HEALTH failure, not a content failure — so re-queue the job for a free/capable host
+# instead of failing the whole run (mirrors the stall watchdog's requeue). Markers chosen to match
+# real accelerator errors without matching incidental "cuda"/"oom" substrings in unrelated text.
+_GPU_ERROR_MARKERS = (
+    "acceleratorerror", "cuda error", "cuda-capable", "cublas", "cudnn", "nvml",
+    "out of memory", "device-side assert", "hip error", "rocm error",
+    "busy or unavailable", "cudaerrordevicesunavailable", "no cuda-capable device",
+)
+
+
+def _is_transient_gpu_error(text: str) -> bool:
+    t = (text or "").lower()
+    return any(m in t for m in _GPU_ERROR_MARKERS)
+
+
+def _watchdog_max_retries() -> int:
+    import os
+    try:
+        return int(os.environ.get("AI_LEADS_WATCHDOG_MAX_RETRIES", "3"))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _requeue_for_transient_gpu(job: dict, error: str, t0: float) -> str:
+    """Re-queue a node job whose model-load/invocation hit a TRANSIENT GPU error so a free, healthy
+    host retries it — instead of failing the whole run. Bounded by ``AI_LEADS_WATCHDOG_MAX_RETRIES``
+    (the SAME cap + machinery the stall watchdog uses); at the cap, fall through to a real failure
+    so a genuinely-broken job can't loop forever. Writes NO dispatch event — the run stays alive."""
+    retries = int(job.get("watchdog_retries") or 0)
+    if retries >= _watchdog_max_retries():
+        return _finalise_failed(job, error, t0)
+    requeued = node_queue.requeue_job_for_retry(job["id"])
+    if requeued is None:
+        # Row already terminal / not ``running`` (a claim-race loser) — nothing to requeue.
+        return _finalise_failed(job, error, t0)
+    node_queue.record_node_event(
+        event_type="requeued", elapsed_s=time.time() - t0, error=error,
+        detail={"retry": int(requeued.get("watchdog_retries") or 0),
+                "reason": "transient_gpu_error"},
+        **_event_base(job),
+    )
+    log.warning(
+        "[execute_node] %s transient GPU error -> re-queued (retry %s/%s): %s",
+        job["id"], int(requeued.get("watchdog_retries") or 0), _watchdog_max_retries(), error,
+    )
+    return "requeued"
 
 
 def _finalise_failed(job: dict, error: str, t0: float) -> str:
