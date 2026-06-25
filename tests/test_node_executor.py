@@ -256,6 +256,46 @@ def test_execute_node_non_gpu_model_load_error_still_fails():
     assert node_queue.get_node_job(job_id)["status"] == "failed"
 
 
+def test_execute_node_requeues_transient_gpu_error_from_node_body():
+    """The INVOCATION handler (not just model-load) re-queues on a transient GPU error mid-run."""
+    run_id = _make_run()
+
+    def run(**_kw):
+        raise RuntimeError("CUDA error: device-side assert triggered")
+
+    _install_fake_node("_ne_body_gpu", run)
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="_ne_body_gpu", queue="gpu",
+    )
+    _set_running(job_id, retries=0)
+
+    result = node_executor.execute_node(node_queue.get_node_job(job_id))
+    assert result == "requeued"
+    assert node_queue.get_node_job(job_id)["status"] == "queued"
+    assert _events(run_id) == []                    # no dispatch event -> run stays alive
+
+
+def test_execute_node_content_error_with_gpu_marker_only_in_traceback_still_fails():
+    """The invocation handler classifies on type+message, NOT the traceback. A CONTENT error whose
+    traceback source line carries a GPU marker (the trailing comment below — linecache puts it in
+    the traceback) must still FAIL, not requeue. If the handler ever matched the full err (incl.
+    traceback), this flips to 'requeued' and the assert catches the regression."""
+    run_id = _make_run()
+
+    def run(**_kw):
+        raise ValueError("malformed polygon")  # cuda error: device-side assert (traceback-only marker)
+
+    _install_fake_node("_ne_tb_only", run)
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="_ne_tb_only", queue="gpu",
+    )
+    _set_running(job_id, retries=0)
+
+    result = node_executor.execute_node(node_queue.get_node_job(job_id))
+    assert result == "failed"                       # message has no marker -> NOT requeued
+    assert node_queue.get_node_job(job_id)["status"] == "failed"
+
+
 def test_execute_node_noop_on_already_terminal_row():
     run_id = _make_run()
     ran = {"n": 0}
