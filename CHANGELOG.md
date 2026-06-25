@@ -32,6 +32,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicit `configure(project=...)` still wins, and unset ⇒ `""` (unchanged
   single-tenant default). Lets every process of a multi-process app share one
   project tag via the deploy env instead of threading it through each script.
+- `node_queue.recent_jobs(*, project=None, status=None, limit=40)` — a read-only
+  recent-activity feed unifying DAG node-jobs and ingest jobs into one newest-first
+  list (kind / name / queue / status / project / worker / timing / retries / error),
+  project- and status-aware, dialect-portable. Powers a Sidekiq-style activity view.
+- **`queue-conductor-web` — Sidekiq-inspired dashboard:** an Overview KPI strip
+  (Busy / Enqueued / Processed / Failed / Workers / Projects, summed across node +
+  ingest) and a Recent-activity feed with status badges + a retries column + "x ago"
+  timing — every panel project-filter-aware, still read-only / stdlib-HTML / no-JS.
 - **`queue-broker` console + `queue-conductor-web` — operate the consolidated,
   one-queue-for-all-projects broker.** `queue-broker` stands up / owns the shared
   broker schema independently of any one project (`db.bootstrap` on the broker

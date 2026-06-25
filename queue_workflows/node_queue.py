@@ -1923,3 +1923,53 @@ def fleet_snapshot(
              **({} if project is None else {"project": project})},
         )
         return [dict(row) for row in cur.fetchall()]
+
+
+def recent_jobs(
+    *, project: str | None = None, status: str | None = None, limit: int = 40,
+) -> list[dict[str, Any]]:
+    """Read-only recent-activity feed across BOTH job families — DAG node-jobs
+    (``workflow_node_jobs``) and standalone ingest jobs (``ingest_jobs``) — unified
+    into one list, newest-first by ``COALESCE(finished_at, started_at, created_at)``.
+    The read model a Sidekiq-style "recent activity / retries / dead" view consumes.
+
+    Each row carries a ``kind`` (``'node'`` | ``'ingest'``) and a ``name`` (the
+    node id / task name) plus the common lifecycle columns — ``queue``, ``status``,
+    ``project``, ``worker`` (``claimed_by``), ``created_at`` / ``started_at`` /
+    ``finished_at``, ``seconds``, ``retries`` (``watchdog_retries`` for node-jobs, 0
+    for ingest), and ``error``.
+
+    ``project`` (migration 0017) filters to one tenant; ``status`` filters to one
+    state (``'failed'`` ⇒ a dead-jobs view, ``'running'`` ⇒ busy). Both ``None`` ⇒
+    the broker-wide feed. No backend-specific time funcs, so it is portable across
+    the pg / sqlite dialects. Returns ``[]`` when empty.
+    """
+    clauses: list[str] = []
+    params: dict[str, Any] = {"limit": int(limit)}
+    if project is not None:
+        clauses.append("project = %(project)s")
+        params["project"] = project
+    if status is not None:
+        clauses.append("status = %(status)s")
+        params["status"] = status
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT id, 'node' AS kind, node_id AS name, queue, status, project,
+                   claimed_by AS worker, created_at, started_at, finished_at,
+                   seconds, watchdog_retries AS retries, error,
+                   COALESCE(finished_at, started_at, created_at) AS recency
+            FROM workflow_node_jobs{where}
+            UNION ALL
+            SELECT id, 'ingest' AS kind, task_name AS name, queue, status, project,
+                   claimed_by AS worker, created_at, started_at, finished_at,
+                   seconds, 0 AS retries, error,
+                   COALESCE(finished_at, started_at, created_at) AS recency
+            FROM ingest_jobs{where}
+            ORDER BY recency DESC
+            LIMIT %(limit)s
+            """,
+            params,
+        )
+        return [dict(row) for row in cur.fetchall()]

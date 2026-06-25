@@ -31,6 +31,7 @@ Usage::
 
 from __future__ import annotations
 
+import datetime
 import html
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -133,6 +134,87 @@ def _fleet_table(fleet: list[dict[str, Any]]) -> str:
     )
 
 
+# ── Sidekiq-inspired pieces (a KPI strip + status badges + a recent-activity feed)
+
+def _ago(dt: Any) -> str:
+    """Compact relative age (Sidekiq shows 'x ago'). Tolerant of naive/aware/None."""
+    if dt is None:
+        return "—"
+    try:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if getattr(dt, "tzinfo", None) is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        s = (now - dt).total_seconds()
+    except Exception:
+        return _esc(dt)
+    if s < 1:
+        return "now"
+    if s < 60:
+        return f"{int(s)}s ago"
+    if s < 3600:
+        return f"{int(s // 60)}m ago"
+    if s < 86400:
+        return f"{int(s // 3600)}h ago"
+    return f"{int(s // 86400)}d ago"
+
+
+_BADGE = {"queued": "q", "running": "r", "completed": "c", "failed": "x",
+          "cancelled": "n", "awaiting_input": "a"}
+
+
+def _badge(status: Any) -> str:
+    return f'<span class="badge b-{_BADGE.get(str(status), "n")}">{_esc(status)}</span>'
+
+
+def _stat_strip(counts: dict[str, int], ingest: dict[str, Any],
+                fleet: list[dict[str, Any]], projects: list[str]) -> str:
+    """Sidekiq-style overview: big-number KPIs summed across node + ingest queues."""
+    tot = {"running": 0, "queued": 0, "completed": 0, "failed": 0}
+    for k, n in (counts or {}).items():            # node-job counts: 'cpu_completed' …
+        for s in tot:
+            if k.endswith("_" + s):
+                tot[s] += int(n)
+    for q, st in (ingest or {}).get("queues", {}).items():
+        if q in ("cpu", "gpu"):
+            continue
+        for s in tot:
+            tot[s] += int(st.get(s, 0))
+    items = [("Busy", tot["running"], "running"), ("Enqueued", tot["queued"], "queued"),
+             ("Processed", tot["completed"], "completed"), ("Failed", tot["failed"], "failed"),
+             ("Workers", len(fleet), "workers"), ("Projects", len(projects), "proj")]
+    cells = "".join(f'<div class="kpi {cls}"><b>{v}</b><span>{label}</span></div>'
+                    for label, v, cls in items)
+    return f'<div class="kpis">{cells}</div>'
+
+
+def _recent_table(jobs: list[dict[str, Any]]) -> str:
+    """Sidekiq-style recent-activity feed across both job families (node + ingest)."""
+    if not jobs:
+        return '<p class="muted">no recent jobs</p>'
+    rows = []
+    for j in jobs:
+        retries = int(j.get("retries") or 0)
+        kind = str(j.get("kind") or "")
+        rows.append(
+            "<tr>"
+            f'<td><span class="kind k-{_esc(kind)}">{_esc(kind)}</span></td>'
+            f'<td class="mono">{_esc(j.get("name") or "—")}</td>'
+            f"<td>{_esc(j.get('queue'))}</td>"
+            f"<td>{_esc(_proj_label(j.get('project') or ''))}</td>"
+            f"<td>{_badge(j.get('status'))}</td>"
+            f'<td class="{"warn" if retries else ""}">{retries or "—"}</td>'
+            f'<td class="mono">{_esc(j.get("worker") or "—")}</td>'
+            f'<td class="muted">{_ago(j.get("recency"))}</td>'
+            "</tr>"
+        )
+    return (
+        '<table class="fleet"><thead><tr>'
+        "<th>kind</th><th>job</th><th>queue</th><th>project</th>"
+        "<th>status</th><th>retries</th><th>worker</th><th>when</th>"
+        f"</tr></thead><tbody>{''.join(rows)}</tbody></table>"
+    )
+
+
 _CSS = """
 :root{color-scheme:light}
 *{box-sizing:border-box}
@@ -168,6 +250,26 @@ table.fleet{border-collapse:collapse;width:100%;font-size:13px;background:#fff;
 .st.ok{color:#1a7f37}.st.stale{color:#9a6700}.st.dead{color:#d1242f;font-weight:700}
 .muted{color:#656d76}
 footer{color:#848d97;font-size:11px;padding:18px 22px;border-top:1px solid #d8dee4}
+/* Sidekiq-style KPI strip */
+.kpis{display:flex;flex-wrap:wrap;gap:12px;margin:0 0 8px}
+.kpi{background:#fff;border:1px solid #d0d7de;border-radius:9px;padding:12px 20px;
+ min-width:104px;box-shadow:0 1px 0 rgba(27,31,36,.04)}
+.kpi b{display:block;font-size:27px;line-height:1;font-weight:700;color:#1f2328}
+.kpi span{display:block;font-size:10px;text-transform:uppercase;letter-spacing:.7px;
+ color:#656d76;margin-top:6px}
+.kpi.running b{color:#0969da}.kpi.queued b{color:#9a6700}
+.kpi.completed b{color:#1a7f37}.kpi.failed b{color:#d1242f}.kpi.workers b{color:#0969da}
+/* status badges + recent feed */
+.badge{display:inline-block;padding:2px 9px;border-radius:11px;font-size:11px;
+ font-weight:600;line-height:1.5}
+.b-q{background:#fff8c5;color:#7d4e00}.b-r{background:#ddf4ff;color:#0550ae}
+.b-c{background:#dafbe1;color:#0a5a2a}.b-x{background:#ffebe9;color:#a40e26}
+.b-n{background:#eaeef2;color:#57606a}.b-a{background:#fbefff;color:#6639ba}
+.kind{font-size:10px;text-transform:uppercase;letter-spacing:.5px;padding:2px 7px;
+ border-radius:5px;font-weight:700}
+.k-node{background:#eef2ff;color:#3538cd}.k-ingest{background:#eafff1;color:#15803d}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+td.warn{color:#9a6700;font-weight:700}
 """
 
 
@@ -177,6 +279,8 @@ def render_dashboard(project: str | None = None, *, stale_after_s: float = 30.0)
     snap = node_queue.snapshot(project=project)
     ingest = node_queue.ingest_snapshot(project=project)
     fleet = node_queue.fleet_snapshot(stale_after_s=stale_after_s, project=project)
+    recent = node_queue.recent_jobs(project=project, limit=25)
+    projects = node_queue.list_projects()
     counts = snap.get("counts", {})
     scope = "all projects" if project is None else f"project = {_proj_label(project)}"
     body = f"""<!doctype html><html lang="en"><head>
@@ -191,10 +295,14 @@ def render_dashboard(project: str | None = None, *, stale_after_s: float = 30.0)
   {_project_filter_bar(project)}
 </header>
 <main>
+  <h2>Overview</h2>
+  {_stat_strip(counts, ingest, fleet, projects)}
   <h2>Queues — shared cpu / gpu</h2>
   <div class="cards">{_queue_card('cpu', counts)}{_queue_card('gpu', counts)}</div>
   <h2>Ingest queues</h2>
   <div class="cards">{_ingest_cards(ingest)}</div>
+  <h2>Recent activity <em style="text-transform:none;font-weight:400;color:#848d97">· last {len(recent)} jobs across node + ingest</em></h2>
+  {_recent_table(recent)}
   <h2>Fleet — workers</h2>
   {_fleet_table(fleet)}
 </main>

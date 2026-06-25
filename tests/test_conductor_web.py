@@ -81,6 +81,40 @@ def test_conductor_backend_flag_selects_store():
     assert queue_workflows.get_config().db_backend == "pg"
 
 
+def test_recent_jobs_unifies_node_and_ingest():
+    """The Sidekiq-style activity feed primitive: one list across BOTH job
+    families, project-aware, with the unified lifecycle shape."""
+    _seed()
+    jobs = node_queue.recent_jobs(limit=50)
+    kinds = {j["kind"] for j in jobs}
+    assert "node" in kinds and "ingest" in kinds
+    names = {j["name"] for j in jobs}
+    assert {"a", "b", "g"} <= names      # node ids
+    assert "noop" in names               # ingest task name
+    for col in ("kind", "name", "queue", "status", "project", "worker", "retries", "recency"):
+        assert col in jobs[0]
+    # project filter scopes the feed
+    beta = node_queue.recent_jobs(project="beta", limit=50)
+    assert {j["project"] for j in beta} == {"beta"}
+    assert {j["name"] for j in beta} == {"b"}
+    # status filter (a 'dead jobs' view would pass status='failed')
+    assert node_queue.recent_jobs(status="failed", limit=50) == []
+
+
+def test_dashboard_has_overview_strip_and_recent_activity():
+    """The Sidekiq-inspired additions render: the KPI overview strip + the
+    recent-activity feed with status badges."""
+    _seed()
+    html = web.render_dashboard(None)
+    assert "Overview" in html
+    for kpi in ("Busy", "Enqueued", "Processed", "Failed", "Workers", "Projects"):
+        assert kpi in html
+    assert "Recent activity" in html
+    assert 'class="kpi' in html      # the KPI strip
+    assert 'class="badge' in html    # Sidekiq-style status pills
+    assert "noop" in html            # the ingest job appears in the feed
+
+
 def test_render_is_escaped(monkeypatch):
     # a hostile project/model value must not break out of the HTML
     node_queue.upsert_worker_heartbeat(
