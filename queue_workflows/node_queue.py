@@ -1926,7 +1926,8 @@ def fleet_snapshot(
 
 
 def recent_jobs(
-    *, project: str | None = None, status: str | None = None, limit: int = 40,
+    *, project: str | None = None, status: str | None = None,
+    min_retries: int = 0, limit: int = 40,
 ) -> list[dict[str, Any]]:
     """Read-only recent-activity feed across BOTH job families — DAG node-jobs
     (``workflow_node_jobs``) and standalone ingest jobs (``ingest_jobs``) — unified
@@ -1940,19 +1941,27 @@ def recent_jobs(
     for ingest), and ``error``.
 
     ``project`` (migration 0017) filters to one tenant; ``status`` filters to one
-    state (``'failed'`` ⇒ a dead-jobs view, ``'running'`` ⇒ busy). Both ``None`` ⇒
-    the broker-wide feed. No backend-specific time funcs, so it is portable across
-    the pg / sqlite dialects. Returns ``[]`` when empty.
+    state (``'failed'`` ⇒ a dead-jobs view, ``'running'`` ⇒ busy); ``min_retries``
+    ≥ 1 ⇒ a retries view (node-jobs whose ``watchdog_retries`` reached it; ingest
+    jobs have no retry counter, so they drop out). All ``None``/0 ⇒ the broker-wide
+    feed. No backend-specific time funcs, so it is portable across the pg / sqlite
+    dialects. Returns ``[]`` when empty.
     """
-    clauses: list[str] = []
+    common: list[str] = []
     params: dict[str, Any] = {"limit": int(limit)}
     if project is not None:
-        clauses.append("project = %(project)s")
+        common.append("project = %(project)s")
         params["project"] = project
     if status is not None:
-        clauses.append("status = %(status)s")
+        common.append("status = %(status)s")
         params["status"] = status
-    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    node_clauses, ingest_clauses = list(common), list(common)
+    if min_retries > 0:
+        node_clauses.append("watchdog_retries >= %(min_retries)s")
+        params["min_retries"] = int(min_retries)
+        ingest_clauses.append("1 = 0")  # ingest jobs carry no retry counter
+    nwhere = (" WHERE " + " AND ".join(node_clauses)) if node_clauses else ""
+    iwhere = (" WHERE " + " AND ".join(ingest_clauses)) if ingest_clauses else ""
     with connection() as conn, conn.cursor() as cur:
         cur.execute(
             f"""
@@ -1960,16 +1969,36 @@ def recent_jobs(
                    claimed_by AS worker, created_at, started_at, finished_at,
                    seconds, watchdog_retries AS retries, error,
                    COALESCE(finished_at, started_at, created_at) AS recency
-            FROM workflow_node_jobs{where}
+            FROM workflow_node_jobs{nwhere}
             UNION ALL
             SELECT id, 'ingest' AS kind, task_name AS name, queue, status, project,
                    claimed_by AS worker, created_at, started_at, finished_at,
                    seconds, 0 AS retries, error,
                    COALESCE(finished_at, started_at, created_at) AS recency
-            FROM ingest_jobs{where}
+            FROM ingest_jobs{iwhere}
             ORDER BY recency DESC
             LIMIT %(limit)s
             """,
             params,
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
+def list_node_events(job_id: str, *, limit: int = 200) -> list[dict[str, Any]]:
+    """Read-only per-attempt event timeline for a node-job — the durable
+    ``workflow_node_events`` log (migration 0011), the forensic history a
+    job-detail view renders: ``claimed`` → ``model_load_*`` → ``progress_beat`` →
+    ``stall_*`` / ``gpu_health_trip`` / ``budget_trip`` → ``requeued`` → terminal,
+    oldest-first, each row carrying ``attempt`` (the ``watchdog_retries`` at emit,
+    tying one node's tries together), ``host_label``, ``elapsed_s``, ``error``, and
+    a free-form ``detail``. Returns ``[]`` for an ingest job (no per-attempt log)
+    or an unknown id."""
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, attempt, event_type, host_label, queue, model, "
+            "elapsed_s, error, detail, created_at "
+            "FROM workflow_node_events WHERE job_id = %(job_id)s "
+            "ORDER BY created_at ASC, id ASC LIMIT %(limit)s",
+            {"job_id": job_id, "limit": int(limit)},
         )
         return [dict(row) for row in cur.fetchall()]

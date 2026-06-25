@@ -115,6 +115,59 @@ def test_dashboard_has_overview_strip_and_recent_activity():
     assert "noop" in html            # the ingest job appears in the feed
 
 
+def test_list_node_events_and_job_detail_render():
+    """The job-detail timeline: list_node_events returns the per-attempt log and
+    render_job shows the metadata + the events (our differentiator over Sidekiq)."""
+    rid = _run("alpha")
+    jid = node_queue.enqueue_node_job(run_id=rid, node_id="nd", node_module="m",
+                                      queue="gpu", project="alpha")
+    node_queue.record_node_event(run_id=rid, node_id="nd", job_id=jid,
+                                 event_type="claimed", host_label="boxA", queue="gpu")
+    node_queue.record_node_event(run_id=rid, node_id="nd", job_id=jid,
+                                 event_type="completed", host_label="boxA",
+                                 queue="gpu", elapsed_s=1.5)
+    events = node_queue.list_node_events(jid)
+    assert [e["event_type"] for e in events] == ["claimed", "completed"]
+    html = web.render_job(node_queue.get_node_job(jid), events, kind="node")
+    assert "Event timeline" in html
+    assert "claimed" in html and "completed" in html and "boxA" in html
+    # an unknown / ingest job has no per-attempt log
+    assert node_queue.list_node_events(str(uuid.uuid4())) == []
+
+
+def test_recent_jobs_retries_filter():
+    """min_retries ⇒ Sidekiq's Retries view: node-jobs over the threshold only;
+    ingest jobs (no retry counter) drop out."""
+    rid = _run("alpha")
+    node_queue.enqueue_node_job(run_id=rid, node_id="clean", node_module="m",
+                                queue="cpu", project="alpha")
+    jid = node_queue.enqueue_node_job(run_id=rid, node_id="flaky", node_module="m",
+                                      queue="cpu", project="alpha")
+    from queue_workflows.db import connection
+    with connection() as c, c.cursor() as cur:
+        cur.execute("UPDATE workflow_node_jobs SET watchdog_retries = 2 "
+                    "WHERE id = %(id)s", {"id": jid})
+        c.commit()
+    retried = node_queue.recent_jobs(min_retries=1, limit=50)
+    names = {j["name"] for j in retried}
+    assert "flaky" in names and "clean" not in names
+    assert all(j["kind"] == "node" for j in retried)   # ingest excluded
+
+
+def test_dashboard_tabs_and_views():
+    """The Recent-activity feed gains Sidekiq All/Retries/Dead tabs; the view
+    param scopes the feed and marks the active tab."""
+    _seed()
+    html = web.render_dashboard(None, view="all")
+    for tab in (">All<", ">Retries<", ">Dead<"):
+        assert tab in html
+    assert 'class="tab active"' in html
+    dead = web.render_dashboard(None, view="dead")
+    assert 'href="/?view=dead' in dead   # the tab links preserve the view
+    # a bad view falls back to 'all' (no crash)
+    assert web.render_dashboard(None, view="bogus").count("Recent activity") == 1
+
+
 def test_render_is_escaped(monkeypatch):
     # a hostile project/model value must not break out of the HTML
     node_queue.upsert_worker_heartbeat(

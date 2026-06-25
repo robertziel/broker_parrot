@@ -198,7 +198,8 @@ def _recent_table(jobs: list[dict[str, Any]]) -> str:
         rows.append(
             "<tr>"
             f'<td><span class="kind k-{_esc(kind)}">{_esc(kind)}</span></td>'
-            f'<td class="mono">{_esc(j.get("name") or "—")}</td>'
+            f'<td class="mono"><a href="/job/{_esc(j.get("id"))}?kind={_esc(kind)}">'
+            f'{_esc(j.get("name") or "—")}</a></td>'
             f"<td>{_esc(j.get('queue'))}</td>"
             f"<td>{_esc(_proj_label(j.get('project') or ''))}</td>"
             f"<td>{_badge(j.get('status'))}</td>"
@@ -270,16 +271,37 @@ footer{color:#848d97;font-size:11px;padding:18px 22px;border-top:1px solid #d8de
 .k-node{background:#eef2ff;color:#3538cd}.k-ingest{background:#eafff1;color:#15803d}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
 td.warn{color:#9a6700;font-weight:700}
+table.fleet a{color:#0969da;text-decoration:none}
+table.fleet a:hover{text-decoration:underline}
+/* Sidekiq-style All/Retries/Dead tabs on the activity feed */
+.tabs{font-size:12px;font-weight:400;text-transform:none;letter-spacing:0;margin-left:10px}
+.tabs .tab{padding:3px 11px;border-radius:12px;color:#57606a;text-decoration:none}
+.tabs .tab.active{background:#0969da;color:#fff}
+/* job-detail metadata grid + error block */
+.metas{display:flex;flex-wrap:wrap;gap:10px}
+.meta{background:#fff;border:1px solid #d0d7de;border-radius:8px;padding:9px 13px;min-width:120px}
+.meta span{display:block;font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:#656d76}
+.meta b{display:block;font-size:13px;margin-top:3px;word-break:break-all;font-weight:600}
+pre.err{background:#fff8f8;border:1px solid #ffcecb;border-radius:8px;padding:12px;
+ color:#a40e26;font-size:12px;overflow:auto;white-space:pre-wrap}
 """
 
 
-def render_dashboard(project: str | None = None, *, stale_after_s: float = 30.0) -> str:
+def render_dashboard(project: str | None = None, *, stale_after_s: float = 30.0,
+                     view: str = "all") -> str:
     """Render the full dashboard HTML for ``project`` (``None`` ⇒ all projects).
+    ``view`` selects the Recent-activity tab: ``all`` | ``retries`` (Sidekiq's
+    Retries — node-jobs with ``watchdog_retries>0``) | ``dead`` (failed jobs).
     Pure — fetches the engine snapshots and returns a complete HTML document."""
     snap = node_queue.snapshot(project=project)
     ingest = node_queue.ingest_snapshot(project=project)
     fleet = node_queue.fleet_snapshot(stale_after_s=stale_after_s, project=project)
-    recent = node_queue.recent_jobs(project=project, limit=25)
+    if view == "retries":
+        recent = node_queue.recent_jobs(project=project, min_retries=1, limit=50)
+    elif view == "dead":
+        recent = node_queue.recent_jobs(project=project, status="failed", limit=50)
+    else:
+        view, recent = "all", node_queue.recent_jobs(project=project, limit=25)
     projects = node_queue.list_projects()
     counts = snap.get("counts", {})
     scope = "all projects" if project is None else f"project = {_proj_label(project)}"
@@ -301,7 +323,7 @@ def render_dashboard(project: str | None = None, *, stale_after_s: float = 30.0)
   <div class="cards">{_queue_card('cpu', counts)}{_queue_card('gpu', counts)}</div>
   <h2>Ingest queues</h2>
   <div class="cards">{_ingest_cards(ingest)}</div>
-  <h2>Recent activity <em style="text-transform:none;font-weight:400;color:#848d97">· last {len(recent)} jobs across node + ingest</em></h2>
+  <h2>Recent activity {_recent_tabs(view, project)}</h2>
   {_recent_table(recent)}
   <h2>Fleet — workers</h2>
   {_fleet_table(fleet)}
@@ -309,6 +331,83 @@ def render_dashboard(project: str | None = None, *, stale_after_s: float = 30.0)
 <footer>read-only · single-DB · auto-refresh {REFRESH_S}s · queue-conductor-web</footer>
 </body></html>"""
     return body
+
+
+def _recent_tabs(view: str, project: str | None) -> str:
+    """Sidekiq-style All / Retries / Dead tabs for the activity feed (preserves
+    the active project filter)."""
+    suffix = "" if project is None else "&project=" + urllib.parse.quote(project)
+    out = []
+    for key, label in (("all", "All"), ("retries", "Retries"), ("dead", "Dead")):
+        cls = "tab active" if view == key else "tab"
+        out.append(f'<a class="{cls}" href="{_esc("/?view=" + key + suffix)}">{label}</a>')
+    return '<span class="tabs">' + "".join(out) + "</span>"
+
+
+def _job_meta(job: dict[str, Any]) -> str:
+    fields = [
+        ("status", _badge(job.get("status"))),
+        ("queue", _esc(job.get("queue"))),
+        ("project", _esc(_proj_label(job.get("project") or ""))),
+        ("worker", _esc(job.get("claimed_by") or "—")),
+        ("run", _esc(job.get("run_id") or "—")),
+        ("retries", _esc(job.get("watchdog_retries", "—"))),
+        ("seconds", _esc(job.get("seconds") if job.get("seconds") is not None else "—")),
+        ("created", _esc(job.get("created_at"))),
+        ("finished", _esc(job.get("finished_at") or "—")),
+    ]
+    cells = "".join(f'<div class="meta"><span>{k}</span><b>{v}</b></div>' for k, v in fields)
+    return f'<div class="metas">{cells}</div>'
+
+
+# event_type → badge colour (terminal/trip = red-ish, claimed/run = blue, requeue = amber)
+_EV_CLS = {"claimed": "r", "completed": "c", "failed": "x", "cancelled": "n",
+           "requeued": "q", "reassigned": "q", "gpu_health_trip": "x",
+           "stall_trip": "x", "budget_trip": "x"}
+
+
+def render_job(job: dict[str, Any], events: list[dict[str, Any]],
+               *, kind: str = "node") -> str:
+    """Job-detail page: the job's metadata + (for a node-job) its per-attempt
+    ``workflow_node_events`` timeline — broker_parrot's forensic history, richer
+    than Sidekiq's per-job retry list."""
+    name = job.get("node_id") or job.get("task_name") or job.get("id")
+    err = (f'<h2>Error</h2><pre class="err">{_esc(job.get("error"))}</pre>'
+           if job.get("error") else "")
+    if events:
+        rows = "".join(
+            "<tr>"
+            f'<td>{_esc(e.get("attempt"))}</td>'
+            f'<td><span class="badge b-{_EV_CLS.get(str(e.get("event_type")), "n")}">'
+            f'{_esc(e.get("event_type"))}</span></td>'
+            f'<td class="mono">{_esc(e.get("host_label") or "—")}</td>'
+            f'<td>{_esc(e.get("elapsed_s") if e.get("elapsed_s") is not None else "—")}</td>'
+            f'<td class="muted">{_esc(e.get("detail") or e.get("error") or "")}</td>'
+            f'<td class="muted">{_ago(e.get("created_at"))}</td>'
+            "</tr>"
+            for e in events
+        )
+        timeline = ('<table class="fleet"><thead><tr><th>try</th><th>event</th>'
+                    "<th>host</th><th>elapsed</th><th>detail</th><th>when</th>"
+                    f"</tr></thead><tbody>{rows}</tbody></table>")
+    elif kind == "node":
+        timeline = '<p class="muted">no events recorded for this node-job yet</p>'
+    else:
+        timeline = '<p class="muted">ingest jobs have no per-attempt event log</p>'
+    return f"""<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>broker_parrot — job</title><style>{_CSS}</style></head><body>
+<header><h1>broker_parrot <small>job · {_esc(name)} · {_esc(kind)}</small></h1>
+<div style="margin-top:8px"><a class="f" href="/">← dashboard</a></div></header>
+<main>
+  <h2>Job <em style="text-transform:none;font-weight:400;color:#848d97">· {_esc(job.get("id"))}</em></h2>
+  {_job_meta(job)}
+  {err}
+  <h2>Event timeline <em style="text-transform:none;font-weight:400;color:#848d97">· workflow_node_events (per attempt)</em></h2>
+  {timeline}
+</main>
+<footer>read-only · single-DB · queue-conductor-web</footer>
+</body></html>"""
 
 
 def render_error(exc: BaseException) -> str:
@@ -338,15 +437,33 @@ class ConductorWebHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
-        if parsed.path not in ("/", "/index.html"):
-            self._send(404, "<h1>404</h1>")
-            return
         # keep_blank_values so the single-tenant sentinel project '' is a real,
         # selectable filter (?project=) and not silently dropped to the all view.
         q = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        # /job/<id> — job detail + per-attempt event timeline
+        if parsed.path.startswith("/job/"):
+            job_id = urllib.parse.unquote(parsed.path[len("/job/"):])
+            kind = q.get("kind", ["node"])[0]
+            try:
+                if kind == "ingest":
+                    job, events = node_queue.get_ingest_job(job_id), []
+                else:
+                    job = node_queue.get_node_job(job_id)
+                    events = node_queue.list_node_events(job_id) if job else []
+                if job is None:
+                    self._send(404, "<h1>404 — no such job</h1>")
+                    return
+                self._send(200, render_job(job, events, kind=kind))
+            except Exception as exc:  # noqa: BLE001 — a DB blip must not kill the server
+                self._send(500, render_error(exc))
+            return
+        if parsed.path not in ("/", "/index.html"):
+            self._send(404, "<h1>404</h1>")
+            return
         project = q["project"][0] if "project" in q else None
+        view = q.get("view", ["all"])[0]
         try:
-            self._send(200, render_dashboard(project, stale_after_s=self.stale_after_s))
+            self._send(200, render_dashboard(project, stale_after_s=self.stale_after_s, view=view))
         except Exception as exc:  # noqa: BLE001 — a DB blip must not kill the server
             self._send(500, render_error(exc))
 

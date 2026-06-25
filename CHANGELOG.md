@@ -40,6 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (Busy / Enqueued / Processed / Failed / Workers / Projects, summed across node +
   ingest) and a Recent-activity feed with status badges + a retries column + "x ago"
   timing — every panel project-filter-aware, still read-only / stdlib-HTML / no-JS.
+  Plus a **`/job/<id>` detail page** (metadata grid + the per-attempt
+  `workflow_node_events` timeline) reachable from the feed, and Sidekiq-style
+  **All / Retries / Dead tabs** on the feed (`?view=`).
+- `node_queue.list_node_events(job_id)` — read-only per-attempt event timeline for a
+  node-job (the `workflow_node_events` log); `recent_jobs(..., min_retries=)` adds a
+  retries filter (node-jobs over the threshold; ingest excluded).
 - **`queue-broker` console + `queue-conductor-web` — operate the consolidated,
   one-queue-for-all-projects broker.** `queue-broker` stands up / owns the shared
   broker schema independently of any one project (`db.bootstrap` on the broker
