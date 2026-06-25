@@ -54,6 +54,7 @@ class HwFeed:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._warned_no_dsn = False  # log the "no DSN yet" notice once per streak
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     def start(self) -> "HwFeed":
@@ -95,11 +96,18 @@ class HwFeed:
         while not self._stop.is_set():
             dsn = self._dsn or metrics_dsn()
             if not dsn:
-                log.warning("[hw_feed] no metrics DSN configured "
-                            "(config.metrics_db_url_env / db_url_env unset)")
-                if self._stop.wait(5.0):
+                # The host may start the feed BEFORE it configures the engine (so
+                # db_url_env isn't set yet). Don't spam — warn once, then poll at a
+                # short interval so we pick up the DSN promptly once configured.
+                if not self._warned_no_dsn:
+                    log.warning("[hw_feed] no metrics DSN yet "
+                                "(config.metrics_db_url_env / db_url_env unset) — "
+                                "retrying until the engine is configured")
+                    self._warned_no_dsn = True
+                if self._stop.wait(1.0):
                     return
                 continue
+            self._warned_no_dsn = False
             try:
                 with psycopg.connect(dsn, autocommit=True) as conn:
                     conn.execute(f"LISTEN {NOTIFY_CHANNEL}")
