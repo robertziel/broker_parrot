@@ -1,0 +1,442 @@
+"""Unit tests for the shared node-execution body ``execute_node``.
+
+``execute_node(job, *, model_cache=None, cancel_event=None)`` owns:
+re-resolving ``$from`` inputs at execute time, building the node out_dir,
+invoking the node module (threading the model handle + cancel_event), and the
+terminal ``mark_*_in_txn`` + dispatch-event outbox write in one transaction.
+
+The node-module resolver is wired at a fake test package via
+``set_node_module_package`` so the engine suite stays domain-free.
+
+Contract pinned here:
+  * a mocked node → row flips ``completed`` + a ``completed`` event in the same
+    txn;
+  * a raising node → row flips ``failed`` + a ``failed`` event;
+  * a GPU job with a ``required_model`` calls ``model_cache.require_model``
+    (once) and threads the handle into the node;
+  * an already-terminal row → no-op (returns "skipped"), writes no event.
+"""
+
+from __future__ import annotations
+
+import sys
+import threading
+import types
+
+import pytest
+
+import queue_workflows
+from queue_workflows import node_executor, node_queue
+from queue_workflows.db import connection
+from tests._helpers import make_run
+
+
+@pytest.fixture(autouse=True)
+def _fake_node_pkg():
+    queue_workflows.set_node_module_package("qwf_ne_nodes")
+    yield
+
+
+def _make_run() -> str:
+    return make_run(workflow_name="_node_exec_test", out_dir=None)
+
+
+def _install_fake_node(name: str, run_fn) -> None:
+    mod = types.ModuleType(f"qwf_ne_nodes.{name}")
+    mod.run = run_fn
+    sys.modules[f"qwf_ne_nodes.{name}"] = mod
+
+
+def _events(run_id: str) -> list[dict]:
+    with connection() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM workflow_dispatch_events WHERE run_id=%s ORDER BY id",
+            (run_id,),
+        )
+        return list(cur.fetchall())
+
+
+# ── happy path ───────────────────────────────────────────────────────────
+
+
+def test_execute_node_marks_completed_and_enqueues_event():
+    run_id = _make_run()
+    captured: dict = {}
+
+    def run(*, inputs=None, out=None, model_handle=None, status_callback=None):
+        captured["inputs"] = inputs
+        return {"context_delta": {"ok": True}}
+
+    _install_fake_node("_ne_ok", run)
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="_ne_ok", queue="cpu",
+        inputs={"a": 1},
+    )
+
+    result = node_executor.execute_node(node_queue.get_node_job(job_id))
+    assert result == "completed"
+
+    row = node_queue.get_node_job(job_id)
+    assert row["status"] == "completed"
+    assert row["context_delta"] == {"ok": True}
+    assert row["resolved_inputs"] == {"a": 1}
+
+    evts = _events(run_id)
+    assert len(evts) == 1
+    assert evts[0]["kind"] == "completed"
+    assert evts[0]["processed_at"] is None
+
+
+def test_execute_node_marks_failed_and_enqueues_event():
+    run_id = _make_run()
+
+    def run(**_kw):
+        raise RuntimeError("boom in node body")
+
+    _install_fake_node("_ne_boom", run)
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="_ne_boom", queue="cpu",
+    )
+
+    result = node_executor.execute_node(node_queue.get_node_job(job_id))
+    assert result == "failed"
+
+    row = node_queue.get_node_job(job_id)
+    assert row["status"] == "failed"
+    assert "boom in node body" in (row["error"] or "")
+
+    evts = _events(run_id)
+    assert len(evts) == 1
+    assert evts[0]["kind"] == "failed"
+
+
+def test_execute_node_threads_model_cache_for_gpu_job():
+    run_id = _make_run()
+    seen: dict = {}
+
+    def run(*, inputs=None, out=None, model_handle=None, status_callback=None,
+            cancel_event=None, model_load_seconds=None):
+        seen["handle"] = model_handle
+        seen["load_s_is_float"] = isinstance(model_load_seconds, float)
+        return {"context_delta": {}}
+
+    _install_fake_node("_ne_gpu", run)
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="g", node_module="_ne_gpu", queue="gpu",
+        required_model="some_model",
+    )
+
+    sentinel_handle = object()
+    require_calls: list[str] = []
+
+    class _FakeCache:
+        current_model = None
+
+        def require_model(self, model_id):
+            require_calls.append(model_id)
+            return sentinel_handle
+
+    result = node_executor.execute_node(
+        node_queue.get_node_job(job_id), model_cache=_FakeCache(),
+    )
+    assert result == "completed"
+    assert require_calls == ["some_model"]
+    assert seen["handle"] is sentinel_handle
+    assert seen["load_s_is_float"] is True
+
+
+def test_execute_node_threads_llm_server_from_resolver():
+    """The engine hands the node its LLM server endpoint AT DISPATCH: a host
+    injects ``set_llm_server_resolver(job) -> server`` and ``execute_node``
+    resolves it per-job and threads it into ``run(llm_server=...)`` — parallel to
+    ``model_handle``. This is how broker_parrot sends the vllm/ollama address+port
+    with the run node-job (the resolver body may pick a different server per job /
+    per box)."""
+    run_id = _make_run()
+    seen: dict = {}
+
+    def run(*, inputs=None, out=None, llm_server=None):
+        seen["llm_server"] = llm_server
+        return {"context_delta": {}}
+
+    _install_fake_node("_ne_llm", run)
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="_ne_llm", queue="cpu",
+    )
+
+    sentinel_server = {"type": "vllm", "url": "http://vllm:8000/v1", "port": 8000}
+    resolver_calls: list[dict] = []
+
+    def _resolver(job):
+        resolver_calls.append(job)
+        return sentinel_server
+
+    queue_workflows.set_llm_server_resolver(_resolver)
+    try:
+        result = node_executor.execute_node(node_queue.get_node_job(job_id))
+    finally:
+        queue_workflows.set_llm_server_resolver(None)
+
+    assert result == "completed"
+    # resolver called once, WITH the job dict (so it can key off host/queue/model).
+    assert len(resolver_calls) == 1
+    assert resolver_calls[0]["id"] == job_id
+    # the exact server object reached the node.
+    assert seen["llm_server"] is sentinel_server
+
+
+def test_execute_node_llm_server_none_when_no_resolver():
+    """No resolver injected ⇒ ``llm_server`` defaults to None; the node still runs.
+    Backward-compatible: every existing node that doesn't declare ``llm_server``
+    is unaffected."""
+    run_id = _make_run()
+    seen: dict = {}
+
+    def run(*, inputs=None, out=None, llm_server=None):
+        seen["llm_server"] = llm_server
+        return {"context_delta": {}}
+
+    _install_fake_node("_ne_llm_none", run)
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="_ne_llm_none", queue="cpu",
+    )
+    queue_workflows.set_llm_server_resolver(None)
+    result = node_executor.execute_node(node_queue.get_node_job(job_id))
+    assert result == "completed"
+    assert seen["llm_server"] is None
+
+
+def test_execute_node_model_load_failure_marks_failed():
+    run_id = _make_run()
+
+    def run(**_kw):
+        raise AssertionError("node body must not run when model load fails")
+
+    _install_fake_node("_ne_gpu_loadfail", run)
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="g", node_module="_ne_gpu_loadfail", queue="gpu",
+        required_model="broken_model",
+    )
+
+    class _FakeCache:
+        current_model = None
+
+        def require_model(self, model_id):
+            raise RuntimeError("cold load exploded")
+
+    result = node_executor.execute_node(
+        node_queue.get_node_job(job_id), model_cache=_FakeCache(),
+    )
+    assert result == "failed"
+    row = node_queue.get_node_job(job_id)
+    assert row["status"] == "failed"
+    assert "cold load exploded" in (row["error"] or "")
+    evts = _events(run_id)
+    assert len(evts) == 1 and evts[0]["kind"] == "failed"
+
+
+# ── transient GPU error: re-queue (don't fail the run), bounded by the watchdog cap ──────────
+
+
+def _set_running(job_id: str, *, retries: int = 0) -> None:
+    with connection() as c, c.cursor() as cur:
+        cur.execute(
+            "UPDATE workflow_node_jobs SET status='running', watchdog_retries=%s WHERE id=%s",
+            (retries, job_id),
+        )
+
+
+class _BusyGpuCache:
+    """A model_cache whose load raises a transient GPU error (device busy/unavailable)."""
+    current_model = None
+
+    def require_model(self, _model_id):
+        raise RuntimeError(
+            "AcceleratorError: CUDA error: CUDA-capable device(s) is/are busy or unavailable"
+        )
+
+
+def test_execute_node_requeues_on_transient_gpu_error_under_cap():
+    run_id = _make_run()
+    _install_fake_node("_ne_gpu_busy", lambda **_k: {"context_delta": {}})  # must NOT run
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="g", node_module="_ne_gpu_busy", queue="gpu",
+        required_model="qwen_erase",
+    )
+    _set_running(job_id, retries=0)
+
+    result = node_executor.execute_node(
+        node_queue.get_node_job(job_id), model_cache=_BusyGpuCache(),
+    )
+    assert result == "requeued"
+
+    row = node_queue.get_node_job(job_id)
+    assert row["status"] == "queued"                # re-queued, NOT failed
+    assert int(row["watchdog_retries"] or 0) == 1   # retry counter bumped
+    assert _events(run_id) == []                    # NO failed dispatch event -> run stays alive
+
+
+def test_execute_node_fails_transient_gpu_error_at_cap(monkeypatch):
+    monkeypatch.setenv("AI_LEADS_WATCHDOG_MAX_RETRIES", "3")
+    run_id = _make_run()
+    _install_fake_node("_ne_gpu_busy2", lambda **_k: {"context_delta": {}})
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="g", node_module="_ne_gpu_busy2", queue="gpu",
+        required_model="qwen_erase",
+    )
+    _set_running(job_id, retries=3)                 # already at the cap
+
+    result = node_executor.execute_node(
+        node_queue.get_node_job(job_id), model_cache=_BusyGpuCache(),
+    )
+    assert result == "failed"                       # cap reached -> a real failure
+    assert node_queue.get_node_job(job_id)["status"] == "failed"
+    evts = _events(run_id)
+    assert len(evts) == 1 and evts[0]["kind"] == "failed"
+
+
+def test_execute_node_non_gpu_model_load_error_still_fails():
+    run_id = _make_run()
+    _install_fake_node("_ne_nongpu", lambda **_k: {"context_delta": {}})
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="g", node_module="_ne_nongpu", queue="gpu",
+        required_model="m",
+    )
+    _set_running(job_id, retries=0)
+
+    class _MissingWeightsCache:
+        current_model = None
+
+        def require_model(self, _m):
+            raise FileNotFoundError("weights file not found: /models/m.safetensors")
+
+    result = node_executor.execute_node(
+        node_queue.get_node_job(job_id), model_cache=_MissingWeightsCache(),
+    )
+    assert result == "failed"                       # not a GPU error -> NOT requeued
+    assert node_queue.get_node_job(job_id)["status"] == "failed"
+
+
+def test_execute_node_requeues_transient_gpu_error_from_node_body():
+    """The INVOCATION handler (not just model-load) re-queues on a transient GPU error mid-run."""
+    run_id = _make_run()
+
+    def run(**_kw):
+        raise RuntimeError("CUDA error: device-side assert triggered")
+
+    _install_fake_node("_ne_body_gpu", run)
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="_ne_body_gpu", queue="gpu",
+    )
+    _set_running(job_id, retries=0)
+
+    result = node_executor.execute_node(node_queue.get_node_job(job_id))
+    assert result == "requeued"
+    assert node_queue.get_node_job(job_id)["status"] == "queued"
+    assert _events(run_id) == []                    # no dispatch event -> run stays alive
+
+
+def test_execute_node_content_error_with_gpu_marker_only_in_traceback_still_fails():
+    """The invocation handler classifies on type+message, NOT the traceback. A CONTENT error whose
+    traceback source line carries a GPU marker (the trailing comment below — linecache puts it in
+    the traceback) must still FAIL, not requeue. If the handler ever matched the full err (incl.
+    traceback), this flips to 'requeued' and the assert catches the regression."""
+    run_id = _make_run()
+
+    def run(**_kw):
+        raise ValueError("malformed polygon")  # cuda error: device-side assert (traceback-only marker)
+
+    _install_fake_node("_ne_tb_only", run)
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="_ne_tb_only", queue="gpu",
+    )
+    _set_running(job_id, retries=0)
+
+    result = node_executor.execute_node(node_queue.get_node_job(job_id))
+    assert result == "failed"                       # message has no marker -> NOT requeued
+    assert node_queue.get_node_job(job_id)["status"] == "failed"
+
+
+def test_execute_node_noop_on_already_terminal_row():
+    run_id = _make_run()
+    ran = {"n": 0}
+
+    def run(**_kw):
+        ran["n"] += 1
+        return {"context_delta": {}}
+
+    _install_fake_node("_ne_terminal", run)
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="_ne_terminal", queue="cpu",
+    )
+    with connection() as c, c.cursor() as cur:
+        cur.execute(
+            "UPDATE workflow_node_jobs SET status='completed', "
+            "context_delta='{}'::jsonb WHERE id=%s",
+            (job_id,),
+        )
+
+    result = node_executor.execute_node(node_queue.get_node_job(job_id))
+    assert result == "skipped"
+    evts = _events(run_id)
+    assert evts == []
+
+
+def test_execute_node_noop_on_already_completed_row_when_node_raises():
+    """The FAILED-path twin of the already-terminal no-op contract.
+
+    A node body that raises funnels through ``_finalise_failed``, which calls
+    ``mark_failed_in_txn`` (the load-bearing ``WHERE status NOT IN
+    ('completed','failed','cancelled')`` guard) and only writes the ``failed``
+    dispatch event when that returns a row. If a claim-race winner already
+    flipped the row ``completed``, ``mark_failed_in_txn`` returns ``None`` and
+    we MUST short-circuit to ``"skipped"`` — writing no ``failed`` event (which
+    would inject a spurious failed fan-out into the outbox) and leaving the
+    prior terminal ``context_delta`` untouched (no clobber). Drop the
+    ``if row is None: return "skipped"`` guard and this test goes red.
+    """
+    run_id = _make_run()
+
+    def run(**_kw):
+        raise RuntimeError("boom")
+
+    _install_fake_node("_ne_term_fail", run)
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="_ne_term_fail", queue="cpu",
+    )
+    # A claim-race winner already completed this row with real context.
+    with connection() as c, c.cursor() as cur:
+        cur.execute(
+            "UPDATE workflow_node_jobs SET status='completed', "
+            "context_delta='{\"keep\": true}'::jsonb WHERE id=%s",
+            (job_id,),
+        )
+
+    result = node_executor.execute_node(node_queue.get_node_job(job_id))
+    assert result == "skipped"
+
+    # No spurious 'failed' event leaked into the dispatch outbox.
+    assert _events(run_id) == []
+
+    # The prior terminal state is intact — not clobbered to 'failed'/{}.
+    row = node_queue.get_node_job(job_id)
+    assert row["status"] == "completed"
+    assert row["context_delta"] == {"keep": True}
+
+
+def test_execute_node_passes_cancel_event_to_opting_in_node():
+    run_id = _make_run()
+    captured: dict = {}
+
+    def run(*, inputs=None, out=None, model_handle=None, status_callback=None,
+            cancel_event=None):
+        captured["got"] = cancel_event is not None
+        return {"context_delta": {}}
+
+    _install_fake_node("_ne_cancel", run)
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="_ne_cancel", queue="cpu",
+    )
+    ev = threading.Event()
+    node_executor.execute_node(node_queue.get_node_job(job_id), cancel_event=ev)
+    assert captured["got"] is True

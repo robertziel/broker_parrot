@@ -1,0 +1,72 @@
+# Client-project worker containers (queue-broker-worker) — one Deployment per
+# (project, resource). A worker does NOT claim work or run its own LLM server: it asks the
+# broker for permission and, when granted, calls the broker-managed LLM Services. Scale a
+# lane with `replicas`; the broker arbitrates the shared resource across all projects.
+#
+# NOTE: the worker's handlers (register_broker_handler) are the PROJECT's code — bake them
+# into the image and select them via each job's payload['handler'] / its resource.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-alpha-cpu
+  namespace: broker-parrot
+  labels: { app: broker-worker, project: alpha, resource: cpu }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: broker-worker, project: alpha, resource: cpu }
+  template:
+    metadata:
+      labels: { app: broker-worker, project: alpha, resource: cpu }
+    spec:
+      containers:
+        - name: worker
+          image: REPLACE_ME/alpha-worker:latest   # the project image (its handlers + queue_workflows)
+          command: ["queue-broker-worker"]
+          args:
+            - "--worker-id"
+            - "$(POD_NAME)"                          # unique per pod
+            - "--project"
+            - "alpha"
+            - "--resource"
+            - "cpu"
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+          envFrom:
+            - configMapRef: { name: broker-config }
+            - secretRef: { name: broker-secrets }
+          resources:
+            requests: { cpu: "500m", memory: "512Mi" }
+            limits: { cpu: "2", memory: "2Gi" }
+---
+# A GPU lane for the same project: schedule onto GPU nodes and request a device. The
+# worker still runs the node body inline and uses the broker's LLM Services for inference.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-alpha-gpu
+  namespace: broker-parrot
+  labels: { app: broker-worker, project: alpha, resource: gpu }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: broker-worker, project: alpha, resource: gpu }
+  template:
+    metadata:
+      labels: { app: broker-worker, project: alpha, resource: gpu }
+    spec:
+      containers:
+        - name: worker
+          image: REPLACE_ME/alpha-worker:latest
+          command: ["queue-broker-worker"]
+          args: ["--worker-id", "$(POD_NAME)", "--project", "alpha", "--resource", "gpu"]
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+          envFrom:
+            - configMapRef: { name: broker-config }
+            - secretRef: { name: broker-secrets }
+          resources:
+            limits:
+              nvidia.com/gpu: "1"

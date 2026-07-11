@@ -1,0 +1,86 @@
+# Broker-managed LLM servers — ollama (the always-on baseline) + vLLM (per-model, heavier).
+# In the v2 model, client projects do NOT run their own ollama/vLLM; these cluster-managed
+# Services are the shared inference backends the broker routes workers to (via the
+# AI_LEADS_OLLAMA_URL / AI_LEADS_VLLM_URL config knobs in broker-config).
+#
+# TODAY these are static Deployments. The broker CONTROLLER that scales/(re)models the vLLM
+# Deployment from live queue demand is a follow-up — see docs/broker_k8s_llm.md.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: broker-parrot
+  labels: { app: ollama }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: ollama }
+  template:
+    metadata:
+      labels: { app: ollama }
+    spec:
+      containers:
+        - name: ollama
+          image: ollama/ollama:latest
+          ports:
+            - containerPort: 11434
+          readinessProbe:
+            httpGet: { path: /api/tags, port: 11434 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+      # nodeSelector/tolerations for GPU nodes are cluster-specific — set them for your fleet.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: broker-parrot
+spec:
+  selector: { app: ollama }
+  ports:
+    - { name: http, port: 11434, targetPort: 11434 }
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+  namespace: broker-parrot
+  labels: { app: vllm }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: vllm }
+  template:
+    metadata:
+      labels: { app: vllm }
+    spec:
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:latest
+          # The served model is set here today; the broker controller will (re)set it from
+          # demand (see design doc). OpenAI-compatible server on :8000.
+          args: ["--model", "REPLACE_ME/served-model", "--port", "8000"]
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm
+  namespace: broker-parrot
+spec:
+  selector: { app: vllm }
+  ports:
+    - { name: http, port: 8000, targetPort: 8000 }
+  type: ClusterIP

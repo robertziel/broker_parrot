@@ -1,0 +1,53 @@
+# Broker web service + operator panel (queue-broker-web) — the control plane's HTTP face.
+# One Deployment + a ClusterIP Service. Front with an Ingress (not shown) for external
+# access; keep the bearer token (broker-secrets) set if it's reachable beyond the cluster.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: broker-web
+  namespace: broker-parrot
+  labels: { app: broker-web }
+spec:
+  replicas: 1                     # single orchestrator for now (grant is check-then-act;
+                                  # a concurrency-safe grant is a prerequisite for >1 — see design doc)
+  selector:
+    matchLabels: { app: broker-web }
+  template:
+    metadata:
+      labels: { app: broker-web }
+    spec:
+      containers:
+        - name: broker-web
+          image: REPLACE_ME/broker-parrot:latest    # image bundling `queue_workflows` + the console scripts
+          command: ["queue-broker-web"]
+          args: ["--host", "0.0.0.0", "--port", "8787"]
+          envFrom:
+            - configMapRef: { name: broker-config }
+            - secretRef: { name: broker-secrets }
+          ports:
+            - containerPort: 8787
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8787 }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8787 }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "256Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: broker-web
+  namespace: broker-parrot
+  labels: { app: broker-web }
+spec:
+  selector: { app: broker-web }
+  ports:
+    - name: http
+      port: 8787
+      targetPort: 8787
+  type: ClusterIP
