@@ -1,0 +1,713 @@
+"""Lease + wake primitives for the Postgres-as-queue claim path.
+
+Exercises the ``claim_next_*`` path + ``reclaim_expired_leases`` + the
+``node_job_ready`` NOTIFY trigger (migration 0006).
+
+Covered:
+- claim stamps ``claimed_by`` + a future ``lease_expires_at``;
+- the run-cancel guard keeps a queued job whose run is cancelled/failed from
+  being claimed;
+- warm-model affinity: a warm worker claims the matching-model row over an
+  older cold row; a NULL-model (cold) worker claims by priority/FIFO;
+- the ``host_priority`` tiebreaker orders deterministically per host;
+- ``reclaim_expired_leases`` re-queues an expired-lease ``running`` row and
+  leaves a fresh-lease row alone;
+- the NOTIFY trigger fires ``node_job_ready`` (carrying the queue) on a queued
+  INSERT and on a reclaim UPDATE.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+
+import threading
+
+import pytest
+
+import psycopg
+
+from queue_workflows import db, node_queue
+from queue_workflows.db import connection
+from tests._helpers import force_lease, make_run, row
+
+
+# ── Lease stamping ─────────────────────────────────────────────────────────
+
+
+def test_claim_cpu_stamps_claimed_by_and_future_lease():
+    run_id = make_run()
+    node_queue.enqueue_node_job(
+        run_id=run_id, node_id="a", node_module="x", queue="cpu",
+    )
+    before = datetime.now(timezone.utc)
+    claimed = node_queue.claim_next_cpu_job(0, host="host-c", lease_s=600)
+    assert claimed is not None
+    assert claimed["status"] == "running"
+    assert claimed["claimed_by"] == "host-c"
+    assert claimed["lease_expires_at"] is not None
+    assert claimed["lease_expires_at"] > before
+
+
+def test_claim_gpu_stamps_claimed_by_and_future_lease():
+    run_id = make_run()
+    node_queue.enqueue_node_job(
+        run_id=run_id, node_id="g", node_module="x", queue="gpu",
+        required_model="sdxl",
+    )
+    claimed = node_queue.claim_next_gpu_job(
+        0, current_model="sdxl", host="host-a", lease_s=900,
+    )
+    assert claimed is not None
+    assert claimed["claimed_by"] == "host-a"
+    delta = claimed["lease_expires_at"] - datetime.now(timezone.utc)
+    assert timedelta(seconds=600) < delta < timedelta(seconds=1200)
+
+
+# ── Run-cancel guard folded into the claim ──────────────────────────────────
+
+
+def test_claim_skips_job_whose_run_is_cancelled():
+    run_id = make_run(status="cancelled")
+    node_queue.enqueue_node_job(
+        run_id=run_id, node_id="a", node_module="x", queue="cpu",
+    )
+    assert node_queue.claim_next_cpu_job(0, host="h") is None
+
+
+def test_claim_skips_job_whose_run_is_failed():
+    run_id = make_run(status="failed")
+    node_queue.enqueue_node_job(
+        run_id=run_id, node_id="g", node_module="x", queue="gpu",
+        required_model="sdxl",
+    )
+    assert node_queue.claim_next_gpu_job(0, current_model="sdxl", host="h") is None
+
+
+def test_claim_takes_active_run_skips_cancelled_run():
+    dead = make_run(status="cancelled")
+    live = make_run(status="running")
+    node_queue.enqueue_node_job(
+        run_id=dead, node_id="dead", node_module="x", queue="cpu", priority=1,
+    )
+    live_job = node_queue.enqueue_node_job(
+        run_id=live, node_id="live", node_module="x", queue="cpu", priority=100,
+    )
+    claimed = node_queue.claim_next_cpu_job(0, host="h")
+    assert claimed is not None
+    assert claimed["id"] == live_job
+
+
+# ── Warm-model affinity ──────────────────────────────────────────────────────
+
+
+def test_warm_gpu_worker_claims_matching_model_first():
+    run_id = make_run()
+    node_queue.enqueue_node_job(run_id=run_id, node_id="a", node_module="x",
+                                queue="gpu", required_model="sdxl")
+    flux = node_queue.enqueue_node_job(run_id=run_id, node_id="b", node_module="x",
+                                       queue="gpu", required_model="flux")
+    claimed = node_queue.claim_next_gpu_job(0, current_model="flux", host="host-a")
+    assert claimed["id"] == flux
+
+
+def test_cold_gpu_worker_claims_by_priority_then_fifo():
+    run_id = make_run()
+    early = node_queue.enqueue_node_job(run_id=run_id, node_id="a", node_module="x",
+                                        queue="gpu", required_model="sdxl",
+                                        priority=100)
+    node_queue.enqueue_node_job(run_id=run_id, node_id="b", node_module="x",
+                                queue="gpu", required_model="flux", priority=100)
+    claimed = node_queue.claim_next_gpu_job(0, current_model=None, host="host-c")
+    assert claimed["id"] == early
+
+
+def test_warm_affinity_respects_null_required_model_with_null_current():
+    run_id = make_run()
+    typed = node_queue.enqueue_node_job(run_id=run_id, node_id="a", node_module="x",
+                                        queue="gpu", required_model="sdxl",
+                                        priority=100)
+    untyped = node_queue.enqueue_node_job(run_id=run_id, node_id="b", node_module="x",
+                                          queue="gpu", priority=100)
+    claimed = node_queue.claim_next_gpu_job(0, current_model=None, host="host-a")
+    assert claimed["id"] == untyped
+    assert typed
+
+
+# ── model-presence lane filter (require_model) ──────────────────────────────
+
+
+def _seed_one_typed_one_untyped(run_id: str) -> tuple[str, str]:
+    """Enqueue one model-backed (``required_model='sdxl'``) and one no-model GPU
+    job; return (typed_id, untyped_id)."""
+    typed = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="typed", node_module="x", queue="gpu",
+        required_model="sdxl", priority=100,
+    )
+    untyped = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="untyped", node_module="x", queue="gpu",
+        priority=100,
+    )
+    return typed, untyped
+
+
+def test_require_model_true_claims_only_model_backed_jobs():
+    """``require_model=True`` (the diffusion inline lane) claims ONLY a row whose
+    ``required_model IS NOT NULL`` — never a no-model VLM job."""
+    run_id = make_run()
+    typed, untyped = _seed_one_typed_one_untyped(run_id)
+    claimed = node_queue.claim_next_gpu_job(
+        0, current_model="sdxl", host="host-a", require_model=True,
+    )
+    assert claimed is not None and claimed["id"] == typed
+    # The untyped (no-model) job is left for the pool lane.
+    assert node_queue.get_node_job(untyped)["status"] == "queued"
+
+
+def test_require_model_false_claims_only_no_model_jobs():
+    """``require_model=False`` (the VLM pool lane) claims ONLY a row whose
+    ``required_model IS NULL`` — never a model-backed diffusion job."""
+    run_id = make_run()
+    typed, untyped = _seed_one_typed_one_untyped(run_id)
+    claimed = node_queue.claim_next_gpu_job(
+        0, current_model=None, host="host-a", require_model=False,
+    )
+    assert claimed is not None and claimed["id"] == untyped
+    assert node_queue.get_node_job(typed)["status"] == "queued"
+
+
+def test_require_model_none_claims_any_existing_behaviour():
+    """``require_model=None`` (default) is the existing claim-any behaviour: it
+    grabs either kind. With a NULL current_model the affinity tiebreak puts the
+    no-model row first — but the point is it is NOT filtered out by presence."""
+    run_id = make_run()
+    typed, untyped = _seed_one_typed_one_untyped(run_id)
+    first = node_queue.claim_next_gpu_job(0, current_model=None, host="host-a")
+    second = node_queue.claim_next_gpu_job(0, current_model=None, host="host-a")
+    assert {first["id"], second["id"]} == {typed, untyped}
+
+
+def test_require_model_true_finds_nothing_when_only_no_model_jobs_queued():
+    """The two lanes are disjoint: with ONLY no-model jobs queued, the diffusion
+    lane (``require_model=True``) claims nothing — it can't steal the pool's
+    rows."""
+    run_id = make_run()
+    node_queue.enqueue_node_job(
+        run_id=run_id, node_id="u", node_module="x", queue="gpu",
+    )
+    assert node_queue.claim_next_gpu_job(
+        0, current_model=None, host="host-a", require_model=True,
+    ) is None
+
+
+def test_require_model_false_finds_nothing_when_only_model_jobs_queued():
+    """Mirror: with ONLY model-backed jobs queued, the pool lane
+    (``require_model=False``) claims nothing."""
+    run_id = make_run()
+    node_queue.enqueue_node_job(
+        run_id=run_id, node_id="t", node_module="x", queue="gpu",
+        required_model="sdxl",
+    )
+    assert node_queue.claim_next_gpu_job(
+        0, current_model=None, host="host-a", require_model=False,
+    ) is None
+
+
+def test_require_model_filter_composes_with_capability_gate():
+    """``require_model=True`` ANDs with the capability gate: a model-backed row
+    this worker CAN'T serve (not in known_models) is still skipped, even though
+    it has a required_model."""
+    run_id = make_run()
+    node_queue.enqueue_node_job(
+        run_id=run_id, node_id="t", node_module="x", queue="gpu",
+        required_model="flux",  # NOT in known_models below
+    )
+    assert node_queue.claim_next_gpu_job(
+        0, current_model=None, host="host-a",
+        known_models=["sdxl"], require_model=True,
+    ) is None
+
+
+# ── host_priority tiebreaker ────────────────────────────────────────────────
+
+
+def test_host_priority_high_takes_head_low_takes_tail():
+    run_id = make_run()
+    first = node_queue.enqueue_node_job(run_id=run_id, node_id="a", node_module="x",
+                                        queue="gpu", required_model="sdxl",
+                                        priority=100)
+    second = node_queue.enqueue_node_job(run_id=run_id, node_id="b", node_module="x",
+                                         queue="gpu", required_model="sdxl",
+                                         priority=100)
+    low = node_queue.claim_next_gpu_job(
+        0, current_model="sdxl", host="host-c", host_priority=-1,
+    )
+    assert low["id"] == second
+    high = node_queue.claim_next_gpu_job(
+        0, current_model="sdxl", host="host-a", host_priority=10,
+    )
+    assert high["id"] == first
+
+
+def test_host_priority_default_is_head_first_fifo():
+    run_id = make_run()
+    first = node_queue.enqueue_node_job(run_id=run_id, node_id="a", node_module="x",
+                                        queue="gpu", required_model="sdxl",
+                                        priority=100)
+    node_queue.enqueue_node_job(run_id=run_id, node_id="b", node_module="x",
+                                queue="gpu", required_model="sdxl", priority=100)
+    claimed = node_queue.claim_next_gpu_job(0, current_model="sdxl", host="h")
+    assert claimed["id"] == first
+
+
+def test_host_priority_applies_to_cpu_too():
+    run_id = make_run()
+    first = node_queue.enqueue_node_job(run_id=run_id, node_id="a", node_module="x",
+                                        queue="cpu", priority=100)
+    second = node_queue.enqueue_node_job(run_id=run_id, node_id="b", node_module="x",
+                                         queue="cpu", priority=100)
+    low = node_queue.claim_next_cpu_job(0, host="host-c", host_priority=-1)
+    assert low["id"] == second
+    high = node_queue.claim_next_cpu_job(0, host="host-a", host_priority=10)
+    assert high["id"] == first
+
+
+# ── reclaim_expired_leases ───────────────────────────────────────────────────
+
+
+def test_reclaim_requeues_expired_lease_row():
+    run_id = make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="a", node_module="x", queue="cpu", priority=100,
+    )
+    force_lease(job_id, expires_in_s=-30)
+    reclaimed = node_queue.reclaim_expired_leases()
+    ids = [r["id"] for r in reclaimed]
+    assert job_id in ids
+    r = row(job_id)
+    assert r["status"] == "queued"
+    assert r["claimed_by"] is None
+    assert r["lease_expires_at"] is None
+    assert r["started_at"] is None
+    assert r["priority"] <= 10
+
+
+def test_reclaim_returns_run_and_node_ids():
+    run_id = make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="the-node", node_module="x", queue="gpu",
+        required_model="sdxl",
+    )
+    force_lease(job_id, expires_in_s=-5)
+    reclaimed = node_queue.reclaim_expired_leases()
+    match = next(r for r in reclaimed if r["id"] == job_id)
+    assert match["run_id"] == run_id
+    assert match["node_id"] == "the-node"
+
+
+def test_reclaim_leaves_fresh_lease_untouched():
+    run_id = make_run()
+    fresh = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="fresh", node_module="x", queue="cpu",
+    )
+    expired = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="expired", node_module="x", queue="cpu",
+    )
+    force_lease(fresh, expires_in_s=600)
+    force_lease(expired, expires_in_s=-1)
+    reclaimed = node_queue.reclaim_expired_leases()
+    ids = [r["id"] for r in reclaimed]
+    assert expired in ids
+    assert fresh not in ids
+    assert row(fresh)["status"] == "running"
+    assert row(fresh)["claimed_by"] == "host-x"
+
+
+def test_reclaim_ignores_running_rows_without_a_lease():
+    run_id = make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="legacy", node_module="x", queue="cpu",
+    )
+    with connection() as c, c.cursor() as cur:
+        cur.execute(
+            "UPDATE workflow_node_jobs SET status='running', started_at=now() "
+            "WHERE id=%s",
+            (job_id,),
+        )
+    reclaimed = node_queue.reclaim_expired_leases()
+    assert job_id not in [r["id"] for r in reclaimed]
+    assert row(job_id)["status"] == "running"
+
+
+# ── requeue_job_for_retry (watchdog re-queue mechanic) ───────────────────────
+# The watchdog-trip path re-queues a SINGLE running node-job for a retry on a
+# fresh worker — same "running→queued + clear lease + bump priority to front"
+# mechanic as reclaim_expired_leases, scoped by id, plus a watchdog_retries++
+# counter (migration 0010). CAS-guarded + idempotent like the mark_* ops; writes
+# NO dispatch event (the run stays running, only the node re-runs).
+
+
+def _claimed_running_job(queue="cpu", priority=100):
+    run_id = make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="x", queue=queue, priority=priority,
+        required_model=("qwen_edit" if queue == "gpu" else None),
+    )
+    if queue == "gpu":
+        node_queue.claim_next_gpu_job(0, host="host-x")
+    else:
+        node_queue.claim_next_cpu_job(0, host="host-x")
+    return run_id, job_id
+
+
+def test_requeue_for_retry_flips_running_to_queued_and_clears_lease():
+    run_id, job_id = _claimed_running_job()
+    before = row(job_id)
+    assert before["status"] == "running"
+    assert before["claimed_by"] == "host-x"
+    assert before["lease_expires_at"] is not None
+
+    out = node_queue.requeue_job_for_retry(job_id)
+    assert out is not None and out["id"] == job_id
+    r = row(job_id)
+    assert r["status"] == "queued"
+    assert r["claimed_by"] is None
+    assert r["lease_expires_at"] is None
+    assert r["started_at"] is None
+
+
+def test_requeue_for_retry_bumps_priority_to_front():
+    # Matches reclaim_expired_leases' LEAST(priority, 10): a back-of-queue job
+    # (priority 100) jumps to <= 10 so the retry runs promptly.
+    run_id, job_id = _claimed_running_job(priority=100)
+    node_queue.requeue_job_for_retry(job_id)
+    assert row(job_id)["priority"] <= 10
+
+
+def test_requeue_for_retry_does_not_lower_an_already_high_priority():
+    # LEAST(priority, 10) never RAISES the number (lowers urgency): a job already
+    # at priority 3 stays 3, not bumped up to 10.
+    run_id, job_id = _claimed_running_job(priority=3)
+    node_queue.requeue_job_for_retry(job_id)
+    assert row(job_id)["priority"] == 3
+
+
+def test_requeue_for_retry_increments_watchdog_retries():
+    run_id, job_id = _claimed_running_job()
+    assert row(job_id)["watchdog_retries"] == 0
+    node_queue.requeue_job_for_retry(job_id)
+    assert row(job_id)["watchdog_retries"] == 1
+    # A second cycle (re-claim then re-queue) increments again.
+    node_queue.claim_next_cpu_job(0, host="host-x")
+    node_queue.requeue_job_for_retry(job_id)
+    assert row(job_id)["watchdog_retries"] == 2
+
+
+def test_requeue_for_retry_returns_none_when_not_running():
+    # CAS guard: only a running row is re-queued. A queued row (never claimed) is
+    # left untouched and returns None — idempotent like the mark_* transitions.
+    run_id = make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="x", queue="cpu",
+    )
+    assert node_queue.requeue_job_for_retry(job_id) is None
+    r = row(job_id)
+    assert r["status"] == "queued"
+    assert r["watchdog_retries"] == 0  # not incremented on no-match
+
+
+def test_requeue_for_retry_idempotent_on_terminal_row():
+    run_id, job_id = _claimed_running_job()
+    with connection() as c, c.cursor() as cur:
+        node_queue.mark_completed_in_txn(cur, job_id, context_delta={}, seconds=1.0)
+    # Already completed → no-op, returns None, counter untouched.
+    assert node_queue.requeue_job_for_retry(job_id) is None
+    r = row(job_id)
+    assert r["status"] == "completed"
+    assert r["watchdog_retries"] == 0
+
+
+def test_requeue_for_retry_writes_no_dispatch_event():
+    # The run must stay running — only the node re-runs — so NO failed event.
+    run_id, job_id = _claimed_running_job()
+    node_queue.requeue_job_for_retry(job_id)
+    with connection() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM workflow_dispatch_events WHERE run_id=%s",
+            (run_id,),
+        )
+        assert cur.fetchone()["n"] == 0
+
+
+@pytest.mark.pg_only
+def test_requeue_for_retry_fires_node_job_ready_notify():
+    # The running→queued flip fires the migration-0006 NOTIFY (carrying the
+    # queue) so an idle worker re-claims it at once — same as reclaim.
+    run_id, job_id = _claimed_running_job(queue="cpu")
+    payloads = _listen_and_capture(lambda: node_queue.requeue_job_for_retry(job_id))
+    assert "cpu" in payloads
+
+
+# ── clear_worker_current_model (Part C — drop the busy ghost on hard-exit) ────
+# A watchdog trip hard-exits via os._exit, skipping the worker's finally — so its
+# worker_heartbeats row keeps advertising current_model. This helper nulls that
+# busy signal + ages last_seen out of the 30 s gauge window so the dead worker
+# stops inflating the "N/M GPU busy" gauge. Scoped by (host_label, queue) PK,
+# idempotent, returns None on no-match.
+
+
+def _heartbeat(host, queue, model):
+    node_queue.upsert_worker_heartbeat(
+        host_label=host, queue=queue, concurrency=1, current_model=model,
+    )
+
+
+def test_heartbeat_advertises_llm_servers_available():
+    """A worker advertises which LLM servers it can run (migration 0014) so the
+    queue UI can gate its per-machine server-type control."""
+    node_queue.upsert_worker_heartbeat(
+        host_label="host-a", queue="gpu", concurrency=1,
+        llm_servers_available=["ollama", "vllm"],
+    )
+    with connection() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT llm_servers_available FROM worker_heartbeats "
+            "WHERE host_label='host-a' AND queue='gpu'"
+        )
+        assert cur.fetchone()["llm_servers_available"] == ["ollama", "vllm"]
+
+
+def test_heartbeat_llm_servers_defaults_to_ollama_baseline():
+    """Omitting the capability ⇒ the ``['ollama']`` baseline, never NULL — so a
+    cpu/ingest worker (or another consumer project) leaves a safe value."""
+    node_queue.upsert_worker_heartbeat(
+        host_label="host-c", queue="cpu", concurrency=1,
+    )
+    with connection() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT llm_servers_available FROM worker_heartbeats "
+            "WHERE host_label='host-c' AND queue='cpu'"
+        )
+        assert cur.fetchone()["llm_servers_available"] == ["ollama"]
+
+
+def test_clear_current_model_nulls_the_busy_signal_and_ages_last_seen():
+    _heartbeat("host-a", "gpu", "qwen_edit")
+    out = node_queue.clear_worker_current_model("host-a", "gpu")
+    assert out is not None and out["current_model"] is None
+    with connection() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT current_model, last_seen < now() - interval '30 seconds' AS stale "
+            "FROM worker_heartbeats WHERE host_label='host-a' AND queue='gpu'"
+        )
+        r = cur.fetchone()
+    assert r["current_model"] is None
+    assert r["stale"], "last_seen aged past the gauge window"  # bool on pg, 0/1 on sqlite
+
+
+def test_clear_current_model_keeps_last_seen_when_mark_stale_false():
+    _heartbeat("host-a", "gpu", "qwen_edit")
+    node_queue.clear_worker_current_model("host-a", "gpu", mark_stale=False)
+    with connection() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT current_model, last_seen > now() - interval '30 seconds' AS fresh "
+            "FROM worker_heartbeats WHERE host_label='host-a' AND queue='gpu'"
+        )
+        r = cur.fetchone()
+    assert r["current_model"] is None
+    assert r["fresh"] is True, "mark_stale=False leaves last_seen fresh"
+
+
+def test_clear_current_model_noop_returns_none_when_row_absent():
+    assert node_queue.clear_worker_current_model("ghost", "gpu") is None
+
+
+def test_clear_current_model_only_touches_the_named_worker():
+    _heartbeat("host-a", "gpu", "qwen_edit")
+    _heartbeat("host-b", "gpu", "wan_i2v")
+    node_queue.clear_worker_current_model("host-a", "gpu")
+    with connection() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT current_model FROM worker_heartbeats "
+            "WHERE host_label='host-b' AND queue='gpu'"
+        )
+        assert cur.fetchone()["current_model"] == "wan_i2v"
+
+
+# ── NOTIFY trigger ───────────────────────────────────────────────────────────
+
+
+def _listen_and_capture(action, *, channel="node_job_ready", timeout=3.0):
+    payloads: list[str] = []
+    with psycopg.connect(db.db_url(), autocommit=True) as listen_conn:
+        listen_conn.execute(f"LISTEN {channel}")
+        listen_conn.execute("SELECT 1").fetchone()
+        action()
+        for n in listen_conn.notifies(timeout=timeout, stop_after=1):
+            payloads.append(n.payload)
+    return payloads
+
+
+@pytest.mark.pg_only
+def test_notify_fires_on_queued_insert_with_queue_payload():
+    run_id = make_run()
+
+    def _insert():
+        node_queue.enqueue_node_job(
+            run_id=run_id, node_id="n", node_module="x", queue="gpu",
+            required_model="sdxl",
+        )
+
+    payloads = _listen_and_capture(_insert)
+    assert payloads == ["gpu"]
+
+
+@pytest.mark.pg_only
+def test_notify_fires_on_reclaim_requeue():
+    run_id = make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="a", node_module="x", queue="cpu",
+    )
+    force_lease(job_id, expires_in_s=-10)
+
+    payloads = _listen_and_capture(node_queue.reclaim_expired_leases)
+    assert "cpu" in payloads
+
+
+@pytest.mark.pg_only
+def test_notify_does_not_fire_on_terminal_transition():
+    run_id = make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="a", node_module="x", queue="cpu",
+    )
+    node_queue.claim_next_cpu_job(0, host="h")
+
+    def _complete():
+        node_queue.mark_completed(job_id, context_delta={}, seconds=0.1)
+
+    payloads = _listen_and_capture(_complete, timeout=1.0)
+    assert payloads == []
+
+
+# ── Exactly-once under live contention (FOR UPDATE SKIP LOCKED) ──────────────
+#
+# Every other test in this module drives the legacy direct-to-PG claim path
+# (``node_queue.claim_next_*``) SEQUENTIALLY. That path — not the StorageBackend
+# SPI exercised by ``tests/test_backend_contract.py`` — is what the real
+# orchestrator/workers run. The core liveness contract is concurrency-1-per-row:
+# a regression dropping ``FOR UPDATE SKIP LOCKED`` (or weakening the claim
+# subselect into a TOCTOU read-then-write) would let two workers claim the same
+# ``running`` row and double-run a node, with NO sequential test failing. These
+# two tests pound the live claim with 8 threads and assert every row is won by
+# exactly one claimer.
+
+
+def _drain_with_threads(claim_fn, *, n_threads: int = 8) -> list[str]:
+    """Run ``claim_fn()`` from ``n_threads`` workers until the queue is empty,
+    collecting every claimed row id (with duplicates, if any) under a lock.
+
+    ``claim_fn`` must take no args and return a claimed-row dict or ``None``.
+    Each call is its own pooled connection + transaction, so the threads race
+    the *real* ``SELECT … FOR UPDATE SKIP LOCKED`` exactly as separate worker
+    processes would.
+    """
+    claimed: list[str] = []
+    lock = threading.Lock()
+    start = threading.Event()
+
+    def worker() -> None:
+        start.wait()
+        while True:
+            row_ = claim_fn()
+            if row_ is None:
+                return
+            with lock:
+                claimed.append(row_["id"])
+
+    threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    start.set()  # release all workers at once to maximise the race window
+    for t in threads:
+        t.join(timeout=30)
+    assert not any(t.is_alive() for t in threads), "a claim thread hung"
+    return claimed
+
+
+def test_concurrent_cpu_claims_each_row_won_exactly_once():
+    """40 queued CPU node-jobs, 8 racing claimers: every id is claimed once and
+    only once. A duplicate id in the result ⇒ SKIP-LOCKED exactly-once
+    regressed and two workers double-ran a node."""
+    run_id = make_run(status="running")
+    ids = [
+        node_queue.enqueue_node_job(
+            run_id=run_id, node_id=f"n{i}", node_module="x", queue="cpu",
+        )
+        for i in range(40)
+    ]
+
+    claimed = _drain_with_threads(
+        lambda: node_queue.claim_next_cpu_job(
+            0, host=f"w{threading.get_ident()}", lease_s=30,
+        )
+    )
+
+    assert sorted(claimed) == sorted(ids), "not every row was claimed exactly once"
+    assert len(claimed) == len(set(claimed)), "a row was claimed twice (double-run)"
+
+
+def test_concurrent_gpu_claims_each_row_won_exactly_once():
+    """Same exactly-once contention contract on the GPU lane. The rows carry no
+    ``required_model`` so the capability gate is a no-op and only the
+    SKIP-LOCKED claim itself decides the winner."""
+    run_id = make_run(status="running")
+    ids = [
+        node_queue.enqueue_node_job(
+            run_id=run_id, node_id=f"g{i}", node_module="x", queue="gpu",
+        )
+        for i in range(40)
+    ]
+
+    claimed = _drain_with_threads(
+        lambda: node_queue.claim_next_gpu_job(
+            0, current_model=None, host=f"w{threading.get_ident()}", lease_s=30,
+        )
+    )
+
+    assert sorted(claimed) == sorted(ids), "not every row was claimed exactly once"
+    assert len(claimed) == len(set(claimed)), "a row was claimed twice (double-run)"
+
+
+# ── Warm affinity vs the integer priority band (precedence is PINNED) ─────────
+
+
+def test_warm_affinity_outranks_integer_priority_band():
+    """The GPU claim ORDER BY is ``is_priority DESC, AFFINITY DESC, priority
+    ASC, host_dir`` — warm-model affinity sorts ABOVE the integer priority band,
+    so a warm-model job in a WORSE (higher-number) band is claimed before a cold
+    job in a BETTER band. This pins the shipped precedence: a future edit that
+    reorders ``AFFINITY`` below ``priority ASC`` (e.g. to match the
+    ``claim_next_gpu_job`` docstring's "within their priority band" wording,
+    which states the OPPOSITE of the SQL) would flip claim order under load and
+    THIS test would fail.
+
+    Existing affinity tests all use EQUAL priority, so none of them constrains
+    this precedence — that is the regression gap this test closes.
+    """
+    run_id = make_run()
+    cold = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="cold", node_module="x", queue="gpu",
+        required_model="sdxl", priority=10,   # better (lower) band
+    )
+    warm = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="warm", node_module="x", queue="gpu",
+        required_model="flux", priority=200,  # worse (higher) band, but warm
+    )
+
+    claimed = node_queue.claim_next_gpu_job(
+        0, current_model="flux", host="host-a", known_models=["flux", "sdxl"],
+    )
+    assert claimed is not None
+    assert claimed["id"] == warm, "warm affinity must outrank the integer band"
+    # And the cold better-band job is still waiting — it was not skipped, just
+    # out-ranked.
+    assert node_queue.get_node_job(cold)["status"] == "queued"

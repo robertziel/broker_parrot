@@ -1,0 +1,41 @@
+# Namespace + shared config for the v2 broker control plane.
+#
+# NOT APPLIED by CI or any agent — these are starting-point manifests. Review, set the
+# placeholders (image, DSN, token), and `kubectl apply` yourself. See ./README.md and
+# docs/broker_k8s_llm.md.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: broker-parrot
+---
+# Non-secret runtime config shared by the broker web service + workers.
+# The broker's own state lives in Postgres, so db_backend is "pg" here (the library
+# default is "sqlite" — a k8s fleet must opt in, per the v1.0.0 breaking default).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: broker-config
+  namespace: broker-parrot
+data:
+  QUEUE_WORKFLOWS_DB_BACKEND: "pg"
+  # env var NAME the client reads its DSN from (the value is in the Secret below).
+  AI_LEADS_DB_URL: ""            # overridden by the Secret; declared so the name exists
+  # broker-managed LLM server URLs → the in-cluster Services (see llm-servers.yaml).
+  AI_LEADS_OLLAMA_URL: "http://ollama.broker-parrot.svc.cluster.local:11434"
+  AI_LEADS_VLLM_URL: "http://vllm.broker-parrot.svc.cluster.local:8000"
+---
+# Secrets — REPLACE the placeholder values (base64) before applying. Never commit real ones.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: broker-secrets
+  namespace: broker-parrot
+type: Opaque
+stringData:
+  # The broker Postgres DSN (one shared broker DB for all projects).
+  AI_LEADS_DB_URL: "postgresql://REPLACE_ME@postgres.broker-parrot.svc.cluster.local:5432/broker"
+  # Shared bearer token gating queue-broker-web. REQUIRED here: broker-web binds
+  # 0.0.0.0, and the service refuses to start on a non-loopback host unless this is
+  # a real secret (≥16 chars, not this placeholder). Generate one, e.g.
+  # `openssl rand -hex 24`.
+  QUEUE_WORKFLOWS_BROKER_WEB_TOKEN: "REPLACE_ME"
