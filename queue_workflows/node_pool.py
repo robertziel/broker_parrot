@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import logging
 import os
+
+from queue_workflows.envcompat import env_get
 import threading
 from typing import Callable
 
@@ -47,7 +49,7 @@ log = logging.getLogger(__name__)
 
 
 def _int_env(name: str, default: int) -> int:
-    raw = os.environ.get(name, "").strip()
+    raw = (env_get(name) or "").strip()
     if not raw:
         return default
     try:
@@ -159,7 +161,7 @@ class NodePool:
         # (a dead/wedged worker that stopped renewing). ~5 s cadence
         # (interval-gated, NOT the 0.5 s dispatch tick).
         self._reclaim_interval_s: float = float(
-            os.environ.get("AI_LEADS_LEASE_RECLAIM_INTERVAL_S", "5")
+            env_get("QUEUE_WORKFLOWS_LEASE_RECLAIM_INTERVAL_S", "5")
         )
         self._reclaim_last_run: float = 0.0
 
@@ -168,7 +170,7 @@ class NodePool:
         # for a dead/wedged fetch/load claim worker. Own ``last_run`` so the two
         # sweeps don't suppress each other.
         self._ingest_reclaim_interval_s: float = float(
-            os.environ.get("AI_LEADS_LEASE_RECLAIM_INTERVAL_S", "5")
+            env_get("QUEUE_WORKFLOWS_LEASE_RECLAIM_INTERVAL_S", "5")
         )
         self._ingest_reclaim_last_run: float = 0.0
 
@@ -179,7 +181,7 @@ class NodePool:
         # see the frozen heartbeat the wedged worker's own GIL-blocked threads
         # cannot act on. Interval-gated like the reclaim sweeps; own ``last_run``.
         self._dead_worker_interval_s: float = float(
-            os.environ.get("AI_LEADS_DEAD_WORKER_SWEEP_INTERVAL_S", "5")
+            env_get("QUEUE_WORKFLOWS_DEAD_WORKER_SWEEP_INTERVAL_S", "5")
         )
         self._dead_worker_last_run: float = 0.0
 
@@ -190,10 +192,10 @@ class NodePool:
         # workflow_runs already covers purge / restart_from / session-delete;
         # this only catches events for runs that are never deleted.
         self._node_event_retention_days: int = int(
-            os.environ.get("AI_LEADS_NODE_EVENT_RETENTION_DAYS", "30")
+            env_get("QUEUE_WORKFLOWS_NODE_EVENT_RETENTION_DAYS", "30")
         )
         self._node_event_prune_interval_s: float = float(
-            os.environ.get("AI_LEADS_NODE_EVENT_PRUNE_INTERVAL_S", "3600")
+            env_get("QUEUE_WORKFLOWS_NODE_EVENT_PRUNE_INTERVAL_S", "3600")
         )
         self._node_event_prune_last_run: float = 0.0
 
@@ -203,7 +205,7 @@ class NodePool:
         # refuses them, but the rows linger and pollute queue gauges. Disabled
         # by default to preserve pre-0.4 behaviour byte-for-byte.
         self._orphan_cancel_interval_s: float = float(
-            os.environ.get("AI_LEADS_ORPHAN_CANCEL_SWEEP_INTERVAL_S", "30")
+            env_get("QUEUE_WORKFLOWS_ORPHAN_CANCEL_SWEEP_INTERVAL_S", "30")
         )
         self._orphan_cancel_last_run: float = 0.0
 
@@ -215,7 +217,7 @@ class NodePool:
         # tick — "run instantly after instance start" — then every 5 min. See
         # :func:`dispatcher.reconcile_run`.
         self._stuck_run_interval_s: float = float(
-            os.environ.get("AI_LEADS_STUCK_RUN_SWEEP_INTERVAL_S", "300")
+            env_get("QUEUE_WORKFLOWS_STUCK_RUN_SWEEP_INTERVAL_S", "300")
         )
         self._stuck_run_last_run: float = 0.0
 
@@ -224,7 +226,7 @@ class NodePool:
         # ``unassignable`` node event each. Interval-gated (default 15 s); the
         # underlying flag UPDATE is idempotent so the gate is a load optimisation.
         self._unassignable_interval_s: float = float(
-            os.environ.get("AI_LEADS_UNASSIGNABLE_SWEEP_INTERVAL_S", "15")
+            env_get("QUEUE_WORKFLOWS_UNASSIGNABLE_SWEEP_INTERVAL_S", "15")
         )
         self._unassignable_last_run: float = 0.0
 
@@ -410,8 +412,7 @@ class NodePool:
         if max_attempts is None:
             max_attempts = _int_env("AI_LEADS_NODE_POOL_RECOVERY_RETRIES", 5)
         if backoff_s is None:
-            raw = os.environ.get(
-                "AI_LEADS_NODE_POOL_RECOVERY_BACKOFF_S", "",
+            raw = env_get("QUEUE_WORKFLOWS_NODE_POOL_RECOVERY_BACKOFF_S", "",
             ).strip()
             try:
                 backoff_s = float(raw) if raw else 2.0

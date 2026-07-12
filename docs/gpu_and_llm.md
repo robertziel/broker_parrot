@@ -64,7 +64,7 @@ This is called once at GPU-worker startup and again by `ModelCache`'s empty-regi
 The GPU claim SQL (`node_queue._CLAIM_SQL`, see [architecture § the queue mechanism](architecture.md#3-the-queue-mechanism)) adds two tiebreaks after the capability gate:
 
 1. **Affinity** — `required_model IS NOT DISTINCT FROM current_model` sorts first, so a worker with a model already warm preferentially claims a job needing that same model instead of forcing a cold worker to reload.
-2. **`host_priority`** direction term — flips the creation-order walk (oldest-first for `host_priority >= 0`, newest-first for `< 0`) so a fleet can bias which host drains a queue first; set per-host via the `AI_LEADS_GPU_CONSUMER_PRIORITY` env knob (`config.host_priority_env`).
+2. **`host_priority`** direction term — flips the creation-order walk (oldest-first for `host_priority >= 0`, newest-first for `< 0`) so a fleet can bias which host drains a queue first; set per-host via the `QUEUE_WORKFLOWS_GPU_CONSUMER_PRIORITY` env knob (`config.host_priority_env`).
 
 Both tiebreaks are built only from validated ints/fixed SQL fragments — never caller strings — matching the engine-wide claim-SQL safety rule.
 
@@ -90,7 +90,7 @@ def gpu_should_unload(handle_present: bool, active: int, idle_s: float, ttl_s: f
     return handle_present and active <= 0 and idle_s >= ttl_s
 ```
 
-Pure function, unit-testable with no real waiting. `ModelCache.ensure_idle_reaper()` arms a daemon thread the first time `require_model` is called (idempotent; no-op if `AI_LEADS_DISABLE_GPU_IDLE_REAPER` is set or `idle_ttl_s <= 0`), polling on `clamp(idle_ttl_s / 5, 5s, 60s)`. Default TTL is 60 s (`AI_LEADS_GPU_MODEL_IDLE_TTL_S`) — short, so a shared GPU frees VRAM quickly for a co-tenant vLLM/ollama server between diffusion bursts (see [§3](#3-llm-backends-per-machine-ollama--vllm--idle-supervisor)). Each tick calls `reap_idle_once()`, which re-checks the same predicate under the lock and, if true, drops the cache and republishes `current_model = NULL`.
+Pure function, unit-testable with no real waiting. `ModelCache.ensure_idle_reaper()` arms a daemon thread the first time `require_model` is called (idempotent; no-op if `QUEUE_WORKFLOWS_DISABLE_GPU_IDLE_REAPER` is set or `idle_ttl_s <= 0`), polling on `clamp(idle_ttl_s / 5, 5s, 60s)`. Default TTL is 60 s (`QUEUE_WORKFLOWS_GPU_MODEL_IDLE_TTL_S`) — short, so a shared GPU frees VRAM quickly for a co-tenant vLLM/ollama server between diffusion bursts (see [§3](#3-llm-backends-per-machine-ollama--vllm--idle-supervisor)). Each tick calls `reap_idle_once()`, which re-checks the same predicate under the lock and, if true, drops the cache and republishes `current_model = NULL`.
 
 This is the same shape (`now_fn`/injectable clock, pure decision function, daemon-thread reaper) as the LLM idle supervisor in §3 and the watchdogs — a deliberate house style so the three GPU-idle mechanisms in this codebase read alike.
 
@@ -193,7 +193,7 @@ The package is deliberately **OpenAI-chat-shape biased and vendor-coupled to exa
 
 - **`OllamaBackend`** — `chat_url` → `{base}/api/chat`, `health_url` → `{base}/api/tags`. `ensure_ready` is a no-op (the daemon cold-loads/hot-swaps on the first request itself), `is_running()` always `True` (no I/O — that's the host node's call to make), `stop_server()` always `False` (the engine never manages the daemon, so the idle supervisor's stop attempt is a truthful no-op).
 - **`VLLMBackend`** — `chat_url` → `{base}/v1/chat/completions`, `health_url` → `{base}/health`. State machine `DEAD → LOADING → SERVING`, plus `RELOADING`/`SLEEPING_L2`/`UNSUPPORTED_SLEEP` for a model switch. vLLM pins one model in VRAM for its whole process lifetime with **no built-in idle unload** and **no hot model swap** — the intended fast path is vLLM **Sleep-Mode L2** (offload weights to host RAM, reload the new model into the same process), but `_sleep_l2_reload` is a deliberate stub (`raise NotImplementedError`); `ensure_ready` catches that once, sets a **sticky** `_sleep_unsupported` flag, and falls back permanently to the slow path (stop → cold-start the new model). After bring-up, the served model id is reconciled against a `/v1/models` probe and a **mismatch raises `RuntimeError`** (fail loud) — because the default `ensure_up_fn` is a no-op that relies on docker `restart: unless-stopped` bringing the sidecar back up on its **baked** `--model` flag, which may not be the newly-requested one; a consumer should soft-degrade (e.g. fall back to ollama) rather than silently POST to the wrong model.
-- **`LLMSupervisor`** — mirrors `ModelCache`'s idle reaper exactly: pure decision `vllm_should_stop(running, inflight, idle_s, ttl_s)`, poll cadence `clamp(idle_ttl_s/5, 5s, 60s)`, gated by `AI_LEADS_DISABLE_LLM_SUPERVISOR`. **Inert** for any non-`"vllm"` `server_type` and for `idle_ttl_s <= 0` — ollama is never touched. It only decides *when*; the actual kill is `backend.stop_server()`.
+- **`LLMSupervisor`** — mirrors `ModelCache`'s idle reaper exactly: pure decision `vllm_should_stop(running, inflight, idle_s, ttl_s)`, poll cadence `clamp(idle_ttl_s/5, 5s, 60s)`, gated by `QUEUE_WORKFLOWS_DISABLE_LLM_SUPERVISOR`. **Inert** for any non-`"vllm"` `server_type` and for `idle_ttl_s <= 0` — ollama is never touched. It only decides *when*; the actual kill is `backend.stop_server()`.
 
 ### `BackendFactory` — identity preservation + freshness
 
@@ -202,9 +202,9 @@ The package is deliberately **OpenAI-chat-shape biased and vendor-coupled to exa
 Two ways a re-read is triggered:
 
 - a **TTL** throttle (default 10 s, `DEFAULT_CONFIG_TTL_S`) — the dropped-NOTIFY fallback;
-- a **LISTEN** invalidator thread (`start()`/`stop()`, gated by `AI_LEADS_DISABLE_LLM_CONFIG_LISTENER`) on the `worker_llm_config_changed` channel — instant refresh the moment an operator edits the config.
+- a **LISTEN** invalidator thread (`start()`/`stop()`, gated by `QUEUE_WORKFLOWS_DISABLE_LLM_CONFIG_LISTENER`) on the `worker_llm_config_changed` channel — instant refresh the moment an operator edits the config.
 
-Server-root URLs are **not** part of the snapshot — they're deployment topology, resolved once from env at build time (`config.ollama_url_env` = `AI_LEADS_OLLAMA_URL`, `config.vllm_url_env` = `AI_LEADS_VLLM_URL`; a redeploy, not a runtime reconfig, is how a URL changes). vLLM's stop/start seams (`cfg.vllm_stop_fn` / `cfg.vllm_start_fn`, wired via `set_vllm_lifecycle(stop_fn, start_fn)`) let a host that runs vLLM as a **separate container** (e.g. ai_leads → the docker Engine API over a UDS) have the in-worker supervisor control the sibling sidecar without relying on a docker restart policy; `None` (default) falls back to the backend's own `pkill`/no-op seams. See [configuration](configuration.md) for the hook-setter list.
+Server-root URLs are **not** part of the snapshot — they're deployment topology, resolved once from env at build time (`config.ollama_url_env` = `QUEUE_WORKFLOWS_OLLAMA_URL`, `config.vllm_url_env` = `QUEUE_WORKFLOWS_VLLM_URL`; a redeploy, not a runtime reconfig, is how a URL changes). vLLM's stop/start seams (`cfg.vllm_stop_fn` / `cfg.vllm_start_fn`, wired via `set_vllm_lifecycle(stop_fn, start_fn)`) let a host that runs vLLM as a **separate container** (e.g. via the docker Engine API over a unix socket) have the in-worker supervisor control the sibling sidecar without relying on a docker restart policy; `None` (default) falls back to the backend's own `pkill`/no-op seams. See [configuration](configuration.md) for the hook-setter list.
 
 ### Per-machine server config: DB owns *which*, env owns *where* (migration 0013)
 
@@ -249,7 +249,7 @@ A diffusion (or SR/CV) model **never** goes through ollama or vLLM — those onl
 
 ### The direction
 
-Today (the per-host engine described in §1–§3) each machine runs its **own** ollama/vLLM and workers self-claim work from Postgres. The v2 direction the operator has set is to **centralize** both halves: one broker service owns the shared CPU/GPU queue and *grants* permission to worker Deployments (see [`broker.md`](broker.md) for the grant/heartbeat/finish protocol), and the LLM servers move from "one per host" to **one shared deployment per cluster** — ollama and vLLM each run once, behind a Kubernetes Service, used by every client project. Client projects stop running their own model servers and instead point `AI_LEADS_OLLAMA_URL` / `AI_LEADS_VLLM_URL` at the cluster Service.
+Today (the per-host engine described in §1–§3) each machine runs its **own** ollama/vLLM and workers self-claim work from Postgres. The v2 direction the operator has set is to **centralize** both halves: one broker service owns the shared CPU/GPU queue and *grants* permission to worker Deployments (see [`broker.md`](broker.md) for the grant/heartbeat/finish protocol), and the LLM servers move from "one per host" to **one shared deployment per cluster** — ollama and vLLM each run once, behind a Kubernetes Service, used by every client project. Client projects stop running their own model servers and instead point `QUEUE_WORKFLOWS_OLLAMA_URL` / `QUEUE_WORKFLOWS_VLLM_URL` at the cluster Service.
 
 ```mermaid
 flowchart TB
@@ -281,7 +281,7 @@ The per-machine abstraction already built in §3 — `llm_backends/` (ollama/vLL
 
 1. Stand up `broker-web` + Postgres + the shared `ollama`/`vllm` Services.
 2. Point a project's workers at the broker (deploy `queue-broker-worker` for its lanes, register its handlers in the worker image — see [`broker.md`](broker.md)).
-3. Set the project's `AI_LEADS_OLLAMA_URL` / `AI_LEADS_VLLM_URL` to the cluster Services and retire its own per-host ollama/vLLM (done per project, in that project's own repo).
+3. Set the project's `QUEUE_WORKFLOWS_OLLAMA_URL` / `QUEUE_WORKFLOWS_VLLM_URL` to the cluster Services and retire its own per-host ollama/vLLM (done per project, in that project's own repo).
 4. Once every project is on the broker, retire the legacy per-host autonomous-worker engine described in §1–§3 above.
 
 ### Gaps — not built yet
@@ -289,7 +289,7 @@ The per-machine abstraction already built in §3 — `llm_backends/` (ollama/vLL
 - **The broker controller** that reconciles vLLM capacity from queue demand — today's manifests, if applied, would run vLLM *statically*.
 - **Concurrency-safe grant** — the broker's job-granting endpoint is check-then-act and runs a single replica; running more than one needs a serialized/locked grant first.
 - **Auth beyond a shared token**, and real secrets/image builds.
-- **Removing per-project ollama/vLLM** happens in each consumer repo (ai_leads, etc.), outside this repository.
+- **Removing per-project ollama/vLLM** happens in each consumer's own repo, outside this one.
 
 ---
 

@@ -18,8 +18,8 @@ export QUEUE_WORKFLOWS_DB_BACKEND=pg
 
 `db_backend` defaults to **`"sqlite"`** as of v1.0.0 — a daemon-less local file,
 the friendliest zero-config default for a reusable library. A Postgres consumer
-(`ai_leads` and siblings) must opt in with `configure(db_backend="pg")` or the
-env var above; otherwise an `AI_LEADS_DB_URL` Postgres DSN gets read as a SQLite
+(existing hosts) must opt in with `configure(db_backend="pg")` or the
+env var above; otherwise an `QUEUE_WORKFLOWS_DB_URL` Postgres DSN gets read as a SQLite
 path. Aliases `postgres`/`postgresql` → `pg` and `mongo` → `mongodb` are accepted
 and normalized; an unknown name raises `ValueError` at `configure()` time. See
 [configuration.md](configuration.md) for the full `EngineConfig` reference.

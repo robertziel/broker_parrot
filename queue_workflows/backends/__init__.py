@@ -15,6 +15,8 @@ rest of the code only ever sees the canonical form.
 from __future__ import annotations
 
 import os
+
+from queue_workflows.envcompat import env_get
 import threading
 
 from queue_workflows.backends.base import (
@@ -110,7 +112,7 @@ def _url_for(canonical: str) -> str:
 
         return db_url()
     env_name = cfg.redis_url_env if canonical == "redis" else cfg.mongo_url_env
-    url = os.environ.get(env_name)
+    url = env_get(env_name)
     if not url:
         raise RuntimeError(
             f"db_backend={canonical!r} but {env_name} is not set; "

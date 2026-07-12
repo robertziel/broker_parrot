@@ -24,6 +24,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+
+from queue_workflows.envcompat import env_get
 import re
 import socket
 import subprocess
@@ -60,7 +62,7 @@ def metrics_dsn() -> str | None:
     so this is always a pg DSN. Shared by the publisher (:func:`_broadcast`) and
     the reader (:class:`queue_workflows.hw_feed.HwFeed`) so both agree on target."""
     cfg = get_config()
-    return os.environ.get(cfg.metrics_db_url_env or cfg.db_url_env)
+    return env_get(cfg.metrics_db_url_env or cfg.db_url_env)
 
 
 def _uses_dedicated_metrics_dsn() -> bool:
@@ -77,7 +79,7 @@ def _host_label() -> str:
     worker boxes so the Rails SSE indicator can group samples by source.
     Defaults to ``socket.gethostname()``."""
     from queue_workflows.config import get_config
-    return os.environ.get(get_config().host_label_env, "").strip() or socket.gethostname()
+    return env_get(get_config().host_label_env, "").strip() or socket.gethostname()
 
 
 # ── GPU probe (vendor-aware) ─────────────────────────────────────────────
@@ -129,7 +131,7 @@ def total_vram_mb() -> int | None:
          any model), so a missing/bogus probe never wedges a worker to "fits
          nothing". Best-effort: never raises.
     """
-    raw = (os.environ.get(_VRAM_TOTAL_ENV, "") or "").strip()
+    raw = (env_get(_VRAM_TOTAL_ENV) or "").strip()
     if raw:
         try:
             v = int(float(raw))
@@ -413,7 +415,7 @@ def start_hw_metrics_sampler_flocked() -> HwMetricsSampler | None:
     """
     global _hw_metrics_lock_fd, _hw_metrics_thread
 
-    if os.environ.get("AI_LEADS_DISABLE_HW_METRICS"):
+    if env_get("QUEUE_WORKFLOWS_DISABLE_HW_METRICS"):
         # Tests opt out — they shouldn't fan out NOTIFYs to a real DB.
         return None
     if _hw_metrics_lock_fd is not None and _hw_metrics_thread is not None:

@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import logging
 import os
+
+from queue_workflows.envcompat import env_get
 import threading
 import time
 from typing import Any, Callable
@@ -52,7 +54,7 @@ def gpu_should_unload(
 # Default idle TTL (s); <= 0 disables. Default 60s (1 min) — offload a
 # warm model quickly so the shared GPU (the vLLM / ollama co-tenant on
 # host-a) frees VRAM between bursts. Override per-host via the env var.
-DEFAULT_IDLE_TTL_S = float(os.environ.get("AI_LEADS_GPU_MODEL_IDLE_TTL_S", "60"))
+DEFAULT_IDLE_TTL_S = float(env_get("QUEUE_WORKFLOWS_GPU_MODEL_IDLE_TTL_S", "60"))
 
 
 class ModelCache:
@@ -213,7 +215,7 @@ class ModelCache:
         (TTL<=0) or under tests (``AI_LEADS_DISABLE_GPU_IDLE_REAPER``)."""
         if (self._reaper_started
                 or self._idle_ttl_s <= 0
-                or os.environ.get("AI_LEADS_DISABLE_GPU_IDLE_REAPER")):
+                or env_get("QUEUE_WORKFLOWS_DISABLE_GPU_IDLE_REAPER")):
             return
         self._reaper_started = True
         threading.Thread(

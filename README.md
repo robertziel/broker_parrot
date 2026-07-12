@@ -21,7 +21,7 @@ Orchestrate work across a handful of heterogeneous CPU/GPU boxes with nothing bu
 
 As of **v1.0.0 the default backend is SQLite** — a daemon-less local file, zero server to stand up — so you can `import`, `configure()`, and run with nothing else installed. Point it at **Postgres** for a real fleet with one line.
 
-> **There's no bundled dashboard — the engine emits what a dashboard needs.** Live per-host CPU/GPU/RAM over `pg_notify('hw_metrics', …)`, `worker_heartbeats`, the `node_queue.*_snapshot()` read models, and the `worker_controls` ON/OFF toggles are all there. Bring your own front-end — it's a great task to hand a coding agent. A newer **broker web service + operator panel** ([`docs/broker.md`](docs/broker.md)) also ships as a pure-stdlib, server-rendered option.
+> **There's no bundled dashboard — the engine emits what a dashboard needs.** Live per-host CPU/GPU/RAM over `pg_notify('hw_metrics', …)`, `worker_heartbeats`, the `node_queue.*_snapshot()` read models, and the `worker_controls` ON/OFF toggles are all there. Bring your own front-end — it's a great task to hand a coding agent. A newer **broker web service + operator panel** ([`docs/broker.md`](docs/broker.md), [screenshot](#-one-broker-for-many-projects)) also ships as a pure-stdlib, server-rendered option.
 
 ---
 
@@ -32,6 +32,7 @@ As of **v1.0.0 the default backend is SQLite** — a daemon-less local file, zer
 - [Highlights](#-highlights)
 - [Installation](#installation)
 - [Core concepts](#-core-concepts)
+- [Architecture at a glance](#-architecture-at-a-glance)
 - [Example implementation](#-example-implementation)
 - [Turning workers on/off](#️-turning-workers-onoff--the-operator-control-plane)
 - [Host-defined queues + ingest jobs](#️-host-defined-queues--parametrised-ingest-jobs)
@@ -131,6 +132,70 @@ Three ideas carry the whole design. The full treatment is in [`docs/architecture
 - **Scheduler** — a DB-native ticker that sleeps to the next scheduled minute and enqueues periodic `ingest_jobs` rows.
 
 **Leases make it self-healing.** A live worker renews `lease_expires_at` (~every 10 s), so lease length is independent of job duration. A dead or wedged worker stops renewing; its lease lapses; the orchestrator's reclaim sweep flips the row back to `queued` (re-firing the NOTIFY). Layered on top are wall-clock, no-progress, and GPU-health watchdogs — each re-queues-and-retries rather than failing — plus an out-of-process dead-worker detector for hardware hangs. See [`docs/watchdogs.md`](docs/watchdogs.md).
+
+---
+
+## 🏗 Architecture at a glance
+
+**The system.** Your app inserts rows inside its own transactions; the trigger's `NOTIFY` wakes workers the instant the row commits. Three kinds of engine processes — orchestrator, claim workers, scheduler — coordinate through nothing but the database:
+
+```mermaid
+flowchart LR
+    subgraph app["Your application"]
+        A["INSERT run / job<br/>(inside your own txn)"]
+    end
+    subgraph db["The database — SQLite or Postgres"]
+        Q[("workflow_runs<br/>workflow_node_jobs<br/>ingest_jobs")]
+        HB[("worker_heartbeats<br/>worker_controls<br/>node-event log")]
+    end
+    subgraph fleet["Engine processes — spread across N boxes"]
+        O["Orchestrator<br/>DAG dispatch · outbox drain<br/>lease reclaim · dead-worker sweep"]
+        W1["Claim worker — cpu<br/>LISTEN → SKIP LOCKED claim"]
+        W2["Claim worker — gpu<br/>+ warm ModelCache"]
+        S["Scheduler<br/>periodic ingest ticker"]
+    end
+    A --> Q
+    Q -- "NOTIFY fires inside<br/>the writer's txn" --> W1
+    Q -- "instant wake,<br/>no polling" --> W2
+    S --> Q
+    O <--> Q
+    W1 <--> Q
+    W2 <--> Q
+    W1 --> HB
+    W2 --> HB
+    O --> HB
+```
+
+**A job's life.** Every transition is a guarded `UPDATE`; crash recovery is just a lapsed lease:
+
+```mermaid
+stateDiagram-v2
+    [*] --> queued: INSERT - the NOTIFY rides the txn
+    queued --> running: worker claims - FOR UPDATE SKIP LOCKED
+    running --> completed: run() returns
+    running --> failed: raises, or watchdog retries exhausted
+    running --> cancelled: run cancelled
+    running --> queued: lease lapses - worker died, reclaim sweep requeues
+    running --> queued: watchdog trip - requeue and retry on a healthy peer
+    completed --> [*]
+    failed --> [*]
+    cancelled --> [*]
+```
+
+**The durable outbox.** A worker never calls the dispatcher — it writes the terminal status *and* a dispatch event in one transaction, and the orchestrator fans out from there. Fan-out is retryable and survives any crash between the two steps:
+
+```mermaid
+sequenceDiagram
+    participant W as Claim worker
+    participant DB as Database
+    participant O as Orchestrator
+    W->>DB: UPDATE job to completed + INSERT dispatch_event (ONE txn)
+    O->>DB: drain the outbox
+    O->>DB: enqueue downstream nodes whose deps are all met
+    DB-->>W: NOTIFY node_job_ready → next claim
+```
+
+The full treatment — including the watchdog stack and the host-agnostic hook seam — is in [`docs/architecture.md`](docs/architecture.md) and [`docs/watchdogs.md`](docs/watchdogs.md).
 
 ---
 
@@ -374,6 +439,10 @@ Set it once per process with `configure(project=...)`, or export `QUEUE_WORKFLOW
 
 The `queue-broker` console script bootstraps the shared schema and inspects the consolidated queue. A newer **broker service** inverts the model further — a pull→grant control plane with a web panel where the broker arbitrates a shared CPU/GPU across projects and can revoke a job at will. Full treatment: [`docs/broker.md`](docs/broker.md).
 
+The bundled `queue-broker-web` operator panel (pure stdlib, server-rendered, no JS) over that shared queue:
+
+![queue-broker-web — the shared CPU/GPU queue, per-project tabs, and the worker fleet](docs/images/broker-web-panel.png)
+
 ---
 
 ## 🗄️ Pluggable storage backends
@@ -454,6 +523,7 @@ The [`docs/`](docs/) set:
 - [`broker.md`](docs/broker.md) — the shared multi-project broker (the `project` tag) and the v2 pull→grant broker service + operator panel.
 - [`gpu_and_llm.md`](docs/gpu_and_llm.md) — the warm-model cache, capacity-aware assignment, the shared GPU pool, and the ollama / vLLM backends.
 - [`deployment.md`](docs/deployment.md) — running the engine in production: console scripts, the one-container-N-processes lane, migrations at deploy, and the fleet cutover runbook.
+- [`use_cases/`](docs/use_cases/README.md) — ten worked operational scenarios: a box powering off mid-job (front-of-queue requeue + the zombie kill signal), boot/rejoin, operator stop, wedged-GPU recovery, DAGs, periodic ingest, the multi-project broker, warm-model affinity, run-next priority, and human-in-the-loop input.
 
 ---
 

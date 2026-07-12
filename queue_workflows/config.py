@@ -93,7 +93,7 @@ class EngineConfig:
     time (so a host can configure AFTER import)."""
 
     # ── env-var names ────────────────────────────────────────────────────────
-    db_url_env: str = "AI_LEADS_DB_URL"
+    db_url_env: str = "QUEUE_WORKFLOWS_DB_URL"
     #: env var holding the DSN that hw-metrics telemetry is published to + read
     #: from — the shared "broker" Postgres, so every project shows the SAME
     #: fleet-wide hardware view instead of each sampling its own DB. ``None`` ⇒
@@ -103,16 +103,16 @@ class EngineConfig:
     #: always a pg DSN regardless of :attr:`db_backend`. See ``hw_metrics`` /
     #: ``hw_feed``.
     metrics_db_url_env: str | None = None
-    host_label_env: str = "AI_LEADS_HOST_LABEL"
-    host_priority_env: str = "AI_LEADS_GPU_CONSUMER_PRIORITY"
+    host_label_env: str = "QUEUE_WORKFLOWS_HOST_LABEL"
+    host_priority_env: str = "QUEUE_WORKFLOWS_GPU_CONSUMER_PRIORITY"
     #: env vars holding the per-machine LLM server ROOT URLs the backend factory
     #: (``queue_workflows.llm_backends.factory``) reads. The DB (worker_controls,
     #: migration 0013) owns WHICH server type a machine runs + its tunables; the
     #: URL is deployment topology (set per host by ansible), so it stays in env.
     #: Names default to the ai_leads vars for byte-compat; values fall back to the
     #: localhost defaults below when the env is unset.
-    ollama_url_env: str = "AI_LEADS_OLLAMA_URL"
-    vllm_url_env: str = "AI_LEADS_VLLM_URL"
+    ollama_url_env: str = "QUEUE_WORKFLOWS_OLLAMA_URL"
+    vllm_url_env: str = "QUEUE_WORKFLOWS_VLLM_URL"
     #: env vars holding the redis / mongodb DSN for those backends (read only when
     #: ``db_backend`` selects them). New names (no ai_leads equivalent).
     redis_url_env: str = "QUEUE_WORKFLOWS_REDIS_URL"

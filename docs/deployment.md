@@ -64,7 +64,7 @@ Only the **orchestrator** calls `db.bootstrap()`. On Postgres it's concurrency-s
 
 Every other process — claim workers, the scheduler — calls `db.wait_for_schema(min_version)` instead of bootstrapping, and **blocks** (polling `current_schema_version`, default 120 s timeout) until the ledger reaches the version that queue depends on, rather than racing the orchestrator's migration run. `min_version` is per queue-family: DAG node-jobs (`cpu`/`gpu`) require schema ≥ 6 (`_NODE_REQUIRED_VERSION`); ingest queues require schema ≥ 8 (`_INGEST_REQUIRED_VERSION`, migration 0008's multi-tenant ingest). This means the current chain (0001‥0019 — see [schema](schema.md)) is far ahead of what a worker actually gates on: worker-control (0012) is read-optional and a pre-0012 DB is treated as all-ON, so a fleet doesn't need to be fully caught up to schema HEAD for workers to run — only orchestrators applying new migrations need to.
 
-A host with its own domain tables (e.g. `ai_leads`' parcels/leads schema) runs a **second** chain against its own ledger, by calling `db.bootstrap(migrations_dir=..., version_table=...)` with its own directory and version-table name — "two ORMs / two chains, one Postgres." The engine never sees or touches the host's chain.
+A host with its own domain tables runs a **second** chain against its own ledger, by calling `db.bootstrap(migrations_dir=..., version_table=...)` with its own directory and version-table name — "two ORMs / two chains, one Postgres." The engine never sees or touches the host's chain.
 
 **Deploy-time checklist:**
 1. Start (or let your orchestrator container start) `queue-orchestrator` first, or at least don't gate other containers' health checks on anything before it — `bootstrap()` racing a fresh empty DB is safe, but a claim worker calling `wait_for_schema` before *any* orchestrator has ever run will simply block up to its timeout and then raise `TimeoutError`.
@@ -73,10 +73,10 @@ A host with its own domain tables (e.g. `ai_leads`' parcels/leads schema) runs a
 
 ## 4. Backend selection at deploy
 
-As of v1.0.0 the library default is `db_backend="sqlite"` — the friendliest zero-config default for a reusable library, and the deliberate breaking change from the old `ai_leads`-compatible `pg` default. A Postgres fleet must opt in, either in code:
+As of v1.0.0 the library default is `db_backend="sqlite"` — the friendliest zero-config default for a reusable library, and the deliberate breaking change from the pre-1.0 `pg` default. A Postgres fleet must opt in, either in code:
 
 ```python
-queue_workflows.configure(db_backend="pg", db_url_env="AI_LEADS_DB_URL")
+queue_workflows.configure(db_backend="pg", db_url_env="QUEUE_WORKFLOWS_DB_URL")
 ```
 
 or via the env knob, which also reaches every standalone console script above (they have no host `configure()` call to hook):
@@ -91,7 +91,7 @@ export QUEUE_WORKFLOWS_DB_BACKEND=pg
 
 ## 5. Fleet cutover: N projects → one shared broker
 
-This is the topology-specific checklist for moving several already-running projects, each with its **own** Postgres DB and its own queue, onto **one shared broker DB** using the `project` tag (migration 0017's multitenant model — see [broker](broker.md) for the generic model and API). It generalizes the sequence this repo actually planned for its own fleet (`ai_leads`, `pic_to_3d`, `lm_content_generator` sharing a physical fleet, each on its own DB); keep those names as the worked example, but treat "3 projects, 3 DSNs, 1 shared mount" as the pattern, not a requirement.
+This is the topology-specific checklist for moving several already-running projects, each with its **own** Postgres DB and its own queue, onto **one shared broker DB** using the `project` tag (migration 0017's multitenant model — see [broker](broker.md) for the generic model and API). The worked example uses three projects — `alpha`, `beta`, `gamma` — sharing a physical fleet, each starting on its own DB; treat "3 projects, 3 DSNs, 1 shared mount" as the pattern, not a requirement.
 
 ### Preconditions the operator decides first
 
@@ -164,7 +164,7 @@ The suite **requires a reachable Postgres** by default — it forces a `*_test`-
 
 ```bash
 QUEUE_WORKFLOWS_TEST_DB_URL=postgresql://user:pw@host:port/queue_workflows_test python -m pytest
-#   falls back to AI_LEADS_DB_URL with its db name suffixed _test if unset
+#   falls back to QUEUE_WORKFLOWS_DB_URL with its db name suffixed _test if unset
 #   (conftest refuses to bootstrap against a non-_test-suffixed database name)
 
 python -m pytest tests/test_node_queue.py             # one module

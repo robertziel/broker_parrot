@@ -61,6 +61,8 @@ from __future__ import annotations
 
 import logging
 import os
+
+from queue_workflows.envcompat import env_get
 import threading
 import time
 from dataclasses import dataclass
@@ -210,13 +212,13 @@ class BackendFactory:
     def _ollama_base_url(self) -> str:
         if self._ollama_url_override is not None:
             return self._normalize_ollama(self._ollama_url_override)
-        raw = os.environ.get(get_config().ollama_url_env, "").strip()
+        raw = env_get(get_config().ollama_url_env, "").strip()
         return self._normalize_ollama(raw or DEFAULT_OLLAMA_URL)
 
     def _vllm_base_url(self) -> str:
         if self._vllm_url_override is not None:
             return self._normalize_vllm(self._vllm_url_override)
-        raw = os.environ.get(get_config().vllm_url_env, "").strip()
+        raw = env_get(get_config().vllm_url_env, "").strip()
         return self._normalize_vllm(raw or DEFAULT_VLLM_URL)
 
     @staticmethod
@@ -349,7 +351,7 @@ class BackendFactory:
     def _listener_enabled(self) -> bool:
         """The LISTEN invalidator runs unless its dedicated kill-switch is set
         (tests set it in conftest). DISTINCT from the supervisor's gate."""
-        return not bool(os.environ.get(DISABLE_LISTENER_ENV))
+        return not bool(env_get(DISABLE_LISTENER_ENV))
 
     def start(self) -> None:
         """Spawn the daemon that LISTENs

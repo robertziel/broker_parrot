@@ -157,42 +157,71 @@ def _check_bind_security(host: str) -> None:
             "Set a random secret, or bind 127.0.0.1 and front it with an authenticated proxy."
         )
 
+#: The panel's design tokens — warm amber primary on a soft neutral page, ink
+#: text, hairline borders, pill badges, carded tables with a tinted row hover.
+#: Pure CSS on the handler's own class names; light theme (dashboards embedding
+#: this can theme around it).
 _CSS = """
-:root{color-scheme:light}
+:root{color-scheme:light;
+--primary:#f7a825;--primary-dark:#e0941a;--primary-soft:#fdebcb;--primary-tint:#fff6e7;
+--ink:#313131;--ink-soft:#4d4d4d;--muted:#7e7e7e;
+--border:#dadada;--border-soft:#ececec;--page:#f9f9f9;--card:#fff;
+--success:#1f9d6b;--success-bg:#d8f0e6;--danger:#d64545;--danger-bg:#fbe0e0;
+--pending:#b9740c;--pending-bg:#fdebcb;
+--radius:12px;--radius-sm:8px;--radius-pill:100px;--topbar-h:64px;
+--shadow-card:0 1px 2px rgba(49,49,49,.05),0 1px 3px rgba(49,49,49,.06);
+--ring:0 0 0 3px rgba(247,168,37,.25)}
 *{box-sizing:border-box}
+a:focus-visible{outline:none;box-shadow:var(--ring);border-radius:var(--radius-sm)}
 body{margin:0;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-     color:#0f172a;background:#f6f7f9}
-header{padding:16px 24px;background:#fff;border-bottom:1px solid #e5e7eb;display:flex;
-       align-items:center;gap:12px;flex-wrap:wrap}
+     color:var(--ink);background:var(--page);font-variant-numeric:tabular-nums}
+header{min-height:var(--topbar-h);padding:12px 24px;background:var(--card);
+       border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .logo{flex:none;line-height:0}
-.logo svg{display:block;width:30px;height:30px}
-h1{font-size:18px;margin:0;font-weight:700}
-h1 .v{color:#64748b;font-weight:500;font-size:13px}
-.sub{color:#64748b;font-size:12px}
-main{padding:20px 24px;max-width:1120px;margin:0 auto}
-section{margin-bottom:26px}
-h2{font-size:13px;text-transform:uppercase;letter-spacing:.04em;color:#64748b;margin:0 0 10px}
-.filters{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 8px}
-.filters a{text-decoration:none;font-size:12px;padding:3px 10px;border-radius:12px;border:1px solid #e5e7eb;
-           color:#475569;background:#fff}
-.filters a.on{background:#0f172a;color:#fff;border-color:#0f172a}
+.logo svg{display:block;width:32px;height:32px;border-radius:var(--radius-sm)}
+h1{font-size:19px;margin:0;font-weight:600;letter-spacing:.1px}
+h1 .v{color:var(--muted);font-weight:500;font-size:13px}
+.sub{color:var(--muted);font-size:12.5px;margin-left:auto}
+main{padding:22px 24px;max-width:1120px;margin:0 auto}
+section{margin-bottom:28px}
+h2{font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin:0 0 10px;font-weight:600}
+.filters{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 10px}
+.filters a{text-decoration:none;font-size:13px;font-weight:600;padding:5px 16px;border-radius:var(--radius-pill);
+           border:1px solid var(--border);color:var(--ink-soft);background:var(--card);
+           transition:all .18s ease;letter-spacing:.1px}
+.filters a:hover{background:var(--primary-tint);border-color:var(--primary);color:var(--ink)}
+.filters a.on{background:var(--primary);color:var(--ink);border-color:var(--primary);font-weight:700}
 .kpis{display:flex;gap:14px;flex-wrap:wrap}
-.kpi{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:12px 14px;min-width:150px}
-.kpi .r{font-weight:700;text-transform:uppercase;font-size:12px;letter-spacing:.04em;color:#334155;margin-bottom:6px}
-.kpi .row{display:flex;justify-content:space-between;font-size:12px;color:#475569}
-.kpi .row b{color:#0f172a;font-variant-numeric:tabular-nums}
-table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden}
-th,td{text-align:left;padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px}
-th{background:#fafbfc;color:#64748b;font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.03em}
+.kpi{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
+     box-shadow:var(--shadow-card);padding:14px 16px;min-width:160px}
+.kpi .r{font-weight:700;text-transform:uppercase;font-size:12px;letter-spacing:.5px;color:var(--ink-soft);margin-bottom:8px}
+.kpi .row{display:flex;justify-content:space-between;font-size:12.5px;color:var(--muted);padding:1px 0}
+.kpi .row b{color:var(--ink)}
+.kpi .row b.n-done{color:var(--success)}.kpi .row b.n-failed{color:var(--danger)}
+.kpi .row b.n-running{color:var(--pending)}
+table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--border);
+      border-radius:var(--radius);overflow:hidden;box-shadow:var(--shadow-card)}
+th,td{text-align:left;padding:12px;font-size:13.5px}
+th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px;
+   border-bottom:1px solid var(--border);background:var(--card);white-space:nowrap}
+td{border-bottom:1px solid var(--border-soft);color:var(--ink)}
+tbody tr{transition:background-color .12s ease}
+tbody tr:hover{background:var(--primary-tint)}
 tr:last-child td{border-bottom:none}
-td.mono,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
-.chip{display:inline-block;padding:2px 9px;border-radius:11px;font-size:12px;font-weight:600}
-.s-queued{background:#eef1f5;color:#475569}.s-granted{background:#e0efff;color:#1d4ed8}
-.s-running{background:#fff4e0;color:#b45309}.s-done{background:#e6f6ec;color:#15803d}
-.s-failed{background:#fde8e8;color:#b91c1c}.s-killed{background:#efeaf6;color:#6b21a8}
-.w-waiting{background:#eef1f5;color:#475569}.w-running{background:#e6f6ec;color:#15803d}
-.w-dead{background:#fde8e8;color:#b91c1c}
-.empty{color:#94a3b8;font-size:13px;padding:14px;background:#fff;border:1px dashed #e5e7eb;border-radius:10px}
+td.mono,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
+.chip{display:inline-flex;align-items:center;padding:3px 12px;border-radius:var(--radius-pill);
+      font-size:12px;font-weight:600;line-height:1.5;border:1px solid transparent;white-space:nowrap;letter-spacing:.1px}
+.s-queued{background:#eee;color:var(--muted);border-color:var(--border)}
+.s-granted{background:var(--primary-tint);color:var(--pending);border-color:rgba(247,168,37,.35)}
+.s-running{background:var(--pending-bg);color:var(--pending);border-color:rgba(247,168,37,.35)}
+.s-done{background:var(--success-bg);color:var(--success);border-color:rgba(31,157,107,.2)}
+.s-failed{background:var(--danger-bg);color:var(--danger);border-color:rgba(214,69,69,.2)}
+.s-killed{background:#eee;color:var(--danger);border-color:rgba(214,69,69,.2)}
+.w-waiting{background:#eee;color:var(--muted);border-color:var(--border)}
+.w-running{background:var(--success-bg);color:var(--success);border-color:rgba(31,157,107,.2)}
+.w-dead{background:var(--danger-bg);color:var(--danger);border-color:rgba(214,69,69,.2)}
+.empty{color:var(--muted);font-size:13px;padding:16px;background:var(--card);
+       border:1px dashed var(--border);border-radius:var(--radius)}
 """
 
 
@@ -201,10 +230,16 @@ def _esc(v: Any) -> str:
 
 
 def _fmt_ts(v: Any) -> str:
+    """Render a timestamp cell across both backends: a datetime formats directly;
+    the sqlite TEXT / ISO-8601 form is trimmed to the same ``YYYY-MM-DD HH:MM:SS``
+    shape (no microseconds/offset noise); missing → an em-dash, never a blank cell."""
+    if v is None or v == "":
+        return "—"
     try:
         return v.strftime("%Y-%m-%d %H:%M:%S")
     except AttributeError:
-        return _esc(v)
+        s = str(v).replace("T", " ")
+        return _esc(s[:19]) if len(s) >= 19 else _esc(s)
 
 
 def _status_chip(status: str) -> str:
@@ -233,7 +268,9 @@ def render_panel(project: str | None = None) -> str:
         '<div class="kpi"><div class="r">{r}</div>{rows}</div>'.format(
             r=_esc(res),
             rows="".join(
-                f'<div class="row"><span>{s}</span><b>{by_res[res].get(s, 0)}</b></div>'
+                # n-<status> tints the count with its status colour when non-zero
+                f'<div class="row"><span>{s}</span>'
+                f'<b class="{"n-" + s if by_res[res].get(s, 0) else ""}">{by_res[res].get(s, 0)}</b></div>'
                 for s in _JOB_STATUSES
             ),
         )
@@ -266,16 +303,18 @@ def render_panel(project: str | None = None) -> str:
     if jobs:
         job_rows = "".join(
             "<tr><td class='mono'>{id}</td><td>{p}</td><td>{r}</td><td>{st}</td>"
-            "<td class='mono'>{pri}</td><td class='mono'>{w}</td><td class='mono'>{u}</td></tr>".format(
+            "<td class='mono'>{pri}</td><td class='mono'>{w}</td>"
+            "<td class='mono'>{c}</td><td class='mono'>{u}</td></tr>".format(
                 id=_esc(j["job_id"][:8]), p=_esc(j["project"]), r=_esc(j["resource"]),
                 st=_status_chip(j["status"]), pri=_esc(j["priority"]),
-                w=_esc(j["granted_worker"] or "—"), u=_fmt_ts(j.get("updated_at")),
+                w=_esc(j["granted_worker"] or "—"),
+                c=_fmt_ts(j.get("created_at")), u=_fmt_ts(j.get("updated_at")),
             )
             for j in jobs
         )
         jobs_html = (
             "<table><thead><tr><th>job</th><th>project</th><th>resource</th><th>status</th>"
-            f"<th>prio</th><th>worker</th><th>updated</th></tr></thead><tbody>{job_rows}</tbody></table>"
+            f"<th>prio</th><th>worker</th><th>created</th><th>updated</th></tr></thead><tbody>{job_rows}</tbody></table>"
         )
     else:
         jobs_html = '<div class="empty">No jobs on the queue.</div>'
