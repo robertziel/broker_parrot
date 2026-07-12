@@ -37,6 +37,8 @@ from __future__ import annotations
 
 import logging
 import os
+
+from queue_workflows.envcompat import env_get
 import socket
 import threading
 from dataclasses import dataclass
@@ -105,7 +107,7 @@ class LLMConfig:
 
 
 def _worker_control_poll_s() -> float:
-    raw = (os.environ.get("AI_LEADS_WORKER_CONTROL_POLL_S", "") or "").strip()
+    raw = (env_get("QUEUE_WORKFLOWS_WORKER_CONTROL_POLL_S", "") or "").strip()
     if not raw:
         return WORKER_CONTROL_POLL_S
     try:
@@ -117,7 +119,7 @@ def _worker_control_poll_s() -> float:
 def _default_host() -> str:
     """This host's label — same derivation the claim worker uses
     (``config.host_label_env`` env, else the OS hostname)."""
-    return os.environ.get(get_config().host_label_env, "").strip() or socket.gethostname()
+    return env_get(get_config().host_label_env, "").strip() or socket.gethostname()
 
 
 def _project(project: str | None = None) -> str:
@@ -478,7 +480,7 @@ class WorkerControlWatcher:
 
     @property
     def _enabled(self) -> bool:
-        return not bool(os.environ.get("AI_LEADS_DISABLE_WORKER_CONTROL"))
+        return not bool(env_get("QUEUE_WORKFLOWS_DISABLE_WORKER_CONTROL"))
 
     def check_once(self) -> bool:
         """Read the control row once; if OFF, dispatch its stop policy. Returns

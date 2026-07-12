@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import logging
 import os
+
+from queue_workflows.envcompat import env_get
 import socket
 
 from queue_workflows.model_cache import ModelCache
@@ -64,11 +66,11 @@ def _publish_current_model(model_id: str | None) -> None:
     row. Failures are swallowed: a transient DB blip should not crash a
     worker that already has the model loaded successfully.
     """
-    if os.environ.get("AI_LEADS_DISABLE_WORKER_HEARTBEAT"):
+    if env_get("QUEUE_WORKFLOWS_DISABLE_WORKER_HEARTBEAT"):
         return
     from queue_workflows.config import get_config
     host = (
-        os.environ.get(get_config().host_label_env, "").strip()
+        env_get(get_config().host_label_env, "").strip()
         or socket.gethostname()
     )
     try:

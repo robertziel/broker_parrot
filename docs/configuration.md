@@ -32,17 +32,17 @@ without resetting the rest.
 
 | kwarg | default | what it does |
 |---|---|---|
-| `db_url_env` | `"AI_LEADS_DB_URL"` | Env var name holding the queue DSN (Postgres DSN for `db_backend="pg"`, a filesystem path for `"sqlite"`). |
+| `db_url_env` | `"QUEUE_WORKFLOWS_DB_URL"` | Env var name holding the queue DSN (Postgres DSN for `db_backend="pg"`, a filesystem path for `"sqlite"`). |
 | `metrics_db_url_env` | `None` | Env var name holding the DSN hw-metrics telemetry publishes to / reads from — the shared "broker" Postgres, so every project shows the same fleet-wide hardware view. `None` falls back to `db_url_env` (a project whose queue DB already *is* the broker needs no extra wiring). Always a pg DSN regardless of `db_backend` — hw-metrics is NOTIFY-only and Postgres-only. |
 | `video_model_ids` | `frozenset()` | GPU model ids on the tight per-job video-render wall-clock budget (`claim_worker.budget_for`). |
 | `node_module_package` | `""` | Dotted package the default node-module resolver imports under (e.g. `"workflows.nodes"`). Empty ⇒ a stored `node_module` value is imported as a fully-qualified module name. |
-| `host_label_env` | `"AI_LEADS_HOST_LABEL"` | Env var name holding this host's identity string (used as `claimed_by` / heartbeat key). |
-| `host_priority_env` | `"AI_LEADS_GPU_CONSUMER_PRIORITY"` | Env var name holding this host's GPU claim-priority tiebreak. |
+| `host_label_env` | `"QUEUE_WORKFLOWS_HOST_LABEL"` | Env var name holding this host's identity string (used as `claimed_by` / heartbeat key). |
+| `host_priority_env` | `"QUEUE_WORKFLOWS_GPU_CONSUMER_PRIORITY"` | Env var name holding this host's GPU claim-priority tiebreak. |
 | `container_prefix` | `"ai_leads-"` | cgroup-attribution container-name prefix — `cgroup_attribution.py` sums the CPU/RAM slice owned by containers whose name starts with this. |
 | `project` | `""` (or `QUEUE_WORKFLOWS_PROJECT`) | Tenant tag on every queue row (migration 0017) so a shared broker Postgres can pool multiple projects — see [The `project` tenant tag vs `db_namespace`](#the-project-tenant-tag-vs-db_namespace) below. |
 | `ingest_queues` | `{"fetch", "load"}` | The valid ingest-family queue names (host-side validation since migration 0008 dropped the DB `CHECK`). **Rejects reuse of the reserved DAG queue names `cpu`/`gpu`** — raises `ValueError` naming the offending set. |
 | `ingest_default_budget_s` | `3600` | Wall-clock budget (seconds) `claim_worker.budget_for` applies to ingest queues other than the built-in `fetch`/`load`. |
-| `db_backend` | `"sqlite"` (or `QUEUE_WORKFLOWS_DB_BACKEND`) | Which storage engine the store resolves to: `"sqlite"` / `"pg"` (relational, via the dialect seam) or `"redis"` / `"mongodb"` (the `StorageBackend` SPI). See [the ai_leads-byte-compat default philosophy](#the-ai_leads-byte-compat-default-philosophy) below for the one breaking exception. |
+| `db_backend` | `"sqlite"` (or `QUEUE_WORKFLOWS_DB_BACKEND`) | Which storage engine the store resolves to: `"sqlite"` / `"pg"` (relational, via the dialect seam) or `"redis"` / `"mongodb"` (the `StorageBackend` SPI). See [env-var names](#env-var-names--canonical-queue_workflows-legacy-ai_leads-fallback) below for the one breaking exception. |
 | `db_namespace` | `""` | Logical namespace isolating this tenant's jobs on a **shared** redis/mongodb server (every key/collection is scoped by it); `""` means the literal namespace `"default"`. For `pg`/`sqlite` it scopes SPI rows via a `namespace` column. Inverse of `project` — see below. |
 | `cancel_orphan_queued_jobs` | `False` | When `True`, `NodePool` periodically flips `queued` node-jobs whose parent run is already `cancelled`/`failed` to `cancelled`, cleaning up queue gauges. Default preserves pre-0.4 behaviour byte-for-byte. |
 | `gpu_requires_local_device` | `True` | When `False`, a GPU worker with no local CUDA device does **not** self-park as blind — it's treated as a remote/thin client whose GPU nodes call an external inference server over HTTP and never touch `torch.cuda`, so the box-blind guard doesn't apply. |
@@ -58,7 +58,7 @@ exposed as `configure()` keywords — `redis_url_env` (default
 `"QUEUE_WORKFLOWS_REDIS_URL"`) and `mongo_url_env` (default
 `"QUEUE_WORKFLOWS_MONGO_URL"`), read by `queue_workflows/backends/__init__.py`
 when `db_backend` selects `redis`/`mongodb`. Similarly `ollama_url_env`
-(`"AI_LEADS_OLLAMA_URL"`) and `vllm_url_env` (`"AI_LEADS_VLLM_URL"`) name the
+(`"QUEUE_WORKFLOWS_OLLAMA_URL"`) and `vllm_url_env` (`"QUEUE_WORKFLOWS_VLLM_URL"`) name the
 env vars the LLM backend factory reads for per-machine server root URLs — see
 [gpu_and_llm.md](gpu_and_llm.md). Rename these by setting the env var itself,
 or by mutating `get_config()` directly.
@@ -88,26 +88,34 @@ value).
 | `register_pool_handler` | `(name: str, callable_: Callable[..., dict]) -> None` | Registers a shared-GPU-pool handler under `name` (deployed on a GPU box); a pooled worker resolves a claimed task's `handler` to it and runs `fn(*, inputs, output_dir, params) -> dict`. Op code lives here; data lives on shared NFS. | Empty on a submit-only app. |
 | `register_broker_handler` | `(key: str, callable_: Callable[[job, cancel], dict \| None]) -> None` | Registers a `broker_service` worker-runtime handler under `key` (matched against a granted job's `payload['handler']` else its `resource`); `cancel` is a `threading.Event` set when the broker revokes permission mid-run. See [broker.md](broker.md). | Empty on a submit-only app. |
 
-## The ai_leads-byte-compat default philosophy
+## Env-var names — canonical `QUEUE_WORKFLOWS_*`, legacy `AI_LEADS_*` fallback
 
-`queue_workflows` was extracted from `ai_leads` (its "Phase 6"), which remains
-the origin and first consumer, with ~35 sibling projects sharing this one
-source. That history explains a pattern visible throughout `config.py`: every
-env-var-name field defaults to the name `ai_leads` already renders into its
-`.env` — `db_url_env` → `AI_LEADS_DB_URL`, `host_label_env` →
-`AI_LEADS_HOST_LABEL`, `host_priority_env` → `AI_LEADS_GPU_CONSUMER_PRIORITY`,
-`container_prefix` → `"ai_leads-"`, `ollama_url_env` / `vllm_url_env` →
-`AI_LEADS_OLLAMA_URL` / `AI_LEADS_VLLM_URL`. These are **configurable
-defaults, not couplings** — the engine reads an env *name* off `EngineConfig`
-and a host renames it with `configure(...)`, never by touching engine code.
-When adding a new tunable, follow the same shape: read an env name off
-`EngineConfig`, default it to the `ai_leads` name.
+Every runtime knob is canonically named `QUEUE_WORKFLOWS_<KNOB>` (`db_url_env`
+→ `QUEUE_WORKFLOWS_DB_URL`, `host_label_env` → `QUEUE_WORKFLOWS_HOST_LABEL`,
+`host_priority_env` → `QUEUE_WORKFLOWS_GPU_CONSUMER_PRIORITY`, `ollama_url_env`
+/ `vllm_url_env` → `QUEUE_WORKFLOWS_OLLAMA_URL` / `QUEUE_WORKFLOWS_VLLM_URL`,
+plus the tuning knobs listed throughout these docs).
+
+**Legacy fallback.** The engine was extracted from a host application whose
+env file used an `AI_LEADS_` prefix, so for backward compatibility every knob
+also resolves its `AI_LEADS_<KNOB>` twin: the lookup order is canonical name →
+legacy name → default (`queue_workflows/envcompat.py`; a source-scan test
+forbids any direct legacy read). An existing deploy keeps working with zero
+`.env` changes; the canonical spelling wins when both are set. The one
+non-env-name remnant is the `container_prefix` default `"ai_leads-"` — a
+cgroup-attribution *value*, overridden per host with
+`configure(container_prefix=...)`.
+
+These are **configurable defaults, not couplings** — the engine reads an env
+*name* off `EngineConfig` and a host renames it with `configure(...)`, never by
+touching engine code. When adding a new tunable, read the env through
+`envcompat.env_get` with the canonical name.
 
 **The one deliberate exception, and it's BREAKING (v1.0.0):** `db_backend`
 now defaults to `"sqlite"`, not `"pg"`. Every prior version defaulted to `pg`;
 v1.0.0 switches the default to the friendliest zero-config option for a
 reusable library — a daemon-less local file needs no server at all. A
-Postgres consumer (`ai_leads` and its siblings) **must opt in**, either with
+Postgres consumer **must opt in**, either with
 
 ```python
 queue_workflows.configure(db_backend="pg")
@@ -124,7 +132,7 @@ scripts** (`queue-orchestrator`, `queue-claim-worker`, `queue-scheduler`,
 `queue-worker-control`, `queue-broker`) which have no host `configure()` call
 to pass `db_backend=` into — they read `QUEUE_WORKFLOWS_DB_BACKEND` directly
 (`config._default_db_backend()`). It also accepts `--db-backend pg` as a CLI
-flag on those scripts. Without either, a pg consumer's `AI_LEADS_DB_URL`
+flag on those scripts. Without either, a pg consumer's `QUEUE_WORKFLOWS_DB_URL`
 value gets read as a *SQLite file path* instead of a Postgres DSN — a subtle,
 silent misconfiguration, which is why `_default_db_backend()` validates and
 normalizes the raw env value (`"Sqlite"`, `"mongo"`, etc.) and raises loudly
@@ -143,10 +151,10 @@ unless noted):
 | `QUEUE_WORKFLOWS_REDIS_URL` | `backends._url_for` (name overridable via `EngineConfig.redis_url_env`) | The redis DSN, read only when `db_backend="redis"` (or `gpu_pool_backend="redis"`). |
 | `QUEUE_WORKFLOWS_MONGO_URL` | `backends._url_for` (name overridable via `EngineConfig.mongo_url_env`) | The mongodb DSN, read only when `db_backend="mongodb"`. |
 | `QUEUE_WORKFLOWS_GPU_POOL_URL` | shared GPU pool store lookup (name overridable via `configure(gpu_pool_url_env=...)`) | DSN for the shared GPU pool `StorageBackend`, independent of the app's own `db_backend`. |
-| `AI_LEADS_DB_URL` | default value of `db_url_env` | The queue DSN, unless a host renamed `db_url_env`. |
-| `AI_LEADS_HOST_LABEL` | default value of `host_label_env` | This host's identity string. |
-| `AI_LEADS_GPU_CONSUMER_PRIORITY` | default value of `host_priority_env` | GPU claim-priority tiebreak. |
-| `AI_LEADS_OLLAMA_URL` / `AI_LEADS_VLLM_URL` | default value of `ollama_url_env` / `vllm_url_env` | Per-machine LLM server root URLs (deployment topology, set per host — e.g. by ansible). See [gpu_and_llm.md](gpu_and_llm.md). |
+| `QUEUE_WORKFLOWS_DB_URL` | default value of `db_url_env` | The queue DSN, unless a host renamed `db_url_env`. |
+| `QUEUE_WORKFLOWS_HOST_LABEL` | default value of `host_label_env` | This host's identity string. |
+| `QUEUE_WORKFLOWS_GPU_CONSUMER_PRIORITY` | default value of `host_priority_env` | GPU claim-priority tiebreak. |
+| `QUEUE_WORKFLOWS_OLLAMA_URL` / `QUEUE_WORKFLOWS_VLLM_URL` | default value of `ollama_url_env` / `vllm_url_env` | Per-machine LLM server root URLs (deployment topology, set per host — e.g. by ansible). See [gpu_and_llm.md](gpu_and_llm.md). |
 
 ## The `project` tenant tag vs `db_namespace`
 
@@ -173,7 +181,7 @@ mis-isolates or mis-pools your data:
 
 In short: `project` says "we're deliberately sharing one queue, tag your
 rows"; `db_namespace` says "we're sharing one server, but must never see each
-other's data." Set `project` via `configure(project="ai_leads")` or the
+other's data." Set `project` via `configure(project="alpha")` or the
 `QUEUE_WORKFLOWS_PROJECT` env var; set `db_namespace` via
 `configure(db_namespace=...)`.
 
@@ -191,7 +199,7 @@ queue_workflows.configure()   # every default applies; sqlite, no host wiring
 ```
 
 Full host wiring (mirrors the module docstring in `queue_workflows/__init__.py`,
-what `ai_leads` does at process startup, before launching a worker /
+what a host application does at process startup, before launching a worker /
 scheduler / orchestrator):
 
 ```python
@@ -200,11 +208,11 @@ from queue_workflows import model_registry
 from queue_workflows.model_registry import ModelSpec
 
 queue_workflows.configure(
-    db_url_env="AI_LEADS_DB_URL",
+    db_url_env="MYAPP_DB_URL",
     db_backend="pg",                                   # opt in — v1.0.0 default is sqlite
     video_model_ids=frozenset({"wan_i2v", "ltx_flf"}),
-    node_module_package="workflows.nodes",
-    container_prefix="ai_leads-",
+    node_module_package="myapp.nodes",
+    container_prefix="myapp-",
 )
 queue_workflows.set_workflow_provider(load_workflow, pipeline_schema)
 queue_workflows.set_builtin_model_registrar(register_builtin_models)

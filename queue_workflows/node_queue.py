@@ -26,6 +26,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+
+from queue_workflows.envcompat import env_get
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Iterable
@@ -224,7 +226,7 @@ STALE_WORKER_AFTER_S = 30
 
 
 def _stale_worker_after_s() -> int:
-    raw = (os.environ.get("AI_LEADS_STALE_WORKER_AFTER_S", "") or "").strip()
+    raw = (env_get("QUEUE_WORKFLOWS_STALE_WORKER_AFTER_S", "") or "").strip()
     if not raw:
         return STALE_WORKER_AFTER_S
     try:

@@ -55,6 +55,8 @@ from __future__ import annotations
 import inspect
 import logging
 import os
+
+from queue_workflows.envcompat import env_get
 import socket
 import threading
 import time
@@ -122,14 +124,14 @@ STALL_POLL_S = 5.0
 
 def _env_float(name: str, default: float) -> float:
     try:
-        return float(os.environ.get(name, "").strip() or default)
+        return float((env_get(name) or "").strip() or default)
     except (TypeError, ValueError):
         return float(default)
 
 
 def _env_int(name: str, default: int) -> int:
     try:
-        return int(float(os.environ.get(name, "").strip() or default))
+        return int(float((env_get(name) or "").strip() or default))
     except (TypeError, ValueError):
         return int(default)
 
@@ -181,14 +183,14 @@ _INGEST_REQUIRED_VERSION = 8
 
 
 def _host_label() -> str:
-    return os.environ.get(get_config().host_label_env, "").strip() or socket.gethostname()
+    return env_get(get_config().host_label_env, "").strip() or socket.gethostname()
 
 
 def _host_priority() -> int:
     """The claim's cross-host tiebreaker (``config.host_priority_env``):
     high-priority hosts head, overflow hosts tail. See ``node_queue._host_dir``."""
     try:
-        return int(os.environ.get(get_config().host_priority_env, "0"))
+        return int(env_get(get_config().host_priority_env, "0"))
     except (TypeError, ValueError):
         return 0
 
@@ -1177,7 +1179,7 @@ class HeartbeatEmitter:
         """Heartbeat runs for every queue family — cpu/gpu node workers AND the
         ingest workers (migration 0008 dropped the cpu/gpu-only CHECK) — unless
         the test opt-out env is set."""
-        return not bool(os.environ.get("AI_LEADS_DISABLE_WORKER_HEARTBEAT"))
+        return not bool(env_get("QUEUE_WORKFLOWS_DISABLE_WORKER_HEARTBEAT"))
 
     def _current_model(self) -> str | None:
         """The GPU busy signal: the warm-model slot, read live each tick. NULL

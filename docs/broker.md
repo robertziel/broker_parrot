@@ -26,16 +26,16 @@ The model, decided by the operator: **shared DB + per-project clients.**
 
 ```
                  Broker  =  ONE shared Postgres
-        workflow_node_jobs(queue=gpu, project=ai_leads, …)
         workflow_node_jobs(queue=gpu, project=alpha, …)
-        ingest_jobs(queue=fetch, project=ai_leads, …)
-        worker_heartbeats(host_label=host-a, queue=gpu, project=ai_leads, …)
+        workflow_node_jobs(queue=gpu, project=alpha, …)
+        ingest_jobs(queue=fetch, project=alpha, …)
+        worker_heartbeats(host_label=host-a, queue=gpu, project=alpha, …)
         worker_heartbeats(host_label=host-a, queue=gpu, project=alpha, …)
                               │
             LISTEN/NOTIFY + worker_control (project-scoped)
                               │
         ┌─────────────────┬──┴──────────────┬─────────────────┐
-   [ai_leads client]  [alpha client]   [beta client]    …each holds its
+   [alpha client]    [beta client]    [gamma client]    …each holds its
     orchestrator +      orchestrator +     orchestrator +   OWN code, claims
     cpu/gpu workers     cpu/gpu workers    cpu/gpu workers   ONLY its project's
                                                               rows.
@@ -82,7 +82,7 @@ A shared, multi-host broker is Postgres, so pass `--db-backend pg` explicitly �
 **Step 2 — every process of every project points at that broker and names itself:**
 
 ```python
-queue_workflows.configure(project="ai_leads", db_backend="pg", db_url_env="BROKER_DSN")
+queue_workflows.configure(project="alpha", db_backend="pg", db_url_env="BROKER_DSN")
 queue_workflows.configure(project="alpha",    db_backend="pg", db_url_env="BROKER_DSN")
 # … each then enqueues + claims ONLY its own project's rows on the ONE shared
 #   cpu/gpu (+ ingest) queue.
@@ -101,19 +101,19 @@ BROKER_DSN=…  queue-broker --db-backend pg --db-url-env BROKER_DSN --status
 ```
 broker schema version: 19
 projects on this broker (2):
-  ai_leads                  cpu[q0 r1]  gpu[q3 r1]
+  alpha                  cpu[q0 r1]  gpu[q3 r1]
   alpha                     cpu[q1 r0]  gpu[q0 r0]
 ```
 
 ### Cutover — adopting a project name on an existing deploy
 
-Migration 0017 backfills every pre-existing row to `project=''`. Because claiming is exact-match, the instant a running deploy switches to `configure(project="ai_leads")` its client stops seeing the backfilled `''` rows — any in-flight queued/running work would be stranded. Adopt a project name only on a **drained** queue, or run a one-time backfill in the same maintenance window:
+Migration 0017 backfills every pre-existing row to `project=''`. Because claiming is exact-match, the instant a running deploy switches to `configure(project="alpha")` its client stops seeing the backfilled `''` rows — any in-flight queued/running work would be stranded. Adopt a project name only on a **drained** queue, or run a one-time backfill in the same maintenance window:
 
 ```sql
-UPDATE workflow_runs        SET project = 'ai_leads' WHERE project = '';
-UPDATE workflow_node_jobs   SET project = 'ai_leads' WHERE project = '';
-UPDATE ingest_jobs          SET project = 'ai_leads' WHERE project = '';
-UPDATE worker_heartbeats    SET project = 'ai_leads' WHERE project = '';  -- or let stale rows age out
+UPDATE workflow_runs        SET project = 'alpha' WHERE project = '';
+UPDATE workflow_node_jobs   SET project = 'alpha' WHERE project = '';
+UPDATE ingest_jobs          SET project = 'alpha' WHERE project = '';
+UPDATE worker_heartbeats    SET project = 'alpha' WHERE project = '';  -- or let stale rows age out
 ```
 
 A deploy that stays single-tenant needs none of this.
@@ -229,7 +229,7 @@ queue_workflows.register_broker_handler("my-handler-key", my_fn)
 Console script:
 
 ```bash
-queue-broker-worker --worker-id host-a-gpu-0 --project ai_leads --resource gpu \
+queue-broker-worker --worker-id host-a-gpu-0 --project alpha --resource gpu \
                      --lease-s 30 --capacity 4 --db-backend pg --db-url-env BROKER_DSN
 ```
 

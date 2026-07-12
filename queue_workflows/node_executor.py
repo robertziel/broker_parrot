@@ -36,6 +36,8 @@ import contextlib
 import inspect
 import logging
 import os
+
+from queue_workflows.envcompat import env_get
 import time
 import traceback
 import typing
@@ -420,7 +422,7 @@ def _is_transient_gpu_error(text: str) -> bool:
 def _watchdog_max_retries() -> int:
     import os
     try:
-        return int(os.environ.get("AI_LEADS_WATCHDOG_MAX_RETRIES", "3"))
+        return int(env_get("QUEUE_WORKFLOWS_WATCHDOG_MAX_RETRIES", "3"))
     except (TypeError, ValueError):
         return 3
 

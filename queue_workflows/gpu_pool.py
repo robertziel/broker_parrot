@@ -39,6 +39,8 @@ Design (DDD)
 from __future__ import annotations
 
 import os
+
+from queue_workflows.envcompat import env_get
 import threading
 import time
 from typing import Any
@@ -67,7 +69,7 @@ def _pool_backend():
     ``config.db_backend``. Rebuilds when the configured backend/url/namespace
     changes (so a test pointing at a fresh namespace gets a fresh handle)."""
     cfg = get_config()
-    url = os.environ.get(cfg.gpu_pool_url_env)
+    url = env_get(cfg.gpu_pool_url_env)
     if not url:
         raise RuntimeError(
             f"shared GPU pool requires {cfg.gpu_pool_url_env} to hold the pool DSN "

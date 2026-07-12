@@ -41,7 +41,7 @@ A **second**, separate trigger (migration 0013) fires `pg_notify('worker_llm_con
 
 ## Enforcement — `WorkerControlWatcher`
 
-`queue_workflows.worker_control.WorkerControlWatcher` is a daemon thread the claim worker starts once it's past its boot park-gate (mirrors `JobStatusWatcher`'s shape): a dedicated connection `LISTEN`s `worker_control`, with a `WORKER_CONTROL_POLL_S` (default 5 s, env `AI_LEADS_WORKER_CONTROL_POLL_S`) safety poll behind it to catch a dropped NOTIFY or a row written before the worker booted.
+`queue_workflows.worker_control.WorkerControlWatcher` is a daemon thread the claim worker starts once it's past its boot park-gate (mirrors `JobStatusWatcher`'s shape): a dedicated connection `LISTEN`s `worker_control`, with a `WORKER_CONTROL_POLL_S` (default 5 s, env `QUEUE_WORKFLOWS_WORKER_CONTROL_POLL_S`) safety poll behind it to catch a dropped NOTIFY or a row written before the worker booted.
 
 On seeing `desired_state = 'off'` it looks up the row's `stop_policy` in the `STOP_POLICIES` registry and dispatches to the handler:
 
@@ -98,7 +98,7 @@ queue-worker-control --queue=gpu --on  [--host HOST]                 [--requeste
 ```
 
 - `--queue` is required: `cpu` | `gpu` | any configured ingest queue.
-- `--host` defaults to `AI_LEADS_HOST_LABEL` (or the host-label env configured via `configure(host_label_env=...)`), falling back to `socket.gethostname()`.
+- `--host` defaults to `QUEUE_WORKFLOWS_HOST_LABEL` (or the host-label env configured via `configure(host_label_env=...)`), falling back to `socket.gethostname()`.
 - `--project` defaults to this process's configured `project` (`configure(project=...)` / `QUEUE_WORKFLOWS_PROJECT`); on a shared broker this is what keeps an OFF scoped to the right tenant.
 - `--policy` defaults to `hard` (the only implemented policy today).
 
@@ -124,8 +124,8 @@ ON CONFLICT (host_label, queue, project) DO UPDATE
 
 ## Env knobs
 
-- `AI_LEADS_WORKER_CONTROL_POLL_S` — safety-poll cadence behind the `LISTEN` wake (default 5.0 s).
-- `AI_LEADS_DISABLE_WORKER_CONTROL` — keeps the watcher inert (tests).
+- `QUEUE_WORKFLOWS_WORKER_CONTROL_POLL_S` — safety-poll cadence behind the `LISTEN` wake (default 5.0 s).
+- `QUEUE_WORKFLOWS_DISABLE_WORKER_CONTROL` — keeps the watcher inert (tests).
 
 ## Related config on the same table
 

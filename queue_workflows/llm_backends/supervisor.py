@@ -41,6 +41,8 @@ from __future__ import annotations
 
 import logging
 import os
+
+from queue_workflows.envcompat import env_get
 import threading
 import time
 from typing import Any, Callable
@@ -120,7 +122,7 @@ class LLMSupervisor:
         :data:`DISABLE_ENV` kill-switch is unset, the backend is vllm (ollama
         self-manages idle), and the configured idle TTL is positive
         (``<=0`` disables, mirroring ``vllm_should_stop`` / ``gpu_should_unload``)."""
-        if os.environ.get(DISABLE_ENV):
+        if env_get(DISABLE_ENV):
             return False
         if getattr(self._backend, "server_type", None) != _VLLM:
             return False

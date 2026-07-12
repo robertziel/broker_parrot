@@ -32,6 +32,8 @@ from __future__ import annotations
 import json as _json
 import logging
 import os
+
+from queue_workflows.envcompat import env_get
 import re
 import sqlite3
 import threading
@@ -69,7 +71,7 @@ _pool_lock = threading.Lock()
 
 def db_url() -> str:
     env_name = _config.get_config().db_url_env
-    url = os.environ.get(env_name)
+    url = env_get(env_name)
     if not url:
         raise RuntimeError(
             f"{env_name} is not set; cannot connect to Postgres. "
@@ -79,16 +81,35 @@ def db_url() -> str:
     return url
 
 
+def _pool_sizes() -> tuple[int, int]:
+    """The process pool's (min, max): ``QUEUE_WORKFLOWS_DB_POOL_MIN`` (floor,
+    default 1) and ``QUEUE_WORKFLOWS_DB_POOL_MAX`` (cap, default 10), legacy
+    ``AI_LEADS_*`` spellings included. min is clamped into [0, max] so no env
+    combination can make ``ConnectionPool`` raise at construction. The cap is
+    the connection-budget lever for N-process claim lanes: each process holds
+    up to ``max`` connections (threads: claim/terminal txns, lease renewer,
+    heartbeat, watchers), so lane_processes x max bounds the Postgres bill."""
+    def _read(name: str, default: int) -> int:
+        try:
+            return int((env_get(name) or "").strip() or default)
+        except (TypeError, ValueError):
+            return default
+    max_size = max(1, _read("QUEUE_WORKFLOWS_DB_POOL_MAX", 10))
+    min_size = max(0, min(_read("QUEUE_WORKFLOWS_DB_POOL_MIN", 1), max_size))
+    return min_size, max_size
+
+
 def get_pool() -> ConnectionPool:
     """Lazy-init a process-wide pool. Safe across worker threads."""
     global _pool
     if _pool is None:
         with _pool_lock:
             if _pool is None:
+                min_size, max_size = _pool_sizes()
                 _pool = ConnectionPool(
                     db_url(),
-                    min_size=1,
-                    max_size=int(os.environ.get("AI_LEADS_DB_POOL_MAX", "10")),
+                    min_size=min_size,
+                    max_size=max_size,
                     kwargs={
                         "row_factory": dict_row,
                         # TCP keepalives so workers on remote boxes detect
@@ -150,7 +171,7 @@ def sqlite_path() -> str:
     """Resolve the SQLite file path from the DSN env (``config.db_url_env``).
     Accepts ``sqlite:///rel.db`` / ``sqlite:////abs/path.db`` / a bare path /
     ``:memory:``."""
-    raw = (os.environ.get(_config.get_config().db_url_env) or "").strip()
+    raw = (env_get(_config.get_config().db_url_env) or "").strip()
     if not raw:
         raise RuntimeError(
             f"{_config.get_config().db_url_env} is not set; cannot open SQLite. "

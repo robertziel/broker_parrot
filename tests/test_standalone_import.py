@@ -35,9 +35,10 @@ def test_default_backend_is_sqlite(monkeypatch):
     monkeypatch.delenv("QUEUE_WORKFLOWS_DB_BACKEND", raising=False)
     from queue_workflows.config import EngineConfig
     assert EngineConfig().db_backend == "sqlite"
-    # the byte-compat env-name defaults are unchanged — only db_backend flipped.
-    assert EngineConfig().db_url_env == "AI_LEADS_DB_URL"
-    assert EngineConfig().container_prefix == "ai_leads-"
+    # env-name defaults are now the CANONICAL library names; the legacy
+    # AI_LEADS_* spellings resolve via envcompat (tests/test_env_compat.py).
+    assert EngineConfig().db_url_env == "QUEUE_WORKFLOWS_DB_URL"
+    assert EngineConfig().container_prefix == "ai_leads-"  # a VALUE (cgroup prefix), not an env name — unchanged
 
 
 def test_import_and_configure_with_safe_defaults():
