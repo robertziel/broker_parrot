@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.2] — 2026-07-13
+
+### License
+- **Relicensed to PolyForm Noncommercial 1.0.0** (was MIT). Free for any
+  noncommercial purpose; commercial use requires a license from the author.
+  Versions ≤ 1.0.1 were published under MIT and remain available under those
+  terms.
+
+### Added
+- **`queue-worker-supervisor`** — a per-host daemon that closes the dead-worker
+  loop: the orchestrator's detector (0009 `last_flagged_dead_at`) flags a wedged
+  worker but deliberately never kills it; this optional supervisor reads the
+  flag for the `host_label`s its box owns (a `label:container` map via `--map` /
+  `QUEUE_WORKFLOWS_SUPERVISOR_MAP`) and `docker restart`s the local container.
+  Report-only without a map; per-`(host, queue)` cooldown; injectable bounce
+  (`set_worker_bounce`) for systemd/k8s hosts. Plus
+  `node_queue.flagged_dead_workers()`, the read side of the flag.
+- **One-model-per-GPU-box arbitration primitives**
+  (`queue_workflows.gpu_model_lease`) — a box-wide model lease so N GPU workers
+  (one per project) sharing one card can't warm different models concurrently:
+  pure `decide()` (empty grants / same model shares / different model denies
+  unless the holder's lease expired), a flock'd `FileLeaseStore` shared across
+  containers, `set_gpu_lease_store()` for custom stores, and
+  `QUEUE_WORKFLOWS_GPU_{BOX_ID,MODEL_LEASE_DIR,MODEL_LEASE_TTL_S}` knobs.
+  **Opt-in and inert by default** (no store ⇒ every load grants, byte-identical
+  behavior); not yet wired into the runtime load path.
+
 ## [1.0.1] — 2026-07-12
 
 ### Changed

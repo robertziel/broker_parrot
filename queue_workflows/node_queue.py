@@ -871,6 +871,41 @@ def requeue_job_for_retry(job_id: str) -> dict[str, Any] | None:
         return requeue_job_for_retry_in_txn(cur, job_id)
 
 
+def flagged_dead_workers(
+    *, within_s: int = 1800, stale_after_s: int | None = None, project: str | None = None,
+) -> list[dict[str, Any]]:
+    """Read the workers CURRENTLY flagged dead — the read side of
+    :func:`flag_stale_workers_holding_running_jobs`, consumed by the per-host
+    :class:`queue_workflows.worker_supervisor.WorkerSupervisor`.
+
+    Returns rows whose ``last_flagged_dead_at`` was stamped within ``within_s``
+    (recent, not an ancient flag) AND that are STILL silent (``last_seen`` older
+    than ``stale_after_s`` — a worker that has since recovered and beat again
+    is not returned, because its fresh heartbeat is the all-clear). Pure read:
+    flags nothing, kills nothing. ``project`` scopes to a tenant (``None`` ⇒ all).
+    """
+    from queue_workflows.dialect import get_dialect
+    d = get_dialect()
+    thr = _stale_worker_after_s() if stale_after_s is None else int(stale_after_s)
+    where = [
+        "last_flagged_dead_at IS NOT NULL",
+        f"last_flagged_dead_at > {d.past_seconds('%(within)s')}",
+        f"last_seen < {d.past_seconds('%(thr)s')}",
+    ]
+    params: dict[str, Any] = {"within": int(within_s), "thr": thr}
+    if project is not None:
+        where.append("project = %(project)s")
+        params["project"] = project
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT host_label, queue, project, last_seen, last_flagged_dead_at "
+            "FROM worker_heartbeats WHERE " + " AND ".join(where)
+            + " ORDER BY host_label, queue",
+            params,
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
 def flag_stale_workers_holding_running_jobs(
     *, stale_after_s: int | None = None, project: str | None = None,
 ) -> list[dict[str, Any]]:

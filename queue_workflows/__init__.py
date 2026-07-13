@@ -47,6 +47,8 @@ __all__ = [
     "set_workflow_provider",
     "set_invoke_context",
     "set_vllm_lifecycle",
+    "set_worker_bounce",
+    "set_gpu_lease_store",
     "set_llm_server_resolver",
     "set_llm_servers_available",
     "register_ingest_task",
@@ -265,6 +267,31 @@ def set_vllm_lifecycle(
     with cfg._lock:
         cfg.vllm_stop_fn = stop_fn
         cfg.vllm_start_fn = start_fn
+
+
+def set_worker_bounce(fn: Callable[[str, str, str], bool] | None) -> None:
+    """Wire the per-host dead-worker bounce action. ``fn(host_label, queue,
+    container) -> bool`` restarts a worker the orchestrator flagged dead, returning
+    True iff issued. Called by
+    :class:`queue_workflows.worker_supervisor.WorkerSupervisor` for a flagged
+    worker this box owns. ``None`` (default) ⇒ the supervisor's built-in
+    ``docker restart <container>``. A host on systemd/k8s/a custom API wires its
+    own. See :attr:`queue_workflows.config.EngineConfig.worker_bounce_fn`."""
+    cfg = get_config()
+    with cfg._lock:
+        cfg.worker_bounce_fn = fn
+
+
+def set_gpu_lease_store(store: Any | None) -> None:
+    """Wire a cross-box GPU model-lease store (one-model-per-GPU-box arbitration,
+    :mod:`queue_workflows.gpu_model_lease`). ``store`` implements ``read(box_id)``
+    + ``update(box_id, fn)`` (e.g. a redis/pg store shared across boxes). ``None``
+    (default) ⇒ the file store when ``gpu_model_lease_dir`` is set, else a no-op
+    that grants every load. See
+    :attr:`queue_workflows.config.EngineConfig.gpu_lease_store`."""
+    cfg = get_config()
+    with cfg._lock:
+        cfg.gpu_lease_store = store
 
 
 def set_llm_server_resolver(
