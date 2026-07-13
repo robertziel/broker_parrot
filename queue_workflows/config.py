@@ -267,6 +267,36 @@ class EngineConfig:
     vllm_stop_fn: Callable[[], bool] | None = None
     vllm_start_fn: Callable[[str], None] | None = None
 
+    # ── per-host dead-worker bounce (host-provided) ───────────────────────────
+    #: ``Callable[[host_label, queue, container], bool]`` — restart a wedged worker
+    #: the orchestrator flagged dead (``worker_heartbeats.last_flagged_dead_at``).
+    #: Called by :class:`~queue_workflows.worker_supervisor.WorkerSupervisor` for a
+    #: flagged worker this box OWNS (a key in its label→container map). Returns True
+    #: iff the bounce was issued. Default ``None`` ⇒ the supervisor's built-in
+    #: ``docker restart <container>``. A host that manages workers differently
+    #: (systemd, k8s, a custom API) wires its own restart here.
+    worker_bounce_fn: Callable[[str, str, str], bool] | None = None
+
+    # ── one-model-per-GPU-box arbitration (opt-in) ────────────────────────────
+    #: The PHYSICAL box identity every GPU worker on a machine agrees on, so the
+    #: model lease (:mod:`queue_workflows.gpu_model_lease`) unifies per-project
+    #: workers that carry DIFFERENT ``host_label``s (``box-a`` vs ``box-a-gpu``).
+    #: Empty ⇒ the machine hostname. Env ``QUEUE_WORKFLOWS_GPU_BOX_ID``.
+    gpu_box_id: str = ""
+    #: Directory for the file-backed box model lease (each GPU container mounts the
+    #: SAME host dir → a box-wide flock). Unset ⇒ the lease is a no-op that grants
+    #: every load (byte-identical to no arbitration). Env
+    #: ``QUEUE_WORKFLOWS_GPU_MODEL_LEASE_DIR``.
+    gpu_model_lease_dir: str = ""
+    #: Lease TTL seconds — a holder renews while it keeps the model warm; a dead
+    #: holder's lease lapses so it can't hold VRAM hostage. Env
+    #: ``QUEUE_WORKFLOWS_GPU_MODEL_LEASE_TTL_S``.
+    gpu_model_lease_ttl_s: float = 120.0
+    #: A host-provided lease store (overrides ``gpu_model_lease_dir``) — anything
+    #: with ``read(box_id)`` + ``update(box_id, fn)``, e.g. a redis/pg-backed store
+    #: shared across boxes. ``None`` ⇒ the file store (if a dir is set) else no-op.
+    gpu_lease_store: Any | None = None
+
     # ── per-dispatch LLM server resolver (host-provided) ──────────────────────
     #: ``Callable[[dict], Any]`` — given a node-job dict (id, node_module, queue,
     #: required_model, host_label, …), return the LLM server the node should call:

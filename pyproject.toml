@@ -8,11 +8,11 @@ build-backend = "hatchling.build"
 # not by index name, and one consumer's wheel build globs `queue_workflows-*.whl`,
 # so renaming the dist would break it for zero benefit.
 name = "queue_workflows"
-version = "1.0.1"
+version = "1.0.2"
 description = "broker_parrot — Postgres-as-queue workflow engine (per-project data plane): SKIP LOCKED claim, lease reclaim, DAG dispatch, GPU warm-model cache. Import package `queue_workflows`. No dashboard ships here: the snapshot primitives are the read model."
 readme = "README.md"
 requires-python = ">=3.10"
-license = "MIT"
+license = "PolyForm-Noncommercial-1.0.0"
 license-files = ["LICENSE"]
 authors = [{ name = "Robert Zieliński", email = "hello@robertz.co" }]
 keywords = ["postgres", "queue", "workflow", "dag", "skip-locked", "task-queue"]
@@ -40,6 +40,7 @@ queue-claim-worker   = "queue_workflows.claim_worker:main"   # generic CLIs (use
 queue-scheduler      = "queue_workflows.scheduler:main"
 queue-orchestrator   = "queue_workflows.orchestrator:main"
 queue-worker-control = "queue_workflows.worker_control:main"  # turn a (host,queue) worker ON/OFF
+queue-worker-supervisor = "queue_workflows.worker_supervisor:main"  # per-host: docker-restart a worker flagged dead
 queue-broker-web     = "queue_workflows.broker_service.web:main"  # v2 broker web service + operator panel (broker_service)
 queue-broker-worker  = "queue_workflows.broker_service.worker:main"  # v2 worker behind the broker permission gate
 
