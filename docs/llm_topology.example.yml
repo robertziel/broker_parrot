@@ -1,0 +1,32 @@
+# broker_parrot LLM-server TOPOLOGY (example) — copy to a gitignored file in your
+# deployment and point `configure(llm_topology_path=…)` (or the consumer's own
+# mount path) at it. See docs/gpu_and_llm.md § "Per-box topology".
+#
+# Each entry maps a worker box (its `host_label`, the value that box exports as the
+# engine's host-label env — e.g. LM_HOST_LABEL / QUEUE_WORKFLOWS_HOST_LABEL) to the
+# LLM server ROOT URL that box should DISPATCH to. The DB (worker_controls, migration
+# 0013) still owns WHICH server type each box runs (ollama / vllm); this file only
+# supplies the address.
+#
+# THE RULE: every GPU box serves its OWN model and dials ITSELF via the docker host
+# gateway (`http://host.docker.internal:11434`, or `http://127.0.0.1:11434` off-docker).
+# Do NOT point one box at another box's server: a single ollama serialises requests
+# per model, so N boxes sharing one server queue behind each other while the borrowers'
+# GPUs sit idle AND still hold a claim slot showing `running`. Pointing several boxes
+# at one server adds *clients*, not inference capacity. (The `llm_probe` heartbeat
+# check exists to make a mis-wired box — one advertising a server it doesn't run —
+# visible instead of silent.) If a box has no GPU, don't give it a `-gpu` lane at all.
+#
+# A value may be a bare URL string or a `{ url: … }` mapping. `default:` is the
+# catch-all for any box with no explicit row. Absent file / absent entry ⇒ the
+# factory falls back to `ollama_url_env` / `vllm_url_env` + the localhost default
+# (itself already "serve yourself", so the safe default matches the rule).
+
+boxes:
+  # Every GPU box → its OWN ollama on the docker host gateway. The worker sets
+  # extra_hosts `host.docker.internal:host-gateway`; each box runs its own server
+  # (e.g. ollama/ollama:latest on CUDA boxes, ollama/ollama:rocm on an AMD box).
+  box-a-gpu:  http://host.docker.internal:11434
+  box-b-gpu:  http://host.docker.internal:11434
+  box-c-gpu:  http://host.docker.internal:11434
+  default:    http://host.docker.internal:11434

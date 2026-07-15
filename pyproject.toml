@@ -8,11 +8,11 @@ build-backend = "hatchling.build"
 # not by index name, and one consumer's wheel build globs `queue_workflows-*.whl`,
 # so renaming the dist would break it for zero benefit.
 name = "queue_workflows"
-version = "1.0.2"
+version = "1.0.3"
 description = "broker_parrot — Postgres-as-queue workflow engine (per-project data plane): SKIP LOCKED claim, lease reclaim, DAG dispatch, GPU warm-model cache. Import package `queue_workflows`. No dashboard ships here: the snapshot primitives are the read model."
 readme = "README.md"
 requires-python = ">=3.10"
-license = "PolyForm-Noncommercial-1.0.0"
+license = "AGPL-3.0-or-later"
 license-files = ["LICENSE"]
 authors = [{ name = "Robert Zieliński", email = "hello@robertz.co" }]
 keywords = ["postgres", "queue", "workflow", "dag", "skip-locked", "task-queue"]
@@ -32,7 +32,8 @@ dependencies = [
 metrics = ["psutil"]               # hw_metrics CPU/RAM probe (GPU probe shells out, no dep)
 redis = ["redis>=5"]               # the 'redis' StorageBackend (queue_workflows.backends.redis)
 mongodb = ["pymongo>=4.4"]         # the 'mongodb' StorageBackend (needs a replica set)
-test = ["pytest", "pytest-cov", "redis>=5", "pymongo>=4.4"]
+topology = ["PyYAML>=6"]           # per-box LLM topology YAML (config llm_topology_path); absent ⇒ env/default
+test = ["pytest", "pytest-cov", "redis>=5", "pymongo>=4.4", "PyYAML>=6"]
 
 [project.scripts]
 queue-broker         = "queue_workflows.broker:main"         # stand up / inspect THE shared broker (one queue, all projects)

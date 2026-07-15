@@ -25,11 +25,11 @@ def _flag(hl, q="gpu"):
 
 
 def test_only_owned_labels_are_bounced():
-    flagged = [_flag("box-a-gpu"), _flag("claim-gpu"), _flag("mystery")]
-    picks = ws.select_bounces(flagged, {"box-a-gpu": "cont-a", "claim-gpu": "cont-b"},
+    flagged = [_flag("box-a-gpu"), _flag("box-b-gpu"), _flag("mystery")]
+    picks = ws.select_bounces(flagged, {"box-a-gpu": "cont-a", "box-b-gpu": "cont-b"},
                               now=100.0, cooldown_s=300.0, last_bounced={})
     got = {p["host_label"]: p["container"] for p in picks}
-    assert got == {"box-a-gpu": "cont-a", "claim-gpu": "cont-b"}   # 'mystery' unmapped → skipped
+    assert got == {"box-a-gpu": "cont-a", "box-b-gpu": "cont-b"}   # 'mystery' unmapped → skipped
 
 
 def test_never_bounces_unmapped_when_map_empty():

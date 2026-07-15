@@ -60,9 +60,6 @@ autocommit-connect LISTEN loop / ``_enabled`` env gate) MIRRORS
 from __future__ import annotations
 
 import logging
-import os
-
-from queue_workflows.envcompat import env_get
 import threading
 import time
 from dataclasses import dataclass
@@ -71,6 +68,7 @@ from typing import Any, Callable
 from queue_workflows import worker_control
 from queue_workflows.config import get_config
 from queue_workflows.db import db_url
+from queue_workflows.envcompat import env_get
 from queue_workflows.llm_backends.base import LLMBackend
 from queue_workflows.llm_backends.ollama import OllamaBackend
 from queue_workflows.llm_backends.supervisor import LLMSupervisor
@@ -209,15 +207,45 @@ class BackendFactory:
 
     # ── URL resolution ───────────────────────────────────────────────────────
 
+    @staticmethod
+    def _topology_url() -> str | None:
+        """The per-box LLM server ROOT URL from the deployment topology YAML
+        (:mod:`queue_workflows.llm_backends.topology`), keyed by THIS box's
+        ``host_label`` — the value it exports as the engine's host-label env. Returns
+        ``None`` when no ``llm_topology_path`` is configured, no file/entry matches,
+        or the label env is unset — so the caller falls back to the env + localhost
+        default (the byte-compatible path for a consumer that never sets a topology).
+
+        Server-type-agnostic: the topology supplies the ADDRESS a box dispatches to;
+        the DB (worker_controls) still owns WHICH server type runs there. So the same
+        entry feeds both the ollama and vllm resolvers below."""
+        cfg = get_config()
+        path = cfg.llm_topology_path
+        if not path:
+            return None
+        host_label = env_get(cfg.host_label_env, "").strip()
+        if not host_label:
+            return None
+        from queue_workflows.llm_backends import topology
+
+        entry = topology.resolve(path, host_label)
+        return (entry or {}).get("url") or None
+
     def _ollama_base_url(self) -> str:
         if self._ollama_url_override is not None:
             return self._normalize_ollama(self._ollama_url_override)
+        topo = self._topology_url()
+        if topo:
+            return self._normalize_ollama(topo)
         raw = env_get(get_config().ollama_url_env, "").strip()
         return self._normalize_ollama(raw or DEFAULT_OLLAMA_URL)
 
     def _vllm_base_url(self) -> str:
         if self._vllm_url_override is not None:
             return self._normalize_vllm(self._vllm_url_override)
+        topo = self._topology_url()
+        if topo:
+            return self._normalize_vllm(topo)
         raw = env_get(get_config().vllm_url_env, "").strip()
         return self._normalize_vllm(raw or DEFAULT_VLLM_URL)
 
@@ -243,6 +271,14 @@ class BackendFactory:
         if server_type == worker_control.SERVER_TYPE_VLLM:
             return self._vllm_base_url()
         return self._ollama_base_url()
+
+    def resolve_base_url(self, server_type: str = worker_control.SERVER_TYPE_OLLAMA) -> str:
+        """The LLM server ROOT URL THIS box would dispatch to for ``server_type`` —
+        the per-box topology entry (keyed by this box's host_label) if set, else the
+        URL env, else the localhost/docker-host default. Public so a caller can PROBE
+        the endpoint (queue_workflows.llm_probe) without building a backend or
+        touching the DB — the heartbeat's observed-capability check uses it."""
+        return self._base_url_for(server_type)
 
     # ── the read-through cache ─────────────────────────────────────────────────
 
@@ -435,6 +471,12 @@ def get_backend(host_label: str, queue: str) -> LLMBackend:
 def invalidate(host_label: str, queue: str) -> None:
     """Process-wide :func:`BackendFactory.invalidate`."""
     _DEFAULT.invalidate(host_label, queue)
+
+
+def resolve_base_url(server_type: str = worker_control.SERVER_TYPE_OLLAMA) -> str:
+    """Process-wide :func:`BackendFactory.resolve_base_url` — this box's LLM ROOT URL
+    for ``server_type`` (topology → env → localhost default)."""
+    return _DEFAULT.resolve_base_url(server_type)
 
 
 def start() -> None:

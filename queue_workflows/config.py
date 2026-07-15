@@ -113,6 +113,15 @@ class EngineConfig:
     #: localhost defaults below when the env is unset.
     ollama_url_env: str = "QUEUE_WORKFLOWS_OLLAMA_URL"
     vllm_url_env: str = "QUEUE_WORKFLOWS_VLLM_URL"
+    #: OPTIONAL path to a per-box LLM-server TOPOLOGY YAML
+    #: (:mod:`queue_workflows.llm_backends.topology`). When set, the backend factory
+    #: resolves a box's LLM server ROOT URL by its ``host_label`` FROM THIS FILE
+    #: (best route per box — loopback on the server host, the fast interconnect from
+    #: a client host) IN PREFERENCE TO ``ollama_url_env`` / ``vllm_url_env``. The DB
+    #: still owns WHICH server type each box runs. ``None`` (default) ⇒ the env path
+    #: only, so every existing consumer is byte-compatible. See
+    #: ``docs/llm_topology.example.yml``.
+    llm_topology_path: str | None = None
     #: env vars holding the redis / mongodb DSN for those backends (read only when
     #: ``db_backend`` selects them). New names (no ai_leads equivalent).
     redis_url_env: str = "QUEUE_WORKFLOWS_REDIS_URL"
@@ -266,6 +275,22 @@ class EngineConfig:
     #: backend's own default (``kill_fn or _default_kill_fn``).
     vllm_stop_fn: Callable[[], bool] | None = None
     vllm_start_fn: Callable[[str], None] | None = None
+
+    # ── inference-server ON/OFF, tied to the GPU worker toggle (host-provided) ─
+    #: The operator GPU ON/OFF toggle (worker_controls, migration 0012) governs the
+    #: machine's inference SERVER too, not just the worker process: turning the GPU
+    #: worker OFF stops the box's LLM server (frees the GPU's VRAM), turning it ON
+    #: starts it. These are the host-wired levers. ``stop_fn()`` stops this machine's
+    #: server (e.g. ``docker stop broker-ollama`` over the UDS); ``start_fn()`` starts
+    #: it. SERVER-TYPE-AGNOSTIC — the host controls whatever it runs (ollama / vllm).
+    #: Distinct from ``vllm_{stop,start}_fn`` above (those drive the vllm backend's
+    #: IDLE reap + model switch; these track the operator DESIRED state). Both default
+    #: ``None`` ⇒ no-op, so a deployment that never wires them is unchanged — the GPU
+    #: toggle keeps parking only the worker, exactly as before. The worker calls them
+    #: GPU-lane-only + best-effort (a failure never blocks the stop/claim path). See
+    #: :func:`queue_workflows.set_inference_server_lifecycle`.
+    inference_server_start_fn: Callable[[], None] | None = None
+    inference_server_stop_fn: Callable[[], None] | None = None
 
     # ── per-host dead-worker bounce (host-provided) ───────────────────────────
     #: ``Callable[[host_label, queue, container], bool]`` — restart a wedged worker

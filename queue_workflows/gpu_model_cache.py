@@ -40,8 +40,14 @@ def gpu_model_cache() -> ModelCache:
     cache itself never imports psycopg."""
     global _GPU_MODEL_CACHE
     if _GPU_MODEL_CACHE is None:
+        # The box-wide model lease (gpu_model_lease). build_lease() returns a no-op
+        # lease unless a store is configured, so an un-opted-in deploy is unchanged;
+        # once a store IS set, this one process-wide cache is what claims the card.
+        from queue_workflows.gpu_model_lease import build_lease
+
         _GPU_MODEL_CACHE = ModelCache(
             publish_current_model=lambda m: _publish_current_model(m),
+            lease=build_lease(),
         )
     return _GPU_MODEL_CACHE
 

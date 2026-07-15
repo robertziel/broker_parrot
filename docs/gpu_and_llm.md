@@ -218,11 +218,34 @@ Server-root URLs are **not** part of the snapshot — they're deployment topolog
 
 A row trigger fires `pg_notify('worker_llm_config_changed', '<host>|<queue>')` — a **distinct** channel (`|` separator) from the 0012 `worker_control` channel (`:` separator), so an LLM-config edit is never mistaken for an ON/OFF change by the hard-stop `WorkerControlWatcher`; the trigger stays quiet on an UPDATE that touches none of the three LLM columns. Read via `worker_control.llm_config_for(host, queue)`, written via `worker_control.set_llm_config(...)` (a partial `COALESCE` upsert that never touches `desired_state`).
 
-The **root URL** is deliberately *not* in this table — it's per-host deployment topology (env), while *which server type* + its tunables is centrally operator-visible/editable state (DB). This split is why the factory's identity snapshot excludes the URL.
+The **root URL** is deliberately *not* in this table — it's per-host deployment topology (env, or the per-box YAML below), while *which server type* + its tunables is centrally operator-visible/editable state (DB). This split is why the factory's identity snapshot excludes the URL.
+
+### Per-box topology: which address each box dials (`llm_topology_path`)
+
+One env holding the URL is fine when every box talks to the same server, but a real fleet wants a **different address per box** — each keyed by its own `host_label`.
+
+Set `configure(llm_topology_path="…/llm_topology.yml")` and the backend factory resolves a box's LLM server ROOT URL **by its `host_label`** from that YAML, in preference to the env — so the engine hands each box the address of *its own* server. The file is deployment topology (real hostnames/IPs): keep the live one gitignored and commit a `.example` (see [`llm_topology.example.yml`](llm_topology.example.yml)).
+
+```yaml
+# llm_topology.yml — host_label → LLM server ROOT URL that box dispatches to
+boxes:
+  box-a-gpu:  http://host.docker.internal:11434  # serves its own model
+  box-b-gpu:  http://host.docker.internal:11434  # serves its own model
+  box-c-gpu:  http://host.docker.internal:11434  # serves its own model
+  default:    http://host.docker.internal:11434  # any box → itself
+```
+
+- **The rule: every GPU box serves its OWN model and dials itself** (`host.docker.internal`, the docker host gateway to the box's own server). Do **not** point one box at another's server — a single ollama serialises requests per model, so N boxes sharing one server queue behind each other while the borrowers' GPUs sit idle *and* still hold a claim slot showing `running`. Pointing several boxes at one server adds *clients*, not capacity. (This is the failure `llm_probe` was written to surface — see [Observed capability](#observed-capability-migration-0014).) If a box has no GPU, don't give it a `-gpu` lane at all.
+- Keyed by the box's own `host_label` (the value it exports as the engine's host-label env, e.g. `QUEUE_WORKFLOWS_HOST_LABEL`) — so a per-lane label like `box-b-gpu` is the key, not the bare hostname.
+- Server-type-agnostic — the same entry feeds both the ollama and vLLM resolvers; the DB still decides which type runs there.
+- **Opt-in + byte-compatible**: unset `llm_topology_path` (default), a missing file, or an unmatched box ⇒ the factory uses the env + `host.docker.internal` default — which is already "serve yourself", so the safe default matches the rule. A broken file never breaks dispatch (it logs + falls back).
+- The YAML is cached by `(path, mtime)`, so an operator edit needs no restart to be *re-read* — but `BackendFactory` caches the built backend per `(host, queue)` and only invalidates on the DB LLM-config NOTIFY, so a **running worker keeps its current URL until that entry is rebuilt**. Restart the worker when you want a topology edit to take effect immediately.
 
 ### Observed capability (migration 0014)
 
-`worker_heartbeats.llm_servers_available text[]` (default `{ollama}`) is the **observed** counterpart — which server types *this machine can actually run* — computed by the worker at startup and re-advertised every heartbeat, set via `queue_workflows.set_llm_servers_available([...])`. Distinct from 0013's *desired* config: vLLM (the CUDA `vllm/vllm-openai` sidecar) runs only on NVIDIA boxes, never on a ROCm control box, so a queue UI reads this list to **gate** its per-machine server-type control — disable the vLLM toggle on a host with no sidecar for it, so an operator can't route VLM calls at a non-existent endpoint.
+`worker_heartbeats.llm_servers_available text[]` (default `{ollama}`) is the **observed** counterpart — which server types *this machine can actually run* — re-advertised every heartbeat. A queue UI reads it to **gate** its per-machine server-type control: disable the vLLM toggle on a host with no sidecar for it, so an operator can't route VLM calls at a non-existent endpoint (vLLM, the CUDA `vllm/vllm-openai` sidecar, runs only on NVIDIA boxes, never on a ROCm box).
+
+**"Observed" means *probed*, not *declared* (`llm_probe`).** The column DEFAULTs to `{ollama}` and originally the worker just re-published a static config value that *also* defaulted to `["ollama"]` — so the field was a guess dressed as a fact. A GPU box running **no** LLM server still advertised `{ollama}`, drew an "OLLAMA · ON" chip, and (via a borrowing topology entry) dispatched every call to another box while its own GPU sat idle — invisibly, because nothing ever asked the endpoint. The GPU worker now wires `HeartbeatEmitter(llm_servers_fn=…)` to `llm_probe.probe_llm_servers(base_url)`, which GETs the box's resolved endpoint and advertises the server that **actually answers** — `[]` when none does. An empty list is the whole point: it makes "this box serves no model" a *visible* state, and the worker logs an ERROR (can't serve) or WARNING (dispatching to a remote box) at startup so the wiring is diagnosable from the log. `is_local_endpoint()` distinguishes serving-yourself from borrowing; the probe is stdlib-only (psycopg stays the one hard dep), HTTP-injected for tests, and never raises. cpu/ingest workers leave `llm_servers_fn` unset and keep publishing the config value unchanged.
 
 Both 0013 and 0014 are default-safe: a DB predating them (or an accessor call before they're applied) returns the all-defaults config / the `{ollama}` baseline, so the engine and any other consumer runs unchanged.
 

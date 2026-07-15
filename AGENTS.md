@@ -6,7 +6,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **broker_parrot** (Python package `queue_workflows` — the import/distribution name is unchanged for compatibility) is a standalone, pip-installable **Postgres-as-queue workflow engine**: a `SELECT … FOR UPDATE SKIP LOCKED` claim loop woken by `LISTEN`, lease reclaim, a DAG dispatcher with a durable outbox, a GPU warm-model cache, periodic ingest work, per-host hw-metrics telemetry, a durable per-node event log, and an operator worker ON/OFF control plane (`worker_control` — hard-stop/park a `(host, queue)` worker; see `docs/worker_control.md` and `docs/watchdogs.md`). **Postgres (via `psycopg` 3) is the only hard runtime dependency.**
 
-
 ## Who uses it / why the `ai_leads` defaults
 
 The engine was extracted from the **`ai_leads`** stack (its "Phase 6") so the ~35 sibling projects in that stack can share one DRY source instead of each carrying a copy. `ai_leads` is the origin and first consumer; it lives in a separate repo (not a sibling of this checkout). A **second consumer** — a non-DAG forecast service — drove the v0.2.0 multi-tenant-ingest generalization (host-defined ingest queues + per-job args; see *Two job families* below), so treat "host" as **≥2 distinct apps**, not just `ai_leads`, when generalizing.
