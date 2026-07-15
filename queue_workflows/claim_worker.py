@@ -1159,6 +1159,7 @@ class HeartbeatEmitter:
         self, *, queue: str, host_label: str, model_cache: Any = None,
         interval_s: float = HEARTBEAT_INTERVAL_S,
         concurrency_fn: Callable[[], int] | None = None,
+        llm_servers_fn: Callable[[], list[str]] | None = None,
     ) -> None:
         self._queue = queue
         self._host_label = host_label
@@ -1168,6 +1169,14 @@ class HeartbeatEmitter:
         # max(1, PAR) (its VLM pool size = the machine's GPU job concurrency);
         # cpu/ingest pass None ⇒ the historical constant 1.
         self._concurrency_fn = concurrency_fn
+        # OBSERVED llm capability provider, read each tick. The GPU worker wires
+        # this to a live endpoint probe (queue_workflows.llm_probe) so a box
+        # advertises the server it ACTUALLY answers on — [] when none does —
+        # instead of the static config guess that defaulted to ["ollama"] even on
+        # a box with no server (the incident this seam fixes). None ⇒ the historical
+        # behaviour: publish config.llm_servers_available unchanged, so cpu/ingest
+        # workers and other consumers are byte-compatible.
+        self._llm_servers_fn = llm_servers_fn
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         # Cached total-VRAM probe (stable hardware property; sampled once).
@@ -1255,12 +1264,28 @@ class HeartbeatEmitter:
                 concurrency=self._concurrency(),
                 current_model=self._current_model(),
                 known_models=known,
-                llm_servers_available=get_config().llm_servers_available,
+                llm_servers_available=self._llm_servers(),
                 vram_total_mb=vram_total,
                 fits_models=self._fits_models(known, vram_total),
             )
         except Exception:
             log.exception("[claim-worker:%s] heartbeat upsert failed", self._queue)
+
+    def _llm_servers(self) -> list[str]:
+        """The OBSERVED llm capability to advertise this tick. Prefer the injected
+        live probe (the GPU worker's endpoint check); fall back to the static
+        ``config.llm_servers_available`` when no probe is wired (cpu/ingest workers,
+        other consumers). A probe that raises must never break the heartbeat, so it
+        degrades to the config value rather than propagating."""
+        if self._llm_servers_fn is not None:
+            try:
+                return list(self._llm_servers_fn())
+            except Exception:
+                log.exception(
+                    "[claim-worker:%s] llm probe failed — falling back to config",
+                    self._queue,
+                )
+        return list(get_config().llm_servers_available)
 
     def _loop(self) -> None:
         # First tick already fired in start(); refresh until stopped.
@@ -1364,6 +1389,14 @@ class ClaimWorker:
         # the diffusion occupies one of the PAR slots. Plain bool: written by the
         # inline loop, read by the feeder thread (GIL-atomic; best-effort cap).
         self._inline_running = False
+        # ONLY-GPU gate: True while this box's LLM server is serving on the GPU (or
+        # is cold/unknown — optimistic). Set False
+        # by the heartbeat probe when the server fell back to CPU (NVML/cgroup loss,
+        # or a model too big for VRAM); the pool lane then SKIPS claiming no-model
+        # LLM-dispatch jobs so they route to a GPU-backed box, and resumes when the
+        # server returns to GPU. Defaults True so a cold worker is never blocked
+        # before its first probe. Only meaningful for a gpu worker. See llm_probe.
+        self._llm_gpu_ok = True
         # Cached total-VRAM probe for the capacity claim gate (migration 0015) —
         # stable hardware property, sampled once per worker process.
         self._vram_probed_claim = False
@@ -1379,6 +1412,12 @@ class ClaimWorker:
             queue=self.queue, host_label=self.host,
             model_cache=self.model_cache,
             concurrency_fn=(self._pool_parallelism if self.queue == "gpu" else None),
+            # GPU worker: advertise the llm server it ACTUALLY answers on, probed
+            # live from the box's resolved endpoint, so a box with no server shows
+            # [] (no "OLLAMA · ON" chip) instead of the static ["ollama"] guess that
+            # let a server-less box masquerade as capable. cpu/ingest keep the
+            # config default (llm_servers_fn=None).
+            llm_servers_fn=(self._probe_llm_servers if self.queue == "gpu" else None),
         )
         # This host's hw-metrics sampler — started in ``run_forever`` ONLY when
         # ``queue == 'gpu'`` (one gpu container per host ⇒ one sampler per host).
@@ -1394,6 +1433,55 @@ class ClaimWorker:
         return self.queue not in _NODE_QUEUES
 
     # ── claim ────────────────────────────────────────────────────────────
+
+    def _probe_llm_servers(self) -> list[str]:
+        """OBSERVED, GPU-verified llm capability for THIS gpu box's heartbeat.
+
+        Resolve the box's endpoint (per-box topology → env → default), probe what
+        actually answers, AND check the server is serving on the GPU — then set the
+        ONLY-GPU claim gate ``self._llm_gpu_ok`` and return the advertised server list.
+
+        * server answers, model on GPU (or cold/vllm) ⇒ advertise it, gate OPEN.
+        * server answers but serving on CPU (NVML/cgroup loss, or model over VRAM) ⇒
+          advertise ``[]`` (NOT a usable GPU server — no "OLLAMA · ON" chip) and CLOSE
+          the gate: the pool lane stops claiming so jobs route to a GPU-backed box.
+          Reopens automatically on the next probe once the server is back on GPU.
+        * no server at all ⇒ advertise ``[]``, gate CLOSED.
+
+        Never raises — the emitter falls back to config on any exception."""
+        from queue_workflows import llm_probe
+        from queue_workflows.llm_backends import factory as _llm_factory
+
+        base_url = _llm_factory.resolve_base_url()
+        servers = llm_probe.probe_llm_servers(base_url)
+        # vLLM is CUDA-only (a live vLLM is GPU by construction); only ollama can
+        # silently fall back to CPU, so only ollama is placement-probed.
+        placement = (
+            llm_probe.probe_gpu_placement(base_url)
+            if servers == [llm_probe.OLLAMA]
+            else llm_probe.GPU if servers else llm_probe.UNKNOWN
+        )
+        gpu_ok = llm_probe.gpu_usable(servers, placement)
+        self._llm_gpu_ok = gpu_ok
+        # Advertise only a GPU-usable server; a CPU-bound one reads as "no server".
+        advertised = servers if gpu_ok else []
+
+        if not servers:
+            log.error("%s", llm_probe.describe_endpoint(self.host, base_url, servers))
+        elif placement == llm_probe.CPU:
+            # Server up, but serving on CPU. Loud + actionable.
+            log.error(
+                "[llm] %s: LLM server at %s is serving on CPU, not GPU "
+                "(NVML/cgroup GPU loss, or model too big for VRAM). REFUSING to "
+                "claim GPU LLM jobs (policy: only GPU) until it returns to GPU — "
+                "restart the LLM server to recover its GPU.",
+                self.host, base_url,
+            )
+        elif not llm_probe.is_local_endpoint(base_url):
+            log.warning("%s", llm_probe.describe_endpoint(self.host, base_url, servers))
+        else:
+            log.info("%s", llm_probe.describe_endpoint(self.host, base_url, servers))
+        return advertised
 
     def _gpu_capacity_for_claim(self) -> tuple[int | None, list[str], bool]:
         """``(vram_total_mb, fits_models, has_models)`` for the GPU claim gate
@@ -1470,8 +1558,17 @@ class ClaimWorker:
         vLLM server which batches up to PAR requests on the GPU. These load NO
         warm model in-worker, so they run in a PAR-sized concurrent pool instead
         of the concurrency-1 inline lane. Disjoint from :meth:`_claim`'s
-        ``require_model=True`` set so the lanes never steal each other's rows."""
+        ``require_model=True`` set so the lanes never steal each other's rows.
+
+        ONLY-GPU gate: no-model jobs are LLM-dispatch (they POST to this box's LLM
+        server). If that server fell back to CPU (``self._llm_gpu_ok`` False, set by
+        the heartbeat probe), SKIP claiming — running the job here would run it on
+        CPU. The row stays queued for a GPU-backed box, and claiming resumes on its
+        own once the server is back on GPU. The two other skips (insufficient VRAM,
+        operator OFF) are enforced elsewhere (capacity gate / worker-control park)."""
         from queue_workflows import model_registry
+        if not self._llm_gpu_ok:
+            return None
         return node_queue.claim_next_gpu_job(
             0, None,
             host=self.host, lease_s=self.lease_s,
@@ -2120,6 +2217,26 @@ class ClaimWorker:
         )
         return True
 
+    def _start_inference_server(self) -> None:
+        """Start this machine's LLM server when this GPU worker enters its claiming
+        state (boot-ON, or unparked from OFF→ON) — the host-wired
+        ``EngineConfig.inference_server_start_fn``, the ON twin of the worker-control
+        OFF stop. GPU-lane only, best-effort (a failure never blocks claiming;
+        idempotent — starting an already-running server is a no-op). Unset ⇒ no-op."""
+        if self.queue != "gpu":
+            return
+        fn = get_config().inference_server_start_fn
+        if fn is None:
+            return
+        try:
+            fn()
+            log.info("[claim-worker:gpu] GPU ON — started the inference server")
+        except Exception:
+            log.exception(
+                "[claim-worker:gpu] inference_server_start_fn failed (ignored — "
+                "claiming proceeds; the server may already be up)",
+            )
+
     def run_forever(self) -> None:
         """Block on ``LISTEN <wake_channel>`` and drain the queue greedily on
         each wake (and on the 1 s safety poll for a dropped NOTIFY). Uses a
@@ -2156,6 +2273,11 @@ class ClaimWorker:
             self.queue, self.host, self.host_priority, self.lease_s,
             self._wake_channel,
         )
+        # GPU ON: the toggle governs the machine's inference server too — bring it up
+        # now that this gpu worker is (past the park gate and) about to claim. The
+        # OFF twin (worker_control._stop_inference_server) stopped it. No-op unless a
+        # host wired the lifecycle; idempotent if the server is already running.
+        self._start_inference_server()
         # Advertise capacity (no-op for fetch/load) + keep last_seen fresh.
         self.heartbeat.start()
         # (hw-metrics sampler already started above, before the park gate, so it

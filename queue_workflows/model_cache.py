@@ -75,7 +75,15 @@ class ModelCache:
         publish_current_model: Callable[[str | None], None] | None = None,
         idle_ttl_s: float | None = None,
         register_builtins: Callable[[], None] | None = None,
+        lease: Any | None = None,
     ) -> None:
+        # The one-model-per-GPU-BOX lease (queue_workflows.gpu_model_lease). The
+        # warm cache guarantees one model per PROCESS; N worker processes (one per
+        # project) on one card would still each warm their own model and contend
+        # for the same VRAM. When a lease is injected, a load must first ACQUIRE
+        # the box — a denial raises ModelLeaseDenied and we do NOT load. Default
+        # None ⇒ no arbitration (byte-identical to the pre-lease engine).
+        self._lease = lease
         # Injected "advertise current_model" side effect. Default no-op so
         # a plain ModelCache has zero external dependencies.
         self._publish = publish_current_model or (lambda _m: None)
@@ -135,6 +143,16 @@ class ModelCache:
             self.ensure_idle_reaper()
             if self._current_model == model_id and self._current_handle is not None:
                 return self._current_handle
+            # ── one model per GPU BOX ──────────────────────────────────────
+            # Claim the box BEFORE dropping/loading anything: if a live peer
+            # (another project's worker on this same card) holds a DIFFERENT
+            # model, acquire_or_raise() raises ModelLeaseDenied and we leave the
+            # cache exactly as it was — we must not free our model just to be
+            # refused, and must not add a second model to the card's VRAM. The
+            # job is then re-queued; warm-model affinity routes it to the box
+            # that already holds it (or it runs here once the peer unloads).
+            if self._lease is not None:
+                self._lease.acquire_or_raise(model_id)
             self.drop_cache()
             # Mid-swap: publish current_model=NULL so the dispatcher's
             # affinity routing doesn't try to pin a same-model job here
@@ -193,6 +211,14 @@ class ModelCache:
                 ctypes.CDLL("libc.so.6").malloc_trim(0)
             except Exception:
                 pass
+            # The VRAM is back — RELEASE the box so another worker (possibly one
+            # wanting a different model) may take it. Best-effort: a store blip
+            # must never break an unload; the holder's lease lapses anyway.
+            if self._lease is not None:
+                try:
+                    self._lease.release()
+                except Exception:
+                    log.exception("[ModelCache] box lease release failed (lease will lapse)")
 
     # ── busy tracking (the prerun/postrun bracket) ───────────────────────
 

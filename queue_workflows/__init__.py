@@ -47,6 +47,7 @@ __all__ = [
     "set_workflow_provider",
     "set_invoke_context",
     "set_vllm_lifecycle",
+    "set_inference_server_lifecycle",
     "set_worker_bounce",
     "set_gpu_lease_store",
     "set_llm_server_resolver",
@@ -72,6 +73,7 @@ def configure(
     node_module_package: str | None = None,
     host_label_env: str | None = None,
     host_priority_env: str | None = None,
+    llm_topology_path: str | None = None,
     container_prefix: str | None = None,
     project: str | None = None,
     ingest_queues: frozenset[str] | None = None,
@@ -108,6 +110,8 @@ def configure(
             cfg.host_label_env = host_label_env
         if host_priority_env is not None:
             cfg.host_priority_env = host_priority_env
+        if llm_topology_path is not None:
+            cfg.llm_topology_path = llm_topology_path
         if container_prefix is not None:
             cfg.container_prefix = container_prefix
         if project is not None:
@@ -267,6 +271,27 @@ def set_vllm_lifecycle(
     with cfg._lock:
         cfg.vllm_stop_fn = stop_fn
         cfg.vllm_start_fn = start_fn
+
+
+def set_inference_server_lifecycle(
+    start_fn: Callable[[], None] | None,
+    stop_fn: Callable[[], None] | None,
+) -> None:
+    """Wire the GPU ON/OFF toggle to this machine's inference SERVER on/off.
+
+    Turning the box's GPU worker OFF (worker_controls, migration 0012) stops the
+    server to free the GPU's VRAM; turning it ON starts it. ``start_fn() -> None``
+    starts this machine's LLM server, ``stop_fn() -> None`` stops it — the host wires
+    them to whatever it runs (e.g. ``docker start/stop broker-ollama`` over the UDS),
+    so the engine stays server-type-agnostic. Either ``None`` ⇒ that direction is a
+    no-op, so a deployment that never wires them keeps today's behaviour (the GPU
+    toggle parks only the worker). The worker invokes them GPU-lane-only and
+    best-effort. See
+    :attr:`queue_workflows.config.EngineConfig.inference_server_start_fn`."""
+    cfg = get_config()
+    with cfg._lock:
+        cfg.inference_server_start_fn = start_fn
+        cfg.inference_server_stop_fn = stop_fn
 
 
 def set_worker_bounce(fn: Callable[[str, str, str], bool] | None) -> None:

@@ -5,7 +5,51 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.0.3] — 2026-07-15
+
+### License
+- **Relicensed to the GNU Affero General Public License v3.0 or later**
+  (`AGPL-3.0-or-later`) — was PolyForm Noncommercial 1.0.0 in 1.0.2, MIT before
+  that. Matching [Open-Meteo](https://open-meteo.com/)'s licensing: a real
+  open-source (OSI-approved) copyleft license, so **commercial use is now
+  allowed**, on the condition that derivative works stay AGPL and
+  source-available — including when offered over a network (AGPL §13). Prior
+  releases remain available under the terms they shipped with (≤ 1.0.1 MIT,
+  1.0.2 PolyForm Noncommercial).
+
+### Added — per-box LLM serving
+- **Per-box LLM-server topology** (`configure(llm_topology_path=…)`) — an
+  optional YAML maps each worker box (by its `host_label`) to the LLM server ROOT
+  URL it dispatches to, so a fleet can give every GPU box its own local server
+  instead of pointing them all at one env-configured URL. The backend factory
+  prefers it over `ollama_url_env` / `vllm_url_env`, keyed by the box's label;
+  `resolve_base_url()` exposes a box's URL without building a backend. Opt-in +
+  byte-compatible (unset / missing file / unmatched box ⇒ the env + localhost
+  default). See `docs/gpu_and_llm.md`.
+- **Observed LLM-server capability** (`queue_workflows.llm_probe`) — the GPU
+  heartbeat now PROBES its resolved endpoint and advertises the server type that
+  actually answers, publishing `worker_heartbeats.llm_servers_available = []`
+  when none does, instead of a static default that could report a server the box
+  wasn't running.
+- **ONLY-GPU claim gate** — a GPU worker whose LLM nodes dispatch to an external
+  server now verifies that server is running the model on the GPU
+  (`probe_gpu_placement` reads ollama `/api/ps`). If it has fallen back to CPU (a
+  lost GPU device, or a model too large for VRAM), the no-model pool lane STOPS
+  claiming LLM jobs so they route to a GPU-backed box, and resumes automatically
+  once the server is back on the GPU. The only other skips remain insufficient
+  VRAM (capacity gate) and the operator OFF toggle.
+- **GPU toggle governs the inference server**
+  (`set_inference_server_lifecycle(start_fn, stop_fn)`) — turning a box's GPU
+  worker OFF now also stops the machine's LLM server (freeing VRAM), and turning
+  it ON starts it. GPU-lane-only, best-effort, and a no-op unless wired.
+
+### Changed
+- **One-model-per-GPU-box lease wired into `ModelCache`** — the arbitration
+  primitives added in 1.0.2 are now active on the warm-model load path (they were
+  opt-in primitives only). Still inert without a configured lease store, so the
+  default behavior is unchanged.
+- New optional extra **`topology`** (PyYAML) — required only to parse the per-box
+  topology YAML; psycopg remains the sole hard runtime dependency.
 
 ## [1.0.2] — 2026-07-13
 

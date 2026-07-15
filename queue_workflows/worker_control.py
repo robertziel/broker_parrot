@@ -437,6 +437,28 @@ def _apply_hard_stop(worker: Any, *, on_exit: Callable[[int], None]) -> None:
     on_exit(EXIT_CONTROL_HARD_STOP)
 
 
+def _stop_inference_server(queue: str) -> None:
+    """Stop this machine's LLM server (free the GPU's VRAM) when its GPU worker is
+    turned OFF — the host-wired ``EngineConfig.inference_server_stop_fn``. GPU-lane
+    only (a cpu/download OFF must not stop ollama), and best-effort: a failure is
+    logged and swallowed so it can NEVER block the OFF hard-stop that follows. Unset
+    hook ⇒ no-op."""
+    if queue != "gpu":
+        return
+    from queue_workflows.config import get_config
+    fn = get_config().inference_server_stop_fn
+    if fn is None:
+        return
+    try:
+        fn()
+        log.info("[worker-control:gpu] GPU OFF — stopped the inference server (freed VRAM)")
+    except Exception:
+        log.exception(
+            "[worker-control:gpu] inference_server_stop_fn failed (ignored — "
+            "the worker hard-stop proceeds regardless)",
+        )
+
+
 #: Stop-policy registry: ``policy name -> handler(worker, *, on_exit)``. The
 #: extensibility seam — add ``"drain"`` / ``"pause"`` here (each a new handler)
 #: with no migration or API change. ``set_worker_control`` validates a requested
@@ -494,6 +516,12 @@ class WorkerControlWatcher:
             return False
         if not row or row.get("desired_state") != STATE_OFF:
             return False
+        # GPU toggle governs the machine's inference SERVER too: turning the gpu
+        # worker OFF stops the box's LLM server to free the GPU's VRAM. Policy-
+        # independent (any OFF), gpu-lane-only, best-effort, and BEFORE the exit so
+        # the VRAM is released as we go down. A CPU/download lane OFF never touches
+        # the server. Unset hook ⇒ no-op (byte-compatible).
+        _stop_inference_server(self._queue)
         policy = row.get("stop_policy") or "hard"
         handler = STOP_POLICIES.get(policy)
         if handler is None:

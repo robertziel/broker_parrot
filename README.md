@@ -10,7 +10,7 @@ _Python package: **`queue_workflows`** (import name unchanged) · built on Postg
 
 Orchestrate work across a handful of heterogeneous CPU/GPU boxes with nothing but a database you already run. No Celery, no Redis to babysit, no cluster scheduler. Insert a row and the work is enqueued; a dead worker's lease lapses and its job re-runs somewhere healthy.
 
-[![License: PolyForm Noncommercial](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue.svg)](LICENSE)
+[![License: AGPL v3](https://img.shields.io/badge/license-AGPL%20v3%20or%20later-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](#installation)
 [![SQLite](https://img.shields.io/badge/sqlite-default-003B57.svg)](#installation)
 [![Postgres](https://img.shields.io/badge/postgres-14%2B-336791.svg)](#installation)
@@ -529,14 +529,20 @@ The [`docs/`](docs/) set:
 
 ## 📦 Background
 
-The engine was extracted from a larger self-hosted stack into this standalone, source-available package so it can be reused and shared on its own. Contributions — bug reports, backend providers, docs, and rough edges — are welcome.
+The engine was extracted from a larger self-hosted stack into this standalone, open-source package so it can be reused and shared on its own. Contributions — bug reports, backend providers, docs, and rough edges — are welcome.
 
 ---
 
 ## ⚖️ License
 
-**PolyForm Noncommercial 1.0.0** © Robert Zieliński — see [`LICENSE`](LICENSE).
-Free for any **noncommercial** purpose (personal projects, research, education,
-nonprofits — see the license's noncommercial definition). For commercial use,
-contact the author for a commercial license. Versions ≤ 1.0.1 were published
-under MIT and remain available under those terms.
+**GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)**
+© Robert Zieliński — see [`LICENSE`](LICENSE).
+
+Free to use, modify, and distribute — **including commercially** — provided
+derivative works stay under the AGPL and remain source-available. AGPL §13 extends
+that to networked use: if you run a modified version of this engine as a service
+that users interact with over a network, those users must be offered its source.
+Simply *running* an unmodified copy behind your own app triggers no obligation.
+
+Previous releases stay under the terms they shipped with: versions ≤ 1.0.1 under
+MIT, version 1.0.2 under PolyForm Noncommercial 1.0.0.
