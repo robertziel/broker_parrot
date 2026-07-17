@@ -36,9 +36,19 @@ from urllib.parse import urlsplit
 
 log = logging.getLogger(__name__)
 
-#: The two server types the engine knows (mirrors ``worker_control.SERVER_TYPE_*``).
+#: The serving-path KINDS the engine arbitrates on a box. ``ollama``/``vllm`` are LLM
+#: servers (mirrors ``worker_control.SERVER_TYPE_*``); ``comfyui`` is a diffusion
+#: server; ``inprocess`` is a model loaded in the worker's own process (the native
+#: ``ModelCache`` path, e.g. sdxl). One box may hold at most one kind at a time.
 OLLAMA = "ollama"
 VLLM = "vllm"
+COMFYUI = "comfyui"
+INPROCESS = "inprocess"
+
+#: Torch-allocator VRAM (bytes) above which a ComfyUI is judged to HOLD a model. A bare
+#: ComfyUI keeps only its CUDA context (hundreds of MB); a loaded diffusion model is
+#: several GB — so a 1 GiB floor cleanly separates "serving a model" from "just up".
+COMFYUI_MODEL_VRAM_FLOOR = 1 << 30
 
 #: Default probe timeout. Deliberately short — this runs on the heartbeat path, and a
 #: slow/dead LLM server must never stall the worker's liveness signal. A server that
@@ -160,6 +170,188 @@ def probe_gpu_placement(
     return GPU
 
 
+def loaded_models(
+    base_url: str | None,
+    *,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+    get_json_fn=None,
+) -> list[str]:
+    """The model ids ollama currently holds resident at ``base_url`` (``/api/ps``),
+    or ``[]`` when nothing is loaded / the endpoint is unreachable / not ollama.
+    Never raises — the idle reaper treats any failure as "nothing to unload"."""
+    if not base_url:
+        return []
+    get_json = get_json_fn or _default_get_json
+    try:
+        data = get_json(f"{str(base_url).rstrip('/')}/api/ps", timeout_s)
+        models = data.get("models") if isinstance(data, dict) else None
+        return [str(m["name"]) for m in (models or []) if isinstance(m, dict) and m.get("name")]
+    except Exception:
+        return []
+
+
+def _parse_rfc3339(ts: str) -> float:
+    """Best-effort RFC3339 → epoch seconds (0.0 on any failure). ollama emits
+    nanosecond fractions which ``fromisoformat`` rejects, so the fraction is
+    trimmed to microseconds first."""
+    import re
+    from datetime import datetime
+
+    try:
+        ts = re.sub(r"\.(\d{6})\d+", r".\1", str(ts)).replace("Z", "+00:00")
+        return datetime.fromisoformat(ts).timestamp()
+    except Exception:
+        return 0.0
+
+
+def loaded_models_info(
+    base_url: str | None,
+    *,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+    get_json_fn=None,
+) -> list[dict]:
+    """Like :func:`loaded_models` but with a recency key per model:
+    ``[{"name": ..., "mru": <epoch-ish float>}]``. ``expires_at`` (last use +
+    keep_alive) is the recency proxy — a later expiry means a more recent use — so
+    the residency enforcer can keep the most-recently-used model deterministically.
+    Never raises; ``[]`` on any failure."""
+    if not base_url:
+        return []
+    get_json = get_json_fn or _default_get_json
+    try:
+        data = get_json(f"{str(base_url).rstrip('/')}/api/ps", timeout_s)
+        models = data.get("models") if isinstance(data, dict) else None
+        return [
+            {"name": str(m["name"]), "mru": _parse_rfc3339(m.get("expires_at", ""))}
+            for m in (models or []) if isinstance(m, dict) and m.get("name")
+        ]
+    except Exception:
+        return []
+
+
+def vllm_served_models(
+    base_url: str | None,
+    *,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+    get_json_fn=None,
+) -> list[str]:
+    """The model id(s) a vLLM at ``base_url`` is serving (OpenAI ``/v1/models``).
+    A vLLM pins its model for the server's lifetime, so a non-empty answer means
+    that model is resident in VRAM right now. Never raises; ``[]`` on any failure
+    (including "that URL is not a vLLM")."""
+    if not base_url:
+        return []
+    get_json = get_json_fn or _default_get_json
+    try:
+        data = get_json(f"{str(base_url).rstrip('/')}/v1/models", timeout_s)
+        rows = data.get("data") if isinstance(data, dict) else None
+        return [str(m["id"]) for m in (rows or []) if isinstance(m, dict) and m.get("id")]
+    except Exception:
+        return []
+
+
+def _default_post_json(url: str, payload, timeout_s: float) -> int:
+    """POST ``payload`` as JSON, return the HTTP status. stdlib only."""
+    import json
+    import urllib.request
+
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # noqa: S310
+        return int(resp.status)
+
+
+def unload_ollama_models(
+    base_url: str | None,
+    models,
+    *,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+    post_fn=None,
+) -> list[str]:
+    """Unload each of ``models`` from the ollama at ``base_url`` — a ``keep_alive: 0``
+    request drops it from VRAM immediately (the documented ollama unload). Returns the
+    ids actually asked to unload; per-model best-effort, so one failure never blocks
+    the rest and the function never raises."""
+    if not base_url:
+        return []
+    post = post_fn or _default_post_json
+    root = str(base_url).rstrip("/")
+    done: list[str] = []
+    for m in models:
+        try:
+            post(f"{root}/api/generate", {"model": m, "keep_alive": 0}, timeout_s)
+            done.append(m)
+        except Exception:
+            log.debug("[llm-probe] unload of %s at %s failed (ignored)", m, root)
+    return done
+
+
+def comfyui_loaded(
+    base_url: str | None,
+    *,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+    get_json_fn=None,
+    vram_floor: int = COMFYUI_MODEL_VRAM_FLOOR,
+) -> bool:
+    """Is the ComfyUI at ``base_url`` currently holding a model in VRAM?
+
+    ComfyUI exposes no "current checkpoint" endpoint, but ``/system_stats`` reports the
+    torch allocator per device (``torch_vram_total`` − ``torch_vram_free`` = what
+    ComfyUI itself holds). A loaded diffusion model is GBs; a bare, model-less ComfyUI
+    is only its CUDA context. So "torch VRAM in use ≥ ``vram_floor``" is the residency
+    signal — it counts ComfyUI's OWN allocation, not co-tenants', so a neighbouring
+    ollama does not make it read loaded. ``True`` only when ComfyUI answers AND holds a
+    model. Never raises (``False`` on any failure / unreachable / not-ComfyUI)."""
+    if not base_url:
+        return False
+    get_json = get_json_fn or _default_get_json
+    try:
+        data = get_json(f"{str(base_url).rstrip('/')}/system_stats", timeout_s)
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    used = 0
+    for dev in data.get("devices") or []:
+        if not isinstance(dev, dict):
+            continue
+        try:
+            total = int(dev.get("torch_vram_total") or 0)
+            free = int(dev.get("torch_vram_free") or 0)
+        except (TypeError, ValueError):
+            continue
+        if total > 0 and free >= 0:
+            used += max(0, total - free)
+    return used >= int(vram_floor)
+
+
+def comfyui_free(
+    base_url: str | None,
+    *,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+    post_fn=None,
+) -> bool:
+    """Evict lever for ComfyUI: POST ``/free`` with ``unload_models`` + ``free_memory``
+    so ComfyUI drops its loaded models and releases VRAM — the ComfyUI equivalent of
+    ollama's ``keep_alive: 0``. ``True`` iff the server accepted it (2xx). Never raises
+    (``False`` on any failure), so a dead ComfyUI can't wedge the caller."""
+    if not base_url:
+        return False
+    post = post_fn or _default_post_json
+    try:
+        status = post(
+            f"{str(base_url).rstrip('/')}/free",
+            {"unload_models": True, "free_memory": True},
+            timeout_s,
+        )
+        return 200 <= int(status) < 300
+    except Exception:
+        log.debug("[llm-probe] comfyui /free at %s failed (ignored)", base_url)
+        return False
+
+
 def gpu_usable(servers: list[str], placement: str) -> bool:
     """The one predicate the GPU claim gate reads: may this box take GPU LLM work?
 
@@ -220,6 +412,9 @@ def endpoint_is_healthy(base_url: str | None, servers: list[str]) -> bool:
 __all__ = [
     "OLLAMA",
     "VLLM",
+    "COMFYUI",
+    "INPROCESS",
+    "COMFYUI_MODEL_VRAM_FLOOR",
     "GPU",
     "CPU",
     "UNKNOWN",
@@ -227,6 +422,12 @@ __all__ = [
     "probe_llm_servers",
     "probe_gpu_placement",
     "gpu_usable",
+    "loaded_models",
+    "loaded_models_info",
+    "vllm_served_models",
+    "unload_ollama_models",
+    "comfyui_loaded",
+    "comfyui_free",
     "is_local_endpoint",
     "describe_endpoint",
     "endpoint_is_healthy",

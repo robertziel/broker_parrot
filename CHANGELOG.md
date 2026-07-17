@@ -5,6 +5,59 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.4] — 2026-07-17
+
+### Added — one model per physical GPU box (cross-project arbitration)
+- **Run-path box lease** (`gpu_model_lease`) — every GPU worker acquires the
+  physical box for its effective model before executing; a live peer holding a
+  DIFFERENT model makes the job spill (re-queue to a free/matching box), while
+  the same model is shared. Coordinates across projects and across uids (root
+  containers + non-root host processes) through one box-local flock file, made
+  world-writable so mixed-uid participants can all join.
+- **Per-box slot arbiter** — `claim_next_gpu_job(max_running=…)` refuses an
+  over-claim in the claim SQL itself, so per-box concurrency is DB-enforced
+  rather than living in per-lane in-process counters.
+- **Residency enforcer + last-defence load gate** (`model_residency`,
+  `ModelCache.pre_load_check`) — a box holds at most one distinct model / one
+  server KIND (ollama / vLLM / ComfyUI / in-process); a second is evicted via
+  its own lever (or the load is refused) and reported in the daemon log.
+- **Idle external-LLM unload** — after a box does no GPU work for
+  `QUEUE_WORKFLOWS_LLM_SERVER_IDLE_TTL_S` (default 300 s) its GPU worker unloads
+  the resident LLM to free unified memory; reloads on demand.
+- **Box-addressed worker-control rows** — `get_worker_control` / `llm_config_for`
+  fall back to a `(box, queue)` row so one control governs every lane on a box.
+
+### Added — per-node-job physical-box placement (migration 0020)
+- `workflow_node_jobs.avoid_box` / `force_box` (`text[]`, NULL = unconstrained)
+  let a queued job be pinned to or excluded from physical boxes by name; the
+  cpu+gpu claim SQL ANDs the constraint in so an ineligible box never claims.
+  Threaded through `enqueue_node_job`, the dispatcher, and the worker's box
+  identity. See `docs/box_placement.md`.
+
+### Added — hardware flight recorder (migration 0021)
+- **`hw_watch`** — opt-in (`QUEUE_WORKFLOWS_HW_WATCH=1`) two-tier persisted
+  hardware telemetry (`detail` 2 s / 1 h + `history` 60 s / 24 h): per-GPU
+  temperature, power draw (average + instantaneous), SM clock, utilisation,
+  throttle-reason mask, and the nvidia-smi **Violation** counters (accumulated
+  per-cause throttle time), every thermal zone, hwmon temps, meminfo, load and
+  disk. Best-effort writes (own connection, swallow-on-failure) driven by the
+  existing sampler thread or the standalone `queue-hw-watch` CLI; pruned on a
+  NodePool sweep. `throttle_index()` collapses the mask to a 0–100 severity;
+  `power_brake()` flags the power-delivery echo. See `docs/hw_watch.md`.
+
+### Reliability
+- **Fast zombie/ghost reclaim** — worker-boot self-reclaim, orchestrator
+  flagged-worker fast-reclaim (~30 s), and a **frozen-lease sweep** that
+  re-queues a `running` row whose lease stopped renewing (~35 s) instead of
+  waiting out the full lease — catching the fast-restart case heartbeat-keyed
+  paths can't see. Orphan-cancel of terminal-run queued jobs now defaults on.
+- **Anti-starvation break** for the fill-before-spill VLM-pool gate — a
+  draining top box never lets claimable work age past
+  `QUEUE_WORKFLOWS_VLM_POOL_MAX_DEFER_AGE_S` (default 20 s), so a busy/blind
+  top box can't starve the fleet (deadlock-proof).
+- Box lease is held for a job's whole lifetime (counter-based), flicker-proof
+  against a transient residency blip.
+
 ## [1.0.3] — 2026-07-15
 
 ### License

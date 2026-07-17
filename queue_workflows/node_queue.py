@@ -85,8 +85,16 @@ def enqueue_node_job(
     priority: int = 100,
     pipeline_name: str | None = None,
     project: str | None = None,
+    avoid_box: Iterable[str] | None = None,
+    force_box: Iterable[str] | None = None,
 ) -> str:
     """Insert a fresh ``queued`` node-job row. Returns the row id.
+
+    ``avoid_box`` / ``force_box`` (migration 0020) are optional PHYSICAL-BOX
+    placement constraints, by BOX NAME (``gpu_model_lease.default_box_id()`` —
+    NOT ``host_label``): the job may run ONLY on a box in ``force_box`` (when set)
+    and NEVER on a box in ``avoid_box``. Empty / ``None`` ⇒ stored NULL =
+    unconstrained (every box eligible). The claim SQL enforces both.
 
     ``project`` (migration 0017) is the tenant tag stamped on the row; ``None``
     ⇒ this client's ``config.project``. The dispatcher passes the parent run's
@@ -107,6 +115,12 @@ def enqueue_node_job(
     if queue == "cpu" and required_model:
         raise ValueError("cpu node-job must not set required_model")
 
+    from queue_workflows.dialect import get_dialect
+    _d = get_dialect()
+    # Empty ⇒ NULL (unconstrained); a stray empty force_box must never strand the row.
+    _avoid = [b for b in (avoid_box or []) if b] or None
+    _force = [b for b in (force_box or []) if b] or None
+
     row_id = str(uuid.uuid4())
     with connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -115,17 +129,21 @@ def enqueue_node_job(
                 (id, run_id, pipeline_name, node_id, node_module,
                  queue, required_model, project,
                  status, priority, inputs, context_delta,
+                 avoid_box, force_box,
                  created_at)
             VALUES
                 (%s, %s, %s, %s, %s,
                  %s, %s, %s,
                  'queued', %s, %s, '{}'::jsonb,
+                 %s, %s,
                  now())
             """,
             (
                 row_id, run_id, pipeline_name, node_id, node_module,
                 queue, required_model, _project(project),
                 priority, _as_json(inputs or {}),
+                _d.array_literal(_avoid) if _avoid else None,
+                _d.array_literal(_force) if _force else None,
             ),
         )
     return row_id
@@ -224,6 +242,21 @@ DEFAULT_LEASE_S = 600
 # dead. Env-overridable for ops tuning.
 STALE_WORKER_AFTER_S = 30
 
+# ANTI-STARVATION for the fill-before-spill pool gate: a box may DEFER a no-model
+# claim to let a higher-ranked peer fill first (bin-packing) — but ONLY while the work
+# is actually draining. If any claimable no-model job has been queued longer than this,
+# deferral is OFF for everyone and the job is claimed NOW, no matter the ranking. This
+# is the liveness guarantee that makes the gate deadlock-proof: the DB-only capacity view
+# is BLIND to cross-project box occupancy (a top-ranked box whose card is held for
+# another project's diffusion model can only SPILL the LLM work, yet still reads as
+# "free capacity"), so without a starvation break the lower boxes would defer forever
+# while the work bounces on the occupied box. Short by design — long enough for a healthy
+# top box to drain a cycle, short enough that a stuck one never starves the fleet.
+# Env-overridable (``QUEUE_WORKFLOWS_VLM_POOL_MAX_DEFER_AGE_S``).
+VLM_POOL_MAX_DEFER_AGE_S = int(
+    env_get("QUEUE_WORKFLOWS_VLM_POOL_MAX_DEFER_AGE_S", "20") or "20"
+)
+
 
 def _stale_worker_after_s() -> int:
     raw = (env_get("QUEUE_WORKFLOWS_STALE_WORKER_AFTER_S", "") or "").strip()
@@ -275,6 +308,7 @@ WHERE j.id = (
           WHERE r.id = c.run_id
             AND r.status NOT IN ('cancelled', 'failed')
       )
+      {placement}
       {capability}
     ORDER BY {order}
     {skip_locked}
@@ -282,6 +316,29 @@ WHERE j.id = (
 )
 RETURNING *
 """
+
+
+def _placement_terms() -> str:
+    """The box-placement WHERE fragment (migration 0020) — shared by the cpu + gpu
+    claims so a worker only ever grabs a row its PHYSICAL box is eligible for. Reads
+    the ``%(box)s`` param (the claiming worker's ``default_box_id()``):
+
+      * ``avoid_box`` — excluded when this box is listed;
+      * ``force_box`` — required to be listed when the array is set.
+
+    NULL arrays ⇒ no constraint (the ``IS NULL`` short-circuit), so an unconstrained
+    row is byte-identical to pre-0020. A ``NULL`` box param (a worker that resolved no
+    box) fails BOTH inner tests, so it claims ONLY unconstrained rows — the safe
+    default (it can't verify a constraint it can't name). Dialect-portable
+    (pg ``= ANY``, sqlite ``json_each``)."""
+    from queue_workflows.dialect import get_dialect
+    _d = get_dialect()
+    in_avoid = _d.array_contains_value("c.avoid_box", "%(box)s")
+    in_force = _d.array_contains_value("c.force_box", "%(box)s")
+    return (
+        f"AND (c.avoid_box IS NULL OR NOT ({in_avoid})) "
+        f"AND (c.force_box IS NULL OR ({in_force}))"
+    )
 
 
 def _affinity_term() -> str:
@@ -311,6 +368,7 @@ def claim_next_cpu_job(
     lease_s: int = DEFAULT_LEASE_S,
     host_priority: int = 0,
     project: str | None = None,
+    box: str | None = None,
 ) -> dict[str, Any] | None:
     """Atomically grab the next queued CPU job (the CPU claim worker's
     claim).
@@ -320,13 +378,17 @@ def claim_next_cpu_job(
     CPU has no model cache, so there's no warm-affinity term; ordering
     is ``is_priority DESC`` (the operator "run next" flag jumps the queue),
     then ``priority ASC``, then the ``host_priority``-directed creation
-    tiebreak."""
+    tiebreak.
+
+    ``box`` (migration 0020) is the claiming worker's PHYSICAL box name; the claim
+    skips rows this box is ineligible for (``avoid_box`` / ``force_box``). ``None``
+    ⇒ claim only unconstrained rows."""
     from queue_workflows.dialect import get_dialect
     _d = get_dialect()
     order = f"c.is_priority DESC, c.priority ASC, {_host_dir_term()}"
     # CPU jobs carry no required_model, so no capability gate applies.
     sql = _CLAIM_SQL.format(
-        order=order, capability="",
+        order=order, capability="", placement=_placement_terms(),
         lease_expr=_d.future_seconds("%(lease_s)s"), skip_locked=_d.skip_locked,
     )
     params = {
@@ -336,6 +398,7 @@ def claim_next_cpu_job(
         "queue": "cpu",
         "project": _project(project),
         "host_dir": _host_dir(host_priority),
+        "box": box or None,
     }
     with connection() as conn, conn.cursor() as cur:
         cur.execute(sql, params)
@@ -353,9 +416,20 @@ def claim_next_gpu_job(
     require_model: bool | None = None,
     pool_modules: Iterable[str] | None = None,
     project: str | None = None,
+    max_running: int | None = None,
+    box: str | None = None,
 ) -> dict[str, Any] | None:
     """Atomically grab the next queued GPU job (the GPU claim worker's
     claim).
+
+    ``box`` (migration 0020) is the claiming worker's PHYSICAL box name; the claim
+    skips rows this box is ineligible for (``avoid_box`` / ``force_box``). ``None``
+    ⇒ claim only unconstrained rows.
+
+    ``max_running`` — THE BOX-SLOT ARBITER: when set, the claim is refused while
+    this ``host`` already has that many ``running`` gpu rows (same project). The
+    single centralized per-box concurrency gate every claim path funnels through;
+    ``None`` keeps the legacy unbounded claim.
 
     Same lease + run-cancel guard as :func:`claim_next_cpu_job`, plus:
 
@@ -427,9 +501,23 @@ def claim_next_gpu_job(
             )
         else:
             capability_terms.append("AND c.required_model IS NULL")
+    if max_running is not None and host:
+        # THE BOX-SLOT ARBITER — the one centralized per-box concurrency gate.
+        # Refuse the claim inside the claim statement itself when this box already
+        # has >= max_running rows running (same queue + project). Every claim path
+        # funnels here — inline lane, pool lane, a second process — so process-local
+        # counters can no longer disagree their way into a 2/1 over-claim, and a
+        # zombie row (a thread that died without finalizing) keeps its slot
+        # occupied until the lease reclaim frees it instead of being stacked on.
+        capability_terms.append(
+            "AND (SELECT COUNT(*) FROM workflow_node_jobs r "
+            "     WHERE r.status = 'running' AND r.queue = %(queue)s "
+            "       AND r.claimed_by = %(host)s AND r.project = %(project)s) "
+            "< %(max_running)s"
+        )
     capability = " ".join(capability_terms)
     sql = _CLAIM_SQL.format(
-        order=order, capability=capability,
+        order=order, capability=capability, placement=_placement_terms(),
         lease_expr=_d.future_seconds("%(lease_s)s"), skip_locked=_d.skip_locked,
     )
     params = {
@@ -440,12 +528,22 @@ def claim_next_gpu_job(
         "project": _project(project),
         "current_model": current_model,
         "host_dir": _host_dir(host_priority),
+        "box": box or None,
     }
     if known:
         params["known_models"] = _d.array_param(known)
     if pool:
         params["pool_modules"] = _d.array_param(pool)
+    if max_running is not None and host:
+        params["max_running"] = int(max_running)
     with connection() as conn, conn.cursor() as cur:
+        if max_running is not None and host:
+            # Serialize claims per box (pg advisory xact lock; sqlite's single
+            # writer needs none) so two concurrent claimants can't both read
+            # "N-1 running" and both take the last slot.
+            ser = _d.box_claim_serializer()
+            if ser:
+                cur.execute(ser, params)
         cur.execute(sql, params)
         return cur.fetchone()
 
@@ -490,7 +588,8 @@ def vlm_pool_should_defer(
     short-circuited by ``EXISTS``. ``stale_s`` mirrors the heartbeat freshness
     window (default :data:`STALE_WORKER_AFTER_S` = 30 s)."""
     sql = """
-        SELECT EXISTS (
+        SELECT (
+          EXISTS (
             SELECT 1
               FROM worker_heartbeats r
               LEFT JOIN (
@@ -512,12 +611,31 @@ def vlm_pool_should_defer(
                )
                -- R still has free VLM capacity
                AND COALESCE(j.running_no_model, 0) < r.concurrency
+          )
+          -- ANTI-STARVATION: never defer while a claimable no-model job is AGING. If the
+          -- top box were draining, nothing would age past the window; a job older than it
+          -- means the higher peer ISN'T taking the work (e.g. its card is held for another
+          -- project's model, so it can only spill) — so claim NOW instead of deferring
+          -- forever. Guarantees liveness the DB-only capacity view can't (it's blind to
+          -- the box lease). "Claimable" = parent run still running (not a ghost).
+          AND NOT EXISTS (
+            SELECT 1
+              FROM workflow_node_jobs sj
+              JOIN workflow_runs sr ON sr.id::text = sj.run_id
+             WHERE sj.queue = 'gpu'
+               AND sj.status = 'queued'
+               AND sj.required_model IS NULL
+               AND sj.project = %(project)s
+               AND sr.status = 'running'
+               AND sj.created_at < now() - make_interval(secs => %(starve_s)s)
+          )
         ) AS should_defer
     """
     params = {
         "host": host_label,
         "par": int(par),
         "stale_s": max(1, int(stale_s)),
+        "starve_s": max(1, int(VLM_POOL_MAX_DEFER_AGE_S)),
         "project": _project(project),
     }
     with connection() as conn, conn.cursor() as cur:
@@ -1137,6 +1255,148 @@ def requeue_running_for_worker(
             (host_label, queue, _project(project)),
         )
         return cur.rowcount or 0
+
+
+def requeue_running_if_worker_stale(
+    host_label: str, queue: str, *,
+    project: str | None = None, stale_after_s: int | None = None,
+) -> int:
+    """FAST zombie reclaim: re-queue a worker's ``running`` rows NOW — but only
+    while that worker's heartbeat is STALE (or absent), i.e. nobody with this
+    ``(host_label, queue, project)`` identity is alive.
+
+    This is the conditional twin of :func:`requeue_running_for_worker`, and the
+    fast path the 600 s lease-reclaim deliberately isn't: the lease is long so a
+    LIVE worker's renewal hiccup never gets it reclaimed, which meant a DEAD
+    worker's job camped the box's slot for up to the whole lease. The heartbeat
+    is the fast liveness signal (10 s cadence, stale at
+    :data:`STALE_WORKER_AFTER_S` = 30 s), so keying the reclaim on it frees the
+    slot in seconds-to-~30 s instead.
+
+    SAFE FOR MULTI-PROCESS LANES (30 cpu procs share one label): any live sibling
+    keeps the heartbeat fresh, and a claim can only happen AFTER the claimer's
+    first beat (``run_forever`` starts the heartbeat before the claim loop), so
+    "claimed row + stale heartbeat" can never describe a live job. The staleness
+    check rides IN the UPDATE statement (one atomic snapshot, no check-then-act
+    race), and double-run is prevented by the standard guarantee: clearing
+    ``claimed_by`` trips a still-alive claimant's JobStatusWatcher.
+
+    RESUME-STYLE like the operator-stop requeue: front-of-queue, NO
+    ``watchdog_retries`` bump — a dead process is an operational loss, not a node
+    fault. Returns the rows re-queued (0 when the worker is alive)."""
+    threshold = STALE_WORKER_AFTER_S if stale_after_s is None else int(stale_after_s)
+    table = "ingest_jobs" if queue in _ingest_queues() else "workflow_node_jobs"
+    front = "" if table == "ingest_jobs" else ", is_priority = TRUE"
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            f"""
+            UPDATE {table} AS t
+            SET status = 'queued',
+                started_at = NULL,
+                claimed_by = NULL,
+                lease_expires_at = NULL,
+                priority = LEAST(priority, 10){front}
+            WHERE t.status = 'running'
+              AND t.claimed_by = %(host)s
+              AND t.queue = %(queue)s
+              AND t.project = %(project)s
+              AND NOT EXISTS (
+                    SELECT 1 FROM worker_heartbeats wh
+                     WHERE wh.host_label = %(host)s
+                       AND wh.queue = %(queue)s
+                       AND wh.project = %(project)s
+                       AND wh.last_seen > now() - make_interval(secs => %(stale_s)s)
+              )
+            """,
+            {
+                "host": host_label, "queue": queue,
+                "project": _project(project), "stale_s": max(1, threshold),
+            },
+        )
+        return cur.rowcount or 0
+
+
+def detect_frozen_leases(
+    prev_sample: dict[str, tuple[Any, float]],
+    rows: list[tuple[str, Any]],
+    *, now: float, frozen_after_s: float,
+) -> tuple[list[tuple[str, Any]], dict[str, tuple[Any, float]]]:
+    """PURE frozen-lease detector — the per-JOB liveness check heartbeats can't give.
+
+    A live claimant's :class:`~queue_workflows.claim_worker.LeaseRenewer` advances
+    ``lease_expires_at`` every ~10 s; a dead one's value FREEZES. This folds the
+    current ``running`` rows (``[(job_id, lease_expires_at), …]``) into the previous
+    sample (``{job_id: (lease_value, frozen_since_ts)}``) and returns
+
+      * ``to_reclaim`` — ``[(job_id, frozen_lease_value), …]`` whose value has not
+        moved for ``frozen_after_s`` (pass the value to the CAS requeue so an
+        in-between renewal aborts the reclaim), and
+      * the new sample (changed/new values restart the clock; rows no longer
+        ``running`` drop out).
+
+    WHY (the gap this closes): a FAST worker restart (< heartbeat staleness) hides
+    the corpse — the old process died between beats and the new one starts beating
+    the SAME label within the window, so every heartbeat-keyed reclaim sees a live
+    label while the predecessor's job rots until the full lease lapses. The lease
+    renewal is per-JOB and unambiguous. Pure + injectable-clock ⇒ unit-testable with
+    no waiting; the orchestrator wires it (``NodePool._sweep_frozen_leases``)."""
+    new_sample: dict[str, tuple[Any, float]] = {}
+    to_reclaim: list[tuple[str, Any]] = []
+    for job_id, lease in rows:
+        prev = prev_sample.get(job_id)
+        since = prev[1] if (prev is not None and prev[0] == lease) else now
+        new_sample[job_id] = (lease, since)
+        if now - since >= frozen_after_s:
+            to_reclaim.append((job_id, lease))
+    return to_reclaim, new_sample
+
+
+def requeue_running_if_lease_frozen(job_id: str, expected_lease_expires_at: Any) -> int:
+    """CAS reclaim of ONE frozen-lease zombie: re-queue the ``running`` row — but
+    only if ``lease_expires_at`` STILL equals the frozen value the detector
+    observed. A renewal in between (the claimant is alive after all) changes the
+    value, the CAS misses, and this is a no-op — so a live job can never be yanked.
+
+    Resume-style like every dead-process reclaim (front-of-queue, NO
+    ``watchdog_retries`` bump), with the :func:`reclaim_expired_leases` parent-run
+    CASE: a terminal parent flips the row to ``cancelled`` instead of re-queuing a
+    ghost. Double-run across the hand-off is covered by the JobStatusWatcher
+    (clearing ``claimed_by`` self-kills a somehow-still-alive claimant)."""
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE workflow_node_jobs AS j
+            SET status = CASE WHEN r.status = 'running' THEN 'queued' ELSE 'cancelled' END,
+                started_at = CASE WHEN r.status = 'running' THEN NULL ELSE j.started_at END,
+                claimed_by = NULL,
+                lease_expires_at = NULL,
+                priority = CASE WHEN r.status = 'running' THEN LEAST(j.priority, 10) ELSE j.priority END,
+                is_priority = CASE WHEN r.status = 'running' THEN TRUE ELSE j.is_priority END,
+                finished_at = CASE WHEN r.status = 'running' THEN j.finished_at ELSE now() END
+            FROM workflow_runs r
+            WHERE r.id::text = j.run_id
+              AND j.id = %(id)s
+              AND j.status = 'running'
+              AND j.lease_expires_at = %(lease)s
+            """,
+            {"id": job_id, "lease": expected_lease_expires_at},
+        )
+        return cur.rowcount or 0
+
+
+def running_lease_snapshot(*, queue: str | None = None) -> list[tuple[str, Any]]:
+    """The frozen-lease detector's input: every ``running`` row's
+    ``(id, lease_expires_at)`` — broker-wide (like :func:`reclaim_expired_leases`:
+    a pure status-driven recovery that leaves ``project`` tags intact, so any
+    orchestrator backstops any tenant's zombies). ``queue`` narrows when given."""
+    q = "SELECT id, lease_expires_at FROM workflow_node_jobs WHERE status = 'running'"
+    args: tuple = ()
+    if queue:
+        q += " AND queue = %s"
+        args = (queue,)
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(q, args)
+        return [(r["id"], r["lease_expires_at"]) for r in cur.fetchall()]
 
 
 # ── Worker capacity heartbeat (DRY upsert) ──────────────────────────────────

@@ -344,9 +344,13 @@ def test_sweep_logs_actionable_dead_worker_line(caplog):
     assert any("DEAD WORKER" in m and "host-a" in m and "wedged" in m for m in msgs), msgs
 
 
-def test_sweep_does_not_touch_the_job_row():
-    """The detector flags the worker but leaves the JOB to the lease-reclaim
-    sweep — it must NOT re-queue or otherwise mutate the running job row."""
+def test_sweep_fast_reclaims_the_dead_workers_job_row():
+    """CONTRACT CHANGE (2026-07-16 zombie audit): the sweep no longer leaves the
+    JOB to the slow 600 s lease-reclaim — a flagged (heartbeat-stale) worker's
+    running row is re-queued NOW, front-of-queue, resume-style, so the box's slot
+    frees in ~30 s instead of lease-length. The lease-reclaim remains the
+    backstop; a still-alive claimant is covered by the JobStatusWatcher
+    reassignment self-kill."""
     job_id = _running_job_owned_by("host-a", model="wan_i2v")
     _put_heartbeat("host-a", "gpu", last_seen_age_s=120)
 
@@ -354,8 +358,10 @@ def test_sweep_does_not_touch_the_job_row():
     pool._sweep_dead_workers()
 
     row = node_queue.get_node_job(job_id)
-    assert row["status"] == "running"        # untouched
-    assert row["claimed_by"] == "host-a"      # not cleared
+    assert row["status"] == "queued"          # fast-reclaimed
+    assert row["claimed_by"] is None          # freed for a healthy claimer
+    assert row["is_priority"] is True         # recovered work runs next
+    assert row["watchdog_retries"] == 0       # a dead process is not a node fault
 
 
 def test_sweep_noop_with_no_workers():

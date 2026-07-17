@@ -192,7 +192,10 @@ _JSON_OBJ_COLS = frozenset({
     "context", "steps_done", "input_spec", "inputs", "resolved_inputs",
     "context_delta", "args", "result", "detail", "value",
 })
-_JSON_ARRAY_COLS = frozenset({"known_models", "fits_models", "llm_servers_available"})
+_JSON_ARRAY_COLS = frozenset({
+    "known_models", "fits_models", "llm_servers_available",
+    "avoid_box", "force_box",   # per-node-job box placement (migration 0020)
+})
 _TS_COLS = frozenset({
     "created_at", "updated_at", "queued_at", "started_at", "finished_at",
     "lease_expires_at", "last_seen", "last_flagged_dead_at", "claimed_at",

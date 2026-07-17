@@ -148,10 +148,10 @@ def test_dialect_fragments_render_for_sqlite(sqlite_engine):
 
 
 def test_migration_chain_bootstraps_and_roundtrips(sqlite_engine):
-    # The SQLite migration chain (migrations_sqlite/) applies to v19, creates the
+    # The SQLite migration chain (migrations_sqlite/) applies to v21, creates the
     # full engine schema, and survives a full downgrade→0→re-bootstrap roundtrip.
     db.bootstrap()
-    assert db.current_schema_version() == 19
+    assert db.current_schema_version() == 21
 
     with db.connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -167,16 +167,16 @@ def test_migration_chain_bootstraps_and_roundtrips(sqlite_engine):
     assert {
         "workflow_runs", "workflow_node_jobs", "ingest_jobs", "worker_heartbeats",
         "worker_controls", "workflow_dispatch_events", "workflow_node_events",
-        "workflow_input_submissions", "workflow_run_files",
+        "workflow_input_submissions", "workflow_run_files", "hw_watch_samples",
     } <= tables
     assert hb_pk == ["host_label", "queue", "project"]   # migration 0017 PK rebuild
     assert wc_pk == ["host_label", "queue", "project"]   # migration 0019 PK rebuild
 
     reverted = db.downgrade(to_version=0)
-    assert len(reverted) == 19
+    assert len(reverted) == 21
     assert db.current_schema_version() == 0
     db.bootstrap()
-    assert db.current_schema_version() == 19
+    assert db.current_schema_version() == 21
 
 
 # ── Phase 3: real engine queue round-trips on SQLite ────────────────────────

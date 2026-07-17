@@ -1160,7 +1160,11 @@ class HeartbeatEmitter:
         interval_s: float = HEARTBEAT_INTERVAL_S,
         concurrency_fn: Callable[[], int] | None = None,
         llm_servers_fn: Callable[[], list[str]] | None = None,
+        on_tick: Callable[[], None] | None = None,
     ) -> None:
+        # Extra per-tick hook (gpu worker: renew/release the box-wide model lease
+        # by observed residency). Best-effort; a failure never stops the heartbeat.
+        self._on_tick = on_tick
         self._queue = queue
         self._host_label = host_label
         self._model_cache = model_cache
@@ -1291,11 +1295,21 @@ class HeartbeatEmitter:
         # First tick already fired in start(); refresh until stopped.
         while not self._stop.wait(self._interval_s):
             self.emit_once()
+            if self._on_tick is not None:
+                try:
+                    self._on_tick()
+                except Exception:
+                    log.exception("[heartbeat:%s] on_tick failed (ignored)", self._queue)
 
     def start(self) -> None:
         if not self._enabled:
             return
         self.emit_once()  # row exists immediately, before the first sleep
+        if self._on_tick is not None:
+            try:
+                self._on_tick()
+            except Exception:
+                log.exception("[heartbeat:%s] on_tick failed (ignored)", self._queue)
         self._thread = threading.Thread(
             target=self._loop, daemon=True,
             name=f"worker-heartbeat-{self._queue}",
@@ -1397,6 +1411,34 @@ class ClaimWorker:
         # server returns to GPU. Defaults True so a cold worker is never blocked
         # before its first probe. Only meaningful for a gpu worker. See llm_probe.
         self._llm_gpu_ok = True
+        # Idle-unload signal: monotonic time this gpu box last did GPU work. Stamped
+        # on every successful claim + refreshed while a job is in flight; the LLM
+        # idle reaper (llm_idle_unload) reads _gpu_idle_seconds() and, after the TTL,
+        # unloads the box's external ollama model to free RAM. None until the gpu
+        # lane starts. See run_forever.
+        self._last_gpu_active_at = time.monotonic()
+        self._llm_idle_reaper: Any = None
+        self._residency_enforcer: Any = None
+        # ONE-MODEL-PER-BOX lease (gpu_model_lease): a flock'd per-box file every
+        # worker container on this physical GPU — regardless of project or DB —
+        # coordinates through. This worker holds it for its currently-RESIDENT
+        # model (renewed by the heartbeat tick, released when the model unloads);
+        # the pre-execution gate SPILLS a job whose model would be a SECOND on the
+        # box. Lazy (gpu only); inert until QUEUE_WORKFLOWS_GPU_MODEL_LEASE_DIR set.
+        self._box_lease: Any = None
+        self._box_held_model: str | None = None
+        #: This worker's physical box name (placement, migration 0020) — lazily
+        #: resolved once via :meth:`_physical_box`.
+        self._box_name: str | None = None
+        #: How many jobs are executing on this worker RIGHT NOW under the box hold.
+        #: The box stays claimed while this is > 0 REGARDLESS of a residency-probe
+        #: flicker (a long ollama job's model can read 'not resident' for a beat) —
+        #: else the tick would release mid-job and never re-acquire (acquire runs
+        #: only at claim), leaving the box unprotected. A counter, not a bool, so PAR
+        #: pool jobs (all same-model by the lease) release the box only when the LAST
+        #: one finishes. Falls to 0 on job end → the tick then frees the box once the
+        #: warm model actually unloads.
+        self._box_active_jobs: int = 0
         # Cached total-VRAM probe for the capacity claim gate (migration 0015) —
         # stable hardware property, sampled once per worker process.
         self._vram_probed_claim = False
@@ -1418,6 +1460,8 @@ class ClaimWorker:
             # let a server-less box masquerade as capable. cpu/ingest keep the
             # config default (llm_servers_fn=None).
             llm_servers_fn=(self._probe_llm_servers if self.queue == "gpu" else None),
+            # gpu: renew/release the box-wide model lease by observed residency.
+            on_tick=(self._box_lease_tick if self.queue == "gpu" else None),
         )
         # This host's hw-metrics sampler — started in ``run_forever`` ONLY when
         # ``queue == 'gpu'`` (one gpu container per host ⇒ one sampler per host).
@@ -1512,6 +1556,32 @@ class ClaimWorker:
         fits = [m for m in model_registry.fits_within(vram_total) if m in known_set]
         return vram_total, fits, bool(known)
 
+    def _gpu_slot_budget(self) -> int:
+        """This box's TOTAL concurrent GPU job budget — the same number the
+        heartbeat advertises as ``concurrency`` and the DB-side box-slot arbiter
+        enforces at claim time (``claim_next_gpu_job(max_running=...)``). One
+        source of truth: max(1, PAR)."""
+        return max(1, self._pool_parallelism())
+
+    def _gpu_active_count(self) -> int:
+        """GPU jobs in flight on this box right now: the VLM pool's inflight count
+        plus the inline diffusion lane (0/1). >0 means the GPU IS in use, so the
+        idle reaper must not unload. Best-effort read (a stale value only shifts an
+        unload by one poll)."""
+        return int(self._pool_inflight) + (1 if self._inline_running else 0)
+
+    def _mark_gpu_active(self) -> None:
+        """Stamp 'the box did GPU work now' — resets the idle-unload countdown."""
+        self._last_gpu_active_at = time.monotonic()
+
+    def _gpu_idle_seconds(self) -> float:
+        """Seconds since this box last did GPU work — 0.0 while a job is in flight
+        (a running job IS activity; also keeps the stamp fresh through a long job)."""
+        if self._gpu_active_count() > 0:
+            self._last_gpu_active_at = time.monotonic()
+            return 0.0
+        return time.monotonic() - self._last_gpu_active_at
+
     def _claim(self) -> dict | None:
         """Claim the next job for the INLINE lane.
 
@@ -1539,17 +1609,23 @@ class ClaimWorker:
             # never wedges the queue.
             if has_models and vram_total is not None and not fits:
                 return None
-            return node_queue.claim_next_gpu_job(
+            job = node_queue.claim_next_gpu_job(
                 0, current_model,
                 host=self.host, lease_s=self.lease_s,
                 host_priority=self.host_priority,
                 known_models=fits,
                 require_model=True,
                 pool_modules=get_config().vlm_pool_node_modules,
+                max_running=self._gpu_slot_budget(),
+                box=self._physical_box(),
             )
+            if job is not None:
+                self._mark_gpu_active()   # resets the LLM idle-unload countdown
+            return job
         return node_queue.claim_next_cpu_job(
             0, host=self.host, lease_s=self.lease_s,
             host_priority=self.host_priority,
+            box=self._physical_box(),
         )
 
     def _claim_pool(self) -> dict | None:
@@ -1569,14 +1645,19 @@ class ClaimWorker:
         from queue_workflows import model_registry
         if not self._llm_gpu_ok:
             return None
-        return node_queue.claim_next_gpu_job(
+        job = node_queue.claim_next_gpu_job(
             0, None,
             host=self.host, lease_s=self.lease_s,
             host_priority=self.host_priority,
             known_models=model_registry.known_ids(),
             require_model=False,
             pool_modules=get_config().vlm_pool_node_modules,
+            max_running=self._gpu_slot_budget(),
+            box=self._physical_box(),
         )
+        if job is not None:
+            self._mark_gpu_active()   # resets the LLM idle-unload countdown
+        return job
 
     def _pool_parallelism(self) -> int:
         """PAR for the VLM pool lane: the per-``(host, gpu)`` LLM ``parallelism``
@@ -1681,6 +1762,12 @@ class ClaimWorker:
             hang in ~2 min, well before the health watchdog's first checkpoint).
         """
         job_id = job["id"]
+        # ONE-MODEL-PER-BOX gate (gpu, real node): spill if the card already holds
+        # another project's model. __input__ park nodes touch no GPU — skip them.
+        if self.queue == "gpu" \
+                and not (job.get("node_module") or "").startswith("__input__") \
+                and not self._acquire_box_or_spill(job):
+            return False
         log.info(
             "[claim-worker:%s] claimed %s (node=%s model=%s)",
             self.queue, job_id, job.get("node_id"), job.get("required_model"),
@@ -1797,6 +1884,8 @@ class ClaimWorker:
         finally:
             if busy:
                 self.model_cache.mark_idle()
+            if is_gpu:
+                self._box_job_done()      # drop the box hold for THIS job (warm-hold stays)
             status_watcher.stop()
             if stall is not None:
                 stall.stop()
@@ -1838,6 +1927,11 @@ class ClaimWorker:
         the whole process (the safe abandon path) — acceptable: the inline
         diffusion job, if any, is re-queued by lease reclaim exactly as a
         watchdog hard-exit would do."""
+        # ONE-MODEL-PER-BOX gate: spill this no-model LLM job if the card already
+        # holds another project's model (e.g. a diffusion render). Same gate as the
+        # inline lane — both funnel through _acquire_box_or_spill.
+        if not self._acquire_box_or_spill(job):
+            return False
         job_id = job["id"]
         log.info(
             "[claim-worker:gpu:pool] claimed %s (node=%s model=%s)",
@@ -1852,6 +1946,7 @@ class ClaimWorker:
         # ``__input__`` sentinel to execute_node. (A VLM lane shouldn't normally
         # see one, but the guard keeps the two lanes' contract identical.)
         if (job.get("node_module") or "").startswith("__input__"):
+            self._box_job_done()          # balance the acquire above (park touches no GPU)
             with connection() as conn, conn.cursor() as cur:
                 node_queue.mark_awaiting_input_in_txn(cur, job_id)
                 node_queue.enqueue_dispatch_event_in_txn(
@@ -1878,6 +1973,7 @@ class ClaimWorker:
                 status_callback=None,
             )
         finally:
+            self._box_job_done()          # drop this pool job's box hold
             status_watcher.stop()
             renewer.stop()
             cancel_event.set()
@@ -2085,6 +2181,44 @@ class ClaimWorker:
 
     # ── operator control (ON/OFF) ────────────────────────────────────────────
 
+    def _physical_box(self) -> str:
+        """This worker's PHYSICAL box name for placement (migration 0020) — the
+        cross-project identity ``QUEUE_WORKFLOWS_GPU_BOX_ID`` / ``config.gpu_box_id``
+        (else the machine hostname), the SAME value the box lease keys on and NOT
+        the per-project ``host_label``. Cached (it can't change within a process)."""
+        if self._box_name is None:
+            from queue_workflows.gpu_model_lease import default_box_id
+            self._box_name = default_box_id()
+        return self._box_name
+
+    def _reclaim_predecessor_zombies(self) -> None:
+        """Boot-time zombie kill: re-queue any ``running`` row still claimed by THIS
+        worker's identity whose heartbeat is stale/absent — i.e. my dead
+        predecessor's in-flight job after a restart/recreate.
+
+        Without this, a recreated worker sat idle next to its predecessor's zombie
+        for up to the whole 600 s lease (the box's ONE gpu slot camped by a corpse).
+        The staleness predicate makes it multi-process-lane safe: a live sibling
+        sharing this label keeps the heartbeat fresh, so its job is never yanked
+        (see :func:`node_queue.requeue_running_if_worker_stale`). Runs BEFORE the
+        heartbeat starts — our own first beat would otherwise mark the label fresh
+        and hide the predecessor's corpse. Best-effort: recovery must never block
+        worker startup (the lease-reclaim remains the backstop)."""
+        try:
+            n = node_queue.requeue_running_if_worker_stale(self.host, self.queue)
+            if n:
+                log.warning(
+                    "[claim-worker:%s] boot: re-queued %d zombie job(s) my dead "
+                    "predecessor (host=%s) still held — freed the slot(s) "
+                    "immediately instead of waiting out the lease",
+                    self.queue, n, self.host,
+                )
+        except Exception:
+            log.exception(
+                "[claim-worker:%s] boot zombie-reclaim failed (lease-reclaim "
+                "remains the backstop)", self.queue,
+            )
+
     def requeue_inflight_for_control(self) -> int:
         """Re-queue any job this worker is currently running back to the queue and
         clear its GPU busy-ghost — the DB cleanup a control HARD stop does just
@@ -2237,6 +2371,175 @@ class ClaimWorker:
                 "claiming proceeds; the server may already be up)",
             )
 
+    def _get_box_lease(self):
+        if self._box_lease is None:
+            from queue_workflows.gpu_model_lease import build_lease
+            self._box_lease = build_lease()
+        return self._box_lease
+
+    def _effective_gpu_model(self, job: dict) -> str:
+        """The model this job puts on the card: its ``required_model`` (a
+        diffusion / ModelCache job), else the LLM-server slot sentinel (a no-model
+        ollama-dispatch job — the box's LLM server holds one model, so all such
+        jobs share the slot)."""
+        from queue_workflows.gpu_model_lease import LLM_SERVER_SLOT
+        return job.get("required_model") or LLM_SERVER_SLOT
+
+    def _acquire_box_or_spill(self, job: dict) -> bool:
+        """ONE-MODEL-PER-BOX admission, across ALL projects on this physical GPU.
+        Acquire the box-wide model lease for this job's effective model BEFORE it
+        runs. Granted ⇒ run (and hold the lease for that model until it unloads).
+        DENIED (a live worker on this box — any project, any DB — holds a DIFFERENT
+        model) ⇒ re-queue the job so it SPILLS to a box that holds its model or is
+        free, and DON'T execute, so a second model never loads on the card.
+
+        Inert (always grants) until the shared lease dir is configured — byte-compat."""
+        model = self._effective_gpu_model(job)
+        if not self._get_box_lease().acquire(model):
+            held = self._get_box_lease().current().model
+            log.warning(
+                "[claim-worker:gpu] host=%s: box already holds %r — SPILLING job %s "
+                "(node=%s, model=%s) to a free/matching box (one model per GPU box "
+                "across all projects)",
+                self.host, held, job.get("id"), job.get("node_id"), model,
+            )
+            try:
+                node_queue.requeue_job_for_retry(job["id"])
+            except Exception:
+                log.exception("[claim-worker:gpu] spill re-queue failed for %s", job.get("id"))
+            return False
+        self._box_held_model = model
+        self._box_active_jobs += 1     # hold the box for this job's whole lifetime
+        return True
+
+    def _box_job_done(self) -> None:
+        """A job that held the box has finished — decrement the active count (floor 0).
+        Called from the node-execution ``finally`` on EVERY path. The box is NOT
+        released here: while a model stays warm the box is kept for it (affinity, no
+        thrash), and the tick frees it once the model actually unloads. Only the
+        transition to 0 active jobs re-enables that residency-driven release."""
+        if self._box_active_jobs > 0:
+            self._box_active_jobs -= 1
+
+    def _model_still_resident(self, held: str) -> bool:
+        """Is ``held`` still on the card? For the LLM slot: any model loaded on the
+        box's ollama. For a diffusion model: the warm ModelCache still holds it."""
+        from queue_workflows.gpu_model_lease import LLM_SERVER_SLOT
+        if held == LLM_SERVER_SLOT:
+            from queue_workflows import llm_probe
+            from queue_workflows.llm_backends import factory as _llm_factory
+            return bool(llm_probe.loaded_models(_llm_factory.resolve_base_url("ollama")))
+        return getattr(self.model_cache, "current_model", None) == held
+
+    def _box_lease_tick(self) -> None:
+        """Heartbeat hook (gpu only): keep holding the box lease while our model is
+        RESIDENT (renew), and RELEASE it once the model unloads — so the box frees
+        for a peer's model only when this one is actually gone. Best-effort."""
+        held = self._box_held_model
+        if not held:
+            return
+        try:
+            # Keep holding while a job is ACTIVE (robust to a residency-probe flicker
+            # — a mid-job blip must never drop the box) OR while the model stays warm
+            # after the job (affinity). Release only when NO job runs AND the model has
+            # actually left the card, so the box frees for a peer's model exactly then.
+            if self._box_active_jobs > 0 or self._model_still_resident(held):
+                self._get_box_lease().renew(held)
+            else:
+                self._get_box_lease().release()
+                self._box_held_model = None
+        except Exception:
+            log.exception("[claim-worker:gpu] box-lease tick failed (ignored)")
+
+    def _arm_llm_idle_reaper(self) -> None:
+        """Arm the external-LLM-server idle reaper (gpu only): after the box has done
+        no GPU work for the TTL (default 5 min), unload its ollama model to free RAM.
+        The model residency is otherwise engine-uncontrolled (ollama's own
+        KEEP_ALIVE). Reads this box's endpoint live via the backend factory; a vllm
+        box has nothing on ``/api/ps`` so the reaper no-ops there (the LLMSupervisor
+        handles vllm idle). Best-effort + env-gated; never breaks worker startup."""
+        try:
+            from queue_workflows import llm_idle_unload, llm_probe
+            from queue_workflows.llm_backends import factory as _llm_factory
+
+            self._llm_idle_reaper = llm_idle_unload.ExternalModelIdleReaper(
+                active_fn=self._gpu_active_count,
+                idle_seconds_fn=self._gpu_idle_seconds,
+                loaded_models_fn=lambda: llm_probe.loaded_models(
+                    _llm_factory.resolve_base_url()),
+                unload_fn=lambda models: llm_probe.unload_ollama_models(
+                    _llm_factory.resolve_base_url(), models),
+                label=self.host,
+            )
+            self._llm_idle_reaper.ensure_started()
+        except Exception:
+            log.exception(
+                "[claim-worker:gpu] LLM idle-unload reaper arm failed (ignored)"
+            )
+
+    def _collect_box_residents(self) -> list:
+        """Everything resident on THIS box's LLM servers right now — the shared
+        probe both the residency enforcer and the ModelCache load gate use, so all
+        three see the box identically."""
+        from queue_workflows import model_residency
+        return model_residency.probe_box_residents()
+
+    def _stop_rogue_vllm(self) -> None:
+        """Hard-kill lever for a vLLM that lost the residency decision: the
+        host-wired sidecar stop (``set_vllm_lifecycle``). Without one there is no
+        portable way to stop an external vLLM — say so loudly instead of pretending."""
+        fn = get_config().vllm_stop_fn
+        if fn is not None:
+            fn()
+            return
+        log.error(
+            "[model-residency] %s: a vLLM lost the one-model-per-box decision but "
+            "no stop hook is wired — wire set_vllm_lifecycle(stop_fn, start_fn) so "
+            "the enforcer can actually kill it.", self.host,
+        )
+
+    def _free_box_comfyui(self) -> None:
+        """Evict lever for a ComfyUI that lost the one-server-per-box decision: POST
+        ``/free`` so it drops its models + releases VRAM. No-op (with a note) when no
+        ComfyUI URL is configured for this box — then ComfyUI isn't part of the box's
+        residency picture and nothing on it could have been decided against."""
+        from queue_workflows import llm_probe
+        url = (env_get("QUEUE_WORKFLOWS_COMFYUI_URL") or get_config().comfyui_url or "").strip()
+        if not url:
+            log.error(
+                "[model-residency] %s: a ComfyUI lost the one-server-per-box decision "
+                "but no QUEUE_WORKFLOWS_COMFYUI_URL is set — cannot free it.", self.host,
+            )
+            return
+        llm_probe.comfyui_free(url)
+
+    def _arm_model_residency_enforcer(self) -> None:
+        """Arm the ONE-MODEL-PER-BOX enforcer (gpu only): poll this box's LLM
+        servers and, whenever more than ``QUEUE_WORKFLOWS_BOX_MODEL_CAP`` (default 1)
+        distinct models are resident, hard-kill the extras (ollama ``keep_alive:0``;
+        vLLM sidecar stop) and raise/log ``ModelResidencyViolation`` — the invariant
+        the incident history shows config alone cannot hold. Best-effort arming;
+        never breaks worker startup."""
+        try:
+            from queue_workflows import llm_probe, model_residency
+            from queue_workflows.llm_backends import factory as _llm_factory
+
+            self._residency_enforcer = model_residency.ModelResidencyEnforcer(
+                collect_fn=self._collect_box_residents,
+                unload_ollama_fn=lambda models: llm_probe.unload_ollama_models(
+                    _llm_factory.resolve_base_url("ollama"), models),
+                stop_vllm_fn=self._stop_rogue_vllm,
+                free_comfyui_fn=self._free_box_comfyui,
+                desired_server_fn=lambda: worker_control.llm_config_for(
+                    self.host, "gpu").server_type,
+                label=self.host,
+            )
+            self._residency_enforcer.ensure_started()
+        except Exception:
+            log.exception(
+                "[claim-worker:gpu] model-residency enforcer arm failed (ignored)"
+            )
+
     def run_forever(self) -> None:
         """Block on ``LISTEN <wake_channel>`` and drain the queue greedily on
         each wake (and on the 1 s safety poll for a dropped NOTIFY). Uses a
@@ -2278,6 +2581,10 @@ class ClaimWorker:
         # OFF twin (worker_control._stop_inference_server) stopped it. No-op unless a
         # host wired the lifecycle; idempotent if the server is already running.
         self._start_inference_server()
+        # Boot zombie-kill: free my dead predecessor's slot(s) NOW — must run
+        # BEFORE heartbeat.start() (our first beat marks this label fresh, which
+        # would hide the predecessor's corpse from the staleness predicate).
+        self._reclaim_predecessor_zombies()
         # Advertise capacity (no-op for fetch/load) + keep last_seen fresh.
         self.heartbeat.start()
         # (hw-metrics sampler already started above, before the park gate, so it
@@ -2296,6 +2603,8 @@ class ClaimWorker:
                 log.exception(
                     "[claim-worker:gpu] LLM backend factory start failed (ignored)"
                 )
+            self._arm_llm_idle_reaper()
+            self._arm_model_residency_enforcer()
         # Operator control watcher: HARD-stop this worker the instant it's turned
         # OFF (re-queue in-flight + os._exit to free RAM; the supervisor restart
         # re-enters the park gate above). Honours AI_LEADS_DISABLE_WORKER_CONTROL.

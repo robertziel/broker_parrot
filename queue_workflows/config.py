@@ -321,6 +321,12 @@ class EngineConfig:
     #: with ``read(box_id)`` + ``update(box_id, fn)``, e.g. a redis/pg-backed store
     #: shared across boxes. ``None`` ⇒ the file store (if a dir is set) else no-op.
     gpu_lease_store: Any | None = None
+    #: ComfyUI base URL on THIS box, if it runs one (a diffusion server that can hold the
+    #: GPU alongside/instead of an LLM). Set ⇒ the box-residency probe includes ComfyUI
+    #: (``/system_stats`` residency, ``/free`` evict) so the one-server-per-box rule
+    #: arbitrates it too. Empty ⇒ ComfyUI is not part of this box's residency picture.
+    #: Env ``QUEUE_WORKFLOWS_COMFYUI_URL``.
+    comfyui_url: str = ""
 
     # ── per-dispatch LLM server resolver (host-provided) ──────────────────────
     #: ``Callable[[dict], Any]`` — given a node-job dict (id, node_module, queue,
@@ -336,16 +342,19 @@ class EngineConfig:
     #: ``llm_server=None`` and keep self-resolving from local env (unchanged).
     llm_server_resolver: Callable[[dict], Any] | None = None
 
-    # ── orphan-cancel sweep (opt-in) ──────────────────────────────────────────
+    # ── orphan-cancel sweep (ON by default since the 2026-07-16 ghost audit) ──
     #: When True, the :class:`NodePool` periodically flips ``queued`` jobs whose
     #: parent run is already ``cancelled`` / ``failed`` to ``cancelled``. The
     #: host's cancel handler is usually a single ``UPDATE workflow_runs SET
     #: status='cancelled'`` and does not cascade into ``workflow_node_jobs``; the
     #: claim SQL refuses such jobs (run-cancel guard), but they linger in
-    #: ``queued`` and pollute queue gauges. Default ``False`` preserves the
-    #: engine's pre-0.4 behaviour byte-for-byte; hosts that want the cleanup
-    #: opt in via ``configure(cancel_orphan_queued_jobs=True)``.
-    cancel_orphan_queued_jobs: bool = False
+    #: ``queued`` forever — polluting queue gauges AND (worse) feeding every
+    #: queue-depth-driven policy a lie (the 2026-07-16 audit found a "full" gpu
+    #: queue that was 82 % ghosts). Default ``True``: ghosts now cannot
+    #: accumulate. The flip is semantically safe — a job of a terminal run can
+    #: never be claimed anyway — and hosts that want the old bookkeeping keep it
+    #: via ``configure(cancel_orphan_queued_jobs=False)``.
+    cancel_orphan_queued_jobs: bool = True
 
     #: When ``False``, a gpu worker whose container has NO local CUDA device does
     #: NOT self-park: it is a REMOTE/THIN client (its gpu nodes call an external

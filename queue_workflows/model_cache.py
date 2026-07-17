@@ -76,7 +76,17 @@ class ModelCache:
         idle_ttl_s: float | None = None,
         register_builtins: Callable[[], None] | None = None,
         lease: Any | None = None,
+        pre_load_check: Callable[[str], None] | None = None,
     ) -> None:
+        # LAST-DEFENCE load gate. Called with the model id right before weights are
+        # pulled into VRAM; it may RAISE to refuse the load (the GPU worker wires it
+        # to model_residency.assert_can_load, which raises ModelAlreadyLoadedError
+        # when the box already holds a DIFFERENT model — even one the cooperative
+        # lease never saw, e.g. an ollama daemon or a non-lease project). Runs AFTER
+        # the same-model cache hit (a reload of the held model is never gated) and
+        # BEFORE the lease/drop/load, so a refusal changes NOTHING. Default None ⇒
+        # no gate (byte-identical to before).
+        self._pre_load_check = pre_load_check
         # The one-model-per-GPU-BOX lease (queue_workflows.gpu_model_lease). The
         # warm cache guarantees one model per PROCESS; N worker processes (one per
         # project) on one card would still each warm their own model and contend
@@ -143,6 +153,14 @@ class ModelCache:
             self.ensure_idle_reaper()
             if self._current_model == model_id and self._current_handle is not None:
                 return self._current_handle
+            # ── LAST DEFENCE LINE ──────────────────────────────────────────
+            # Before touching the lease or freeing our own model, OBSERVE the box:
+            # if a DIFFERENT model is already resident (any path — ollama, vLLM,
+            # another project), the gate RAISES and we load nothing. This backstops
+            # the cooperative lease below, which only sees loads that go through it.
+            # Runs first so a refusal leaves the cache exactly as it was.
+            if self._pre_load_check is not None:
+                self._pre_load_check(model_id)
             # ── one model per GPU BOX ──────────────────────────────────────
             # Claim the box BEFORE dropping/loading anything: if a live peer
             # (another project's worker on this same card) holds a DIFFERENT

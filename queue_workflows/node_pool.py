@@ -199,6 +199,15 @@ class NodePool:
         )
         self._node_event_prune_last_run: float = 0.0
 
+        # Hardware flight-recorder retention (migration 0021) — the detail
+        # tier keeps only 1 h, so this sweep runs on a faster gate than the
+        # node-event prune. prune_hw_watch itself swallows storage errors, so
+        # a pre-0021 DB just prunes nothing.
+        self._hw_watch_prune_interval_s: float = float(
+            env_get("QUEUE_WORKFLOWS_HW_WATCH_PRUNE_INTERVAL_S", "300")
+        )
+        self._hw_watch_prune_last_run: float = 0.0
+
         # Orphan-cancel sweep — opt-in (``configure(cancel_orphan_queued_jobs=
         # True)``). Flips ``queued`` jobs whose parent run is already terminal
         # (``cancelled`` / ``failed``) to ``cancelled``. The claim SQL already
@@ -208,6 +217,23 @@ class NodePool:
             env_get("QUEUE_WORKFLOWS_ORPHAN_CANCEL_SWEEP_INTERVAL_S", "30")
         )
         self._orphan_cancel_last_run: float = 0.0
+
+        # Frozen-lease sweep — the per-JOB fast zombie reclaim. A live claimant
+        # advances lease_expires_at every ~10 s; a value frozen for
+        # ``_frozen_lease_after_s`` (default 35 s) is a dead process's job, re-queued
+        # NOW via a CAS (an in-between renewal aborts it) instead of waiting out the
+        # 600 s lease. Catches the case every heartbeat-keyed path can't: a FAST
+        # worker restart that starts beating the shared label again within the
+        # staleness window, hiding the predecessor's corpse.
+        self._frozen_lease_after_s: float = float(
+            env_get("QUEUE_WORKFLOWS_FROZEN_LEASE_AFTER_S", "35")
+        )
+        self._frozen_lease_interval_s: float = float(
+            env_get("QUEUE_WORKFLOWS_FROZEN_LEASE_SWEEP_INTERVAL_S", "5")
+        )
+        self._frozen_lease_last_run: float = 0.0
+        self._frozen_lease_sample: dict = {}
+        self._frozen_lease_now_fn = None  # test seam; None ⇒ time.time
 
         # Stuck-run reconciler — recovery for a run the engine still calls
         # ``queued`` / ``running`` but which has NO live node-job backing it (a
@@ -510,12 +536,28 @@ class NodePool:
         except Exception:
             log.exception("[node-pool] dead-worker sweep failed")
 
+        # 5b) Frozen-lease sweep — the per-JOB fast zombie reclaim (a running row
+        # whose lease stopped renewing for ~35 s is a dead process's job; re-queue
+        # NOW instead of waiting out the 600 s lease). Catches the fast-restart
+        # case the heartbeat-keyed paths can't see.
+        try:
+            self._sweep_frozen_leases()
+        except Exception:
+            log.exception("[node-pool] frozen-lease sweep failed")
+
         # 6) Node-event retention — prune workflow_node_events older than the
         # retention window (append-only growth control; hourly-gated).
         try:
             self._sweep_node_event_retention()
         except Exception:
             log.exception("[node-pool] node-event retention sweep failed")
+
+        # 6b) Hardware flight-recorder retention — two-tier prune of
+        # hw_watch_samples (detail 1 h / history 24 h; 5-min-gated).
+        try:
+            self._sweep_hw_watch_retention()
+        except Exception:
+            log.exception("[node-pool] hw-watch retention sweep failed")
 
         # 7) Orphan-cancel sweep — opt-in. Flip ``queued`` jobs of cancelled /
         # failed runs to ``cancelled`` so the queue gauges don't read
@@ -689,14 +731,71 @@ class NodePool:
 
         flagged = node_queue.flag_stale_workers_holding_running_jobs()
         for row in flagged:
+            # FAST dead-reclaim: free the flagged worker's jobs NOW (~30 s after
+            # death) instead of letting them camp the box's slot until the 600 s
+            # lease lapses. Same staleness predicate as the flag, atomic in the
+            # UPDATE, JobStatusWatcher-safe (a wedged-but-alive claimant
+            # self-kills on seeing its row reassigned). Best-effort per worker —
+            # the lease-reclaim remains the backstop if this ever fails.
+            requeued = 0
+            try:
+                requeued = node_queue.requeue_running_if_worker_stale(
+                    row.get("host_label"), row.get("queue"),
+                    project=row.get("project"),
+                )
+            except Exception:
+                log.exception(
+                    "[node-pool] fast dead-reclaim failed for %s/%s "
+                    "(lease-reclaim remains the backstop)",
+                    row.get("host_label"), row.get("queue"),
+                )
             log.error(
                 "[node-pool] DEAD WORKER: %s/%s [project=%s] heartbeat stale "
-                "since %s but still owns %s running job(s) — worker PROCESS is "
-                "wedged (GPU hang?); job(s) re-queued by lease-reclaim, but the "
-                "container must be bounced (host-supervisor should restart it)",
+                "since %s but still owned %s running job(s) — %d re-queued NOW "
+                "(fast dead-reclaim; lease-reclaim backstops the rest); worker "
+                "PROCESS is wedged (GPU hang?) — the container must be bounced "
+                "(host-supervisor should restart it)",
                 row.get("host_label"), row.get("queue"), row.get("project"),
-                row.get("last_seen"), row.get("running_jobs"),
+                row.get("last_seen"), row.get("running_jobs"), requeued,
             )
+
+    def _sweep_frozen_leases(self) -> None:
+        """FAST per-job zombie reclaim: re-queue ``running`` rows whose
+        ``lease_expires_at`` hasn't advanced for ``_frozen_lease_after_s`` (a live
+        claimant renews every ~10 s — a frozen value IS a dead process), via the
+        CAS :func:`node_queue.requeue_running_if_lease_frozen` so a renewal that
+        lands between sample and reclaim aborts it. Broker-wide, project-agnostic
+        (pure status-driven recovery, same rationale as the lease-reclaim). The
+        600 s lease-reclaim remains the final backstop. Interval-gated; the sample
+        lives in memory (an orchestrator restart just re-learns, one window later)."""
+        import time as _time
+
+        now_fn = self._frozen_lease_now_fn or _time.time
+        now = now_fn()
+        if now - self._frozen_lease_last_run < self._frozen_lease_interval_s:
+            return
+        self._frozen_lease_last_run = now
+
+        rows = node_queue.running_lease_snapshot()
+        to_reclaim, self._frozen_lease_sample = node_queue.detect_frozen_leases(
+            self._frozen_lease_sample, rows,
+            now=now, frozen_after_s=self._frozen_lease_after_s,
+        )
+        for job_id, lease in to_reclaim:
+            try:
+                if node_queue.requeue_running_if_lease_frozen(job_id, lease):
+                    self._frozen_lease_sample.pop(job_id, None)
+                    log.warning(
+                        "[node-pool] FROZEN LEASE: job %s stopped renewing for "
+                        ">= %.0fs (claimant dead) — re-queued NOW instead of "
+                        "waiting out the lease",
+                        job_id, self._frozen_lease_after_s,
+                    )
+            except Exception:
+                log.exception(
+                    "[node-pool] frozen-lease reclaim failed for %s "
+                    "(lease-reclaim remains the backstop)", job_id,
+                )
 
     def _sweep_orphan_queued_jobs(self) -> None:
         """Flip ``queued`` jobs of already-terminal runs to ``cancelled``.
@@ -750,4 +849,26 @@ class NodePool:
             log.info(
                 "[node-pool] pruned %d node-event row(s) older than %d days",
                 deleted, self._node_event_retention_days,
+            )
+
+    def _sweep_hw_watch_retention(self) -> None:
+        """Prune ``hw_watch_samples`` past each tier's retention window
+        (detail 1 h / history 24 h — migration 0021). Interval-gated
+        (``_hw_watch_prune_interval_s``, default 5 min: the detail ring is
+        only an hour deep, so an hourly gate would let it double). The prune
+        itself swallows storage errors, so a pre-0021 DB is a silent no-op."""
+        import time as _time
+
+        now = _time.time()
+        if now - self._hw_watch_prune_last_run < self._hw_watch_prune_interval_s:
+            return
+        self._hw_watch_prune_last_run = now
+
+        from queue_workflows import hw_watch
+
+        detail_deleted, history_deleted = hw_watch.prune_hw_watch()
+        if detail_deleted or history_deleted:
+            log.info(
+                "[node-pool] pruned hw-watch samples (detail=%d, history=%d)",
+                detail_deleted, history_deleted,
             )

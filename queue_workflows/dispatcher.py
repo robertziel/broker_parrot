@@ -1315,4 +1315,10 @@ def _enqueue(run_id: str, node: dict[str, Any], run: dict[str, Any]) -> str:
         priority=int(run.get("priority", 100)),
         pipeline_name=node.get("pipeline_name"),
         project=run.get("project"),
+        # Per-node PHYSICAL-BOX placement (migration 0020): a node spec may pin
+        # (``force_box``) or exclude (``avoid_box``) boxes by name. Absent ⇒ NULL
+        # ⇒ unconstrained. Threaded straight through so any workflow can steer a
+        # node onto / off a machine (e.g. keep renders off the control hub).
+        avoid_box=node.get("avoid_box"),
+        force_box=node.get("force_box"),
     )

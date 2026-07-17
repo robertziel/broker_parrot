@@ -126,3 +126,21 @@ def test_injected_store_hook_wins(monkeypatch):
         assert gml.build_lease().store is sentinel
     finally:
         queue_workflows.set_gpu_lease_store(None)
+
+
+def test_file_store_artifacts_are_cross_uid_writable(tmp_path):
+    """The lease file coordinates ROOT containers AND host (non-root) processes on one
+    box — whoever creates it first must not lock the others out (the observed failure:
+    a root container created it 0644, then a non-root host worker hit EACCES and could
+    not participate at all). So the store chmods the lock file 0666 and the lease dir
+    0777 (a coordination lockfile, not data — the classic shared-lock permission)."""
+    import os
+    import stat
+
+    d = str(tmp_path / "lease")
+    store = gml.FileLeaseStore(d)
+    store.update("box-a", lambda st: (True, st))
+    dmode = stat.S_IMODE(os.stat(d).st_mode)
+    fmode = stat.S_IMODE(os.stat(os.path.join(d, "gpu_model_lease_box-a.json")).st_mode)
+    assert fmode == 0o666, f"lease file must be world-writable, got {oct(fmode)}"
+    assert dmode == 0o777, f"lease dir must be world-writable, got {oct(dmode)}"

@@ -95,6 +95,7 @@ _ENGINE_TABLES = (
     "worker_heartbeats",
     "worker_controls",
     "ingest_jobs",
+    "hw_watch_samples",
 )
 
 

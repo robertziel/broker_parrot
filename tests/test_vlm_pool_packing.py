@@ -94,6 +94,47 @@ def test_defer_true_when_equal_par_earlier_host_has_free_capacity():
     assert node_queue.vlm_pool_should_defer("bbb", 2) is True
 
 
+def _old_claimable_no_model_job(age_s: float) -> str:
+    """A QUEUED no-model gpu job with a RUNNING parent, created ``age_s`` ago —
+    the 'starving' work the anti-starvation break must claim rather than defer."""
+    run_id = make_run()  # status='running' by default → claimable parent
+    node_queue.enqueue_node_job(
+        run_id=run_id, node_id="starving", node_module="x", queue="gpu",
+    )
+    with connection() as c, c.cursor() as cur:
+        cur.execute(
+            "UPDATE workflow_node_jobs "
+            "SET created_at = now() - make_interval(secs => %s) WHERE run_id = %s",
+            (float(age_s), run_id),
+        )
+    return run_id
+
+
+def test_anti_starvation_breaks_deferral_when_a_claimable_job_ages(monkeypatch):
+    """THE DEADLOCK FIX. A lower-ranked box normally defers to a free higher peer
+    (bin-packing) — but if a claimable no-model job has been queued past the
+    starvation window, the higher peer plainly ISN'T draining it (e.g. its card is
+    held for another project's model, so it only spills), and deferral turns OFF for
+    everyone: M claims NOW rather than sleep while work rots on the occupied box."""
+    _beat("aaa", concurrency=2)   # earlier host, idle → normally ranks above "bbb"
+    _beat("bbb", concurrency=2)
+    assert node_queue.vlm_pool_should_defer("bbb", 2) is True   # no aging work yet
+
+    monkeypatch.setattr(node_queue, "VLM_POOL_MAX_DEFER_AGE_S", 5)
+    _old_claimable_no_model_job(age_s=30)                       # older than the window
+    assert node_queue.vlm_pool_should_defer("bbb", 2) is False  # deferral broken → claim
+
+
+def test_anti_starvation_ignores_a_FRESH_claimable_job(monkeypatch):
+    """A just-queued job (younger than the window) must NOT break deferral — normal
+    fill-before-spill consolidation still holds under healthy flow."""
+    _beat("aaa", concurrency=2)
+    _beat("bbb", concurrency=2)
+    monkeypatch.setattr(node_queue, "VLM_POOL_MAX_DEFER_AGE_S", 60)
+    _old_claimable_no_model_job(age_s=2)                        # fresh → within window
+    assert node_queue.vlm_pool_should_defer("bbb", 2) is True   # still defers
+
+
 def test_defer_false_when_every_higher_peer_is_full():
     """When every higher-ranked peer is at capacity (running-no-model count >=
     its concurrency), nothing ranks above with room → M claims (no defer)."""

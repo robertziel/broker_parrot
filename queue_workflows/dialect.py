@@ -81,6 +81,18 @@ class Dialect:
         """Row-level skip-locked clause for the claim subselect."""
         return "FOR UPDATE SKIP LOCKED"
 
+    def box_claim_serializer(self) -> str | None:
+        """Statement that serializes CLAIMS per box inside the claim transaction —
+        run before the slot-gated claim so two concurrent claimants can't both read
+        "N-1 running" and both take the box's last slot. pg: an advisory xact lock
+        keyed on (host, queue, project), auto-released at commit. ``None`` ⇒ the
+        store needs no extra serialization (SQLite's single writer already
+        serializes every claim)."""
+        return (
+            "SELECT pg_advisory_xact_lock(hashtext("
+            "%(host)s || '|' || %(queue)s || '|' || %(project)s))"
+        )
+
     def not_distinct_from(self, a: str, b: str) -> str:
         """Null-safe equality (``NULL`` equals ``NULL``) — the warm-model
         affinity tiebreak. pg: ``a IS NOT DISTINCT FROM b``."""
@@ -129,6 +141,11 @@ class PgDialect(Dialect):
 
 class SqliteDialect(Dialect):
     name = "sqlite"
+
+    def box_claim_serializer(self) -> str | None:
+        # SQLite has ONE writer at a time — every claim is already serialized by
+        # the store itself, so no extra per-box lock statement is needed.
+        return None
 
     @property
     def now(self) -> str:
