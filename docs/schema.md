@@ -119,7 +119,7 @@ Selecting the backend is a `configure()` concern, not a schema concern — see
 and [storage_backends.md](storage_backends.md) for the `redis`/`mongodb`
 backends, which bypass this schema entirely via the `StorageBackend` SPI.
 
-## 3. The chain, migration by migration (0001–0019)
+## 3. The chain, migration by migration (0001–0020)
 
 Every migration below applies to *both* dialect directories in lockstep
 (dialect differences per §2); the "why" is dialect-independent.
@@ -145,6 +145,7 @@ Every migration below applies to *both* dialect directories in lockstep
 | **0017** `project_tenant` | `project TEXT NOT NULL DEFAULT ''` on `workflow_runs`, `workflow_node_jobs`, `ingest_jobs`, `worker_heartbeats`; widens `worker_heartbeats`' PK to `(host_label, queue, project)`; project-aware claim indexes | Pools **multiple projects onto one shared broker Postgres** (previously one Postgres per project was assumed). `DEFAULT ''` keeps a single-tenant deploy byte-compatible — every row is `''`, the claim filter `project=''` matches everything, so behavior is unchanged with zero host wiring. **Breaking for raw-SQL heartbeat writers**: the 2-column `ON CONFLICT (host_label, queue)` no longer matches any constraint — callers must move to `node_queue.upsert_worker_heartbeat`. |
 | **0018** `node_events_project` | `workflow_node_events.project TEXT NOT NULL DEFAULT ''` + `(project, event_type, created_at DESC)` index | 0017 tagged runs/node-jobs/ingest-jobs/heartbeats with `project` but missed the forensic event log — this closes the gap so an operator "Errors" view stays project-scoped without a join, matching the rest of the broker. |
 | **0019** `worker_controls_project` | `worker_controls.project TEXT NOT NULL DEFAULT ''`; re-keys its PK to `(host_label, queue, project)` | The control-plane twin of 0017: on a shared broker, `host_label` is no longer globally unique (two projects can run a worker on the same machine+queue), so a 2-column `worker_controls` PK let one project's operator ON/OFF (or LLM-config write) silently hit the *other* project's worker. NOTIFY payloads are deliberately left unchanged (`host:queue` / `host\|queue`, no tenant segment) — both watchers treat the NOTIFY as a bare wake and re-read their own project's row, so a spurious cross-tenant wake is harmless. **Breaking for raw-SQL control writers** for the same reason as 0017. |
+| **0020** `node_job_box_placement` | `workflow_node_jobs.avoid_box text[]` + `force_box text[]` (both NULL by default; sqlite twin = `TEXT` JSON) | Per-node-job **physical-box placement**: a job may be excluded from (`avoid_box`) or pinned to (`force_box`) boxes **by name** — the `gpu_model_lease.default_box_id()` identity (`QUEUE_WORKFLOWS_GPU_BOX_ID` → hostname), the same one the one-model-per-box lease uses, **not** the per-project `host_label`. The cpu **and** gpu claim SQL AND a placement predicate into their `SELECT … SKIP LOCKED`, so an ineligible box never grabs the row (an eligible peer does); NULL arrays short-circuit to unconstrained, so every pre-0020 row + consumer is byte-identical. A box-unaware worker (no resolved name) claims only unconstrained rows. See `docs/box_placement.md`. |
 
 `0017`'s and `0019`'s down-migrations are the two genuinely **destructive**
 reversals in the chain: collapsing the 3-column PK back to 2 columns only

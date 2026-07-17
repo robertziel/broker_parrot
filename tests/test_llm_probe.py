@@ -74,6 +74,86 @@ def test_empty_base_url_probes_nothing():
     assert get.calls == []  # type: ignore[attr-defined]
 
 
+# ── ComfyUI: a THIRD server kind that can hold the box (diffusion) ────────────
+#
+# broker_parrot must arbitrate every serving path on a box, not just the two LLM
+# servers. ComfyUI has no "current checkpoint" API, but its /system_stats reports the
+# torch allocator's VRAM: a loaded diffusion model shows GBs of torch_vram in use,
+# where a bare ComfyUI (CUDA context only) sits near zero. That is the honest
+# residency signal, and /free is the honest evict lever.
+
+
+def _fake_get_json(url_to_payload: dict):
+    calls: list[str] = []
+
+    def get_json(url: str, timeout_s: float):
+        calls.append(url)
+        if url not in url_to_payload:
+            raise OSError("connection refused")
+        val = url_to_payload[url]
+        if isinstance(val, Exception):
+            raise val
+        return val
+
+    get_json.calls = calls  # type: ignore[attr-defined]
+    return get_json
+
+
+def _stats(torch_used_bytes: int):
+    """A /system_stats payload where the cuda device's torch allocator holds
+    ``torch_used_bytes`` (total - free)."""
+    total = 128 << 30
+    return {"devices": [{
+        "name": "cuda:0", "type": "cuda", "index": 0,
+        "vram_total": total, "vram_free": total - torch_used_bytes,
+        "torch_vram_total": total, "torch_vram_free": total - torch_used_bytes,
+    }]}
+
+
+def test_comfyui_with_a_model_loaded_is_resident():
+    # 20 GiB of torch VRAM in use ⇒ a diffusion model is resident.
+    gj = _fake_get_json({"http://box:8188/system_stats": _stats(20 << 30)})
+    assert llm_probe.comfyui_loaded("http://box:8188", get_json_fn=gj) is True
+
+
+def test_comfyui_up_but_no_model_is_not_resident():
+    # Bare ComfyUI: only the CUDA context (~hundreds of MB) — below the model floor.
+    gj = _fake_get_json({"http://box:8188/system_stats": _stats(256 << 20)})
+    assert llm_probe.comfyui_loaded("http://box:8188", get_json_fn=gj) is False
+
+
+def test_comfyui_unreachable_is_not_resident():
+    gj = _fake_get_json({})  # nothing answers
+    assert llm_probe.comfyui_loaded("http://box:8188", get_json_fn=gj) is False
+
+
+def test_comfyui_probe_never_raises():
+    gj = _fake_get_json({"http://box:8188/system_stats": OSError("boom")})
+    assert llm_probe.comfyui_loaded("http://box:8188", get_json_fn=gj) is False
+    assert llm_probe.comfyui_loaded("", get_json_fn=gj) is False
+    assert llm_probe.comfyui_loaded(None, get_json_fn=gj) is False
+
+
+def test_comfyui_free_posts_the_unload_payload():
+    posted: list[tuple] = []
+
+    def post(url, payload, timeout_s):
+        posted.append((url, payload))
+        return 200
+
+    assert llm_probe.comfyui_free("http://box:8188", post_fn=post) is True
+    assert posted == [("http://box:8188/free",
+                       {"unload_models": True, "free_memory": True})]
+
+
+def test_comfyui_free_never_raises_and_reports_failure():
+    def boom(url, payload, timeout_s):
+        raise OSError("down")
+
+    assert llm_probe.comfyui_free("http://box:8188", post_fn=boom) is False
+    assert llm_probe.comfyui_free("", post_fn=boom) is False
+
+
 # ── locality: is this box serving itself, or borrowing another box's GPU? ─────
 
 

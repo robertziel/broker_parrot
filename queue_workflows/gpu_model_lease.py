@@ -49,6 +49,13 @@ log = logging.getLogger(__name__)
 DEFAULT_TTL_S = 120.0
 
 
+#: The lease key for a NO-MODEL LLM-dispatch job. A box's LLM server (ollama)
+#: holds ONE model, so every such job shares this one slot; it is a DIFFERENT key
+#: from any diffusion model id, so the two mutually exclude on the box (one model
+#: per card across all projects).
+LLM_SERVER_SLOT = "__llm_server__"
+
+
 class ModelLeaseDenied(RuntimeError):
     """Raised when a worker may not load a model because a LIVE holder on this box
     has a different one resident. The caller must not load — let the job be
@@ -108,11 +115,22 @@ class FileLeaseStore:
     """A shared-file store: JSON under ``dir``, guarded by an exclusive ``flock`` so
     the read-modify-write is atomic across PROCESSES (and across containers, when
     each mounts the same host directory — that's what makes it a *box*-wide lease).
-    """
+
+    The participants deliberately span uids: root worker containers and non-root
+    HOST processes (e.g. an editable-install fleet run outside Docker) all
+    coordinate on one file. So every artifact is made world-writable (file ``0666``, dir ``0777``,
+    chmod best-effort past the umask) — whoever creates it first must never lock the
+    others out (the observed failure: a root container created the file ``0644`` and
+    the host worker hit ``EACCES``, silently unable to participate). It's a
+    coordination lockfile, not data — the classic shared-lock permission."""
 
     def __init__(self, directory: str) -> None:
         self.dir = directory
         os.makedirs(self.dir, exist_ok=True)
+        try:
+            os.chmod(self.dir, 0o777)
+        except OSError:
+            pass  # not the owner — fine, as long as we can write into it
 
     def _path(self, box_id: str) -> str:
         safe = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in box_id)
@@ -130,7 +148,13 @@ class FileLeaseStore:
         """Atomic read-modify-write under an exclusive lock."""
         import fcntl
         path = self._path(box_id)
+        created = not os.path.exists(path)
         with open(path, "a+") as fh:
+            if created:
+                try:
+                    os.chmod(path, 0o666)   # cross-uid: root containers + host procs
+                except OSError:
+                    pass
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
             try:
                 fh.seek(0)

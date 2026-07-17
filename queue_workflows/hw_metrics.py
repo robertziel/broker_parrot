@@ -357,7 +357,14 @@ def _iso_now() -> str:
 
 
 class HwMetricsSampler(threading.Thread):
-    """Thread that samples + broadcasts. Daemon — dies with the worker."""
+    """Thread that samples + broadcasts. Daemon — dies with the worker.
+
+    When the persisted hardware flight recorder is enabled
+    (``QUEUE_WORKFLOWS_HW_WATCH=1`` — see :mod:`queue_workflows.hw_watch`)
+    this same thread also drives its two-tier cadence: the loop then ticks at
+    the detail interval (default 2 s) while the NOTIFY broadcast keeps its own
+    5 s schedule, so the live-dashboard contract is unchanged. Disabled ⇒ the
+    loop is byte-identical to the pre-0021 behaviour."""
 
     def __init__(self, interval_s: float = SAMPLE_INTERVAL_S):
         super().__init__(daemon=True, name="hw-metrics")
@@ -367,19 +374,46 @@ class HwMetricsSampler(threading.Thread):
         # ``usage_usec`` per container) for CPU% deltas, so the instance lives
         # with the sampler thread. Prefix comes from config.container_prefix.
         self._attrib = CgroupAttribution()
+        from queue_workflows import hw_watch
+        self._watch = (
+            hw_watch.HwWatchRecorder(host_label=_host_label())
+            if hw_watch.enabled() else None
+        )
 
     def stop(self) -> None:
         self._stop_evt.set()
 
     def run(self) -> None:
-        log.info("[hw_metrics] sampler running (NOTIFY %s, interval=%ss)",
-                 NOTIFY_CHANNEL, self.interval_s)
+        log.info("[hw_metrics] sampler running (NOTIFY %s, interval=%ss%s)",
+                 NOTIFY_CHANNEL, self.interval_s,
+                 ", hw-watch persistence ON" if self._watch else "")
+        if self._watch is None:
+            while not self._stop_evt.is_set():
+                try:
+                    _broadcast(_build_sample(self._attrib))
+                except Exception:
+                    log.exception("[hw_metrics] broadcast failed")
+                if self._stop_evt.wait(self.interval_s):
+                    return
+            return
+
+        # Flight-recorder mode: fast tick for the detail tier; broadcast on
+        # its own due-time so the NOTIFY cadence stays interval_s.
+        next_broadcast = 0.0
+        tick_s = min(self.interval_s, self._watch.detail_interval_s)
         while not self._stop_evt.is_set():
+            now = time.time()
+            if now >= next_broadcast:
+                try:
+                    _broadcast(_build_sample(self._attrib))
+                except Exception:
+                    log.exception("[hw_metrics] broadcast failed")
+                next_broadcast = now + self.interval_s
             try:
-                _broadcast(_build_sample(self._attrib))
+                self._watch.tick(now)
             except Exception:
-                log.exception("[hw_metrics] broadcast failed")
-            if self._stop_evt.wait(self.interval_s):
+                log.exception("[hw_metrics] hw-watch tick failed")
+            if self._stop_evt.wait(tick_s):
                 return
 
 

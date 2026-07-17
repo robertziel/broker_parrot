@@ -178,9 +178,14 @@ def test_cancel_orphaned_queued_jobs_sweeps_across_multiple_runs():
 # ── configure(cancel_orphan_queued_jobs=...) ─────────────────────────────────
 
 
-def test_cancel_orphan_queued_jobs_default_is_false():
+def test_cancel_orphan_queued_jobs_default_is_TRUE():
+    """Default flipped ON by the 2026-07-16 ghost audit: a 'full' gpu queue turned
+    out to be 82 % ghosts (queued jobs of terminal runs), which poisoned every
+    queue-depth-driven signal. Semantically safe — a terminal run's job can never
+    be claimed — so the engine now cleans them up by default; hosts opt back out
+    via configure(cancel_orphan_queued_jobs=False)."""
     cfg = queue_workflows.configure()
-    assert cfg.cancel_orphan_queued_jobs is False
+    assert cfg.cancel_orphan_queued_jobs is True
 
 
 def test_configure_cancel_orphan_queued_jobs_roundtrips_true():
@@ -208,12 +213,10 @@ def test_node_pool_tick_sweeps_orphans_when_flag_enabled():
 
 
 def test_node_pool_tick_does_not_sweep_when_flag_disabled():
-    """Default: flag OFF ⇒ the sweep is a no-op. Existing engine behaviour is
-    preserved byte-for-byte (orphans remain queued; the claim SQL still skips
-    them via the run-cancel guard)."""
-    # Explicit reaffirm of the default — relying on conftest reset is enough
-    # but stating it makes the contract obvious to a future reader.
-    assert queue_workflows.get_config().cancel_orphan_queued_jobs is False
+    """Opt-OUT still honoured: a host that sets the flag False keeps the old
+    bookkeeping — the sweep is a no-op (orphans remain queued; the claim SQL
+    still skips them via the run-cancel guard)."""
+    queue_workflows.configure(cancel_orphan_queued_jobs=False)
 
     run_id = make_run()
     job_id = node_queue.enqueue_node_job(

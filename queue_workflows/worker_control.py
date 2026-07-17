@@ -194,25 +194,21 @@ def set_worker_control(
             cur.execute(sql, params)
 
 
-def get_worker_control(
-    host_label: str, queue: str, *, project: str | None = None,
+def _box_address(host_label: str) -> str | None:
+    """The BOX a per-lane label addresses: one trailing ``-<segment>`` stripped
+    (``box-c-gpu`` → ``box-c``; ``a-b-gpu`` → ``a-b``), or ``None`` for a label
+    with no ``-`` (nothing to strip). Deliberately strips exactly ONE segment —
+    the documented lane convention is ``<box>-<lane>`` — so a box row can never
+    reach across to a *different* box that happens to share a prefix."""
+    base, sep, tail = host_label.rpartition("-")
+    return base if (sep and base and tail) else None
+
+
+def _lookup_worker_control(
+    host_label: str, queue: str, project: str | None,
 ) -> dict[str, Any] | None:
-    """Return the control row for a ``(host_label, queue, project)`` worker, or
-    ``None`` when no row exists OR the ``worker_controls`` table hasn't been
-    migrated yet.
-
-    Project-scoped (migration 0019); ``project`` defaults to ``config.project``.
-
-    Never raises on a partially-migrated DB, and — importantly — never SILENTLY
-    ignores an OFF row:
-
-    * ``UndefinedTable`` (pre-0012, no worker_controls) ⇒ ``None`` ⇒ default-ON.
-      This is what lets the engine run unchanged before 0012 is applied — the
-      claim worker's ``await_schema`` gate only waits for the lease migrations
-      (6/8), not 12.
-    * ``UndefinedColumn`` (0012 applied, 0019 not) ⇒ retry the pre-0019 2-col
-      lookup. Falling back to ``None`` here would make a worker whose operator
-      set it OFF quietly come back ON during the bootstrap window."""
+    """One exact ``(host_label, queue[, project])`` row fetch, tolerant of a
+    partially-migrated DB (see :func:`get_worker_control` for the rules)."""
     import psycopg
 
     cols = (
@@ -242,6 +238,44 @@ def get_worker_control(
             return cur.fetchone()
     except psycopg.errors.UndefinedTable:
         return None
+
+
+def get_worker_control(
+    host_label: str, queue: str, *, project: str | None = None,
+) -> dict[str, Any] | None:
+    """Return the control row governing a ``(host_label, queue, project)`` worker,
+    or ``None`` when none exists OR the ``worker_controls`` table hasn't been
+    migrated yet.
+
+    **Resolution order — exact label, then box address.** Deployments label
+    per-lane workers ``<box>-<lane>`` (``box-c-gpu``), but an operator UI parks a
+    *machine* and may write the row keyed by the bare box name (``box-c``). The
+    exact ``(host_label, queue)`` row wins when present; otherwise a row keyed by
+    the label with one trailing ``-<segment>`` stripped applies. Without this, a
+    box-keyed OFF row matched nothing: the UI showed the box parked (its read side
+    maps rows to boxes by substring) while the worker — matching only its exact
+    label and treating absent-as-ON — kept claiming. ``queue`` filters both
+    lookups, so ``(box-c, cpu)`` never parks ``box-c-gpu``.
+
+    Project-scoped (migration 0019); ``project`` defaults to ``config.project``.
+
+    Never raises on a partially-migrated DB, and — importantly — never SILENTLY
+    ignores an OFF row:
+
+    * ``UndefinedTable`` (pre-0012, no worker_controls) ⇒ ``None`` ⇒ default-ON.
+      This is what lets the engine run unchanged before 0012 is applied — the
+      claim worker's ``await_schema`` gate only waits for the lease migrations
+      (6/8), not 12.
+    * ``UndefinedColumn`` (0012 applied, 0019 not) ⇒ retry the pre-0019 2-col
+      lookup. Falling back to ``None`` here would make a worker whose operator
+      set it OFF quietly come back ON during the bootstrap window."""
+    row = _lookup_worker_control(host_label, queue, project)
+    if row is not None:
+        return row
+    box = _box_address(host_label)
+    if box:
+        return _lookup_worker_control(box, queue, project)
+    return None
 
 
 def desired_state_for(
@@ -358,31 +392,21 @@ def set_llm_config(
             cur.execute(sql, params)
 
 
-def llm_config_for(
-    host_label: str, queue: str, *, project: str | None = None,
-) -> LLMConfig:
-    """The effective :class:`LLMConfig` for a worker: the row's LLM columns, or
-    the all-defaults config when no row exists.
-
-    Project-scoped (migration 0019); ``project`` defaults to ``config.project``.
-
-    Never raises on a partially-migrated DB — ``UndefinedTable`` (pre-0012, no
-    worker_controls) and ``UndefinedColumn`` (0012 applied but not 0013) fall
-    back to defaults, so the engine + every consumer runs unchanged before 0013
-    is applied (mirrors :func:`get_worker_control`'s pre-0012 tolerance). A
-    pre-0019 DB (no ``project`` column) retries the 2-col lookup first, so the
-    operator's configured server type isn't lost during the bootstrap window."""
+def _lookup_llm_row(
+    host_label: str, queue: str, project: str | None,
+) -> dict[str, Any] | None:
+    """One exact LLM-columns row fetch, tolerant of a partially-migrated DB
+    (see :func:`llm_config_for` for the rules)."""
     import psycopg
 
     cols = "SELECT llm_server_type, llm_parallelism, vllm_idle_ttl_s FROM worker_controls"
-    row = None
     try:
         with connection() as conn, conn.cursor() as cur:
             cur.execute(
                 f"{cols} WHERE host_label = %s AND queue = %s AND project = %s",
                 (host_label, queue, _project(project)),
             )
-            row = cur.fetchone()
+            return cur.fetchone()
     except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn):
         # Either no table (pre-0012) / no LLM columns (pre-0013) — defaults — or
         # no project column (pre-0019), in which case the 2-col lookup still has
@@ -393,9 +417,36 @@ def llm_config_for(
                     f"{cols} WHERE host_label = %s AND queue = %s",
                     (host_label, queue),
                 )
-                row = cur.fetchone()
+                return cur.fetchone()
         except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn):
-            return LLMConfig()
+            return None
+
+
+def llm_config_for(
+    host_label: str, queue: str, *, project: str | None = None,
+) -> LLMConfig:
+    """The effective :class:`LLMConfig` for a worker: the row's LLM columns, or
+    the all-defaults config when no row exists.
+
+    Resolves the exact ``(host_label, queue)`` row first, then the BOX-addressed
+    row (one trailing ``-<segment>`` stripped — see :func:`get_worker_control`):
+    the same operator UIs that park a machine by its box name set the machine's
+    LLM server type the same way, so the lookup honors both keys with the exact
+    row winning.
+
+    Project-scoped (migration 0019); ``project`` defaults to ``config.project``.
+
+    Never raises on a partially-migrated DB — ``UndefinedTable`` (pre-0012, no
+    worker_controls) and ``UndefinedColumn`` (0012 applied but not 0013) fall
+    back to defaults, so the engine + every consumer runs unchanged before 0013
+    is applied (mirrors :func:`get_worker_control`'s pre-0012 tolerance). A
+    pre-0019 DB (no ``project`` column) retries the 2-col lookup first, so the
+    operator's configured server type isn't lost during the bootstrap window."""
+    row = _lookup_llm_row(host_label, queue, project)
+    if row is None:
+        box = _box_address(host_label)
+        if box:
+            row = _lookup_llm_row(box, queue, project)
     if not row:
         return LLMConfig()
     return LLMConfig(

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 from queue_workflows.envcompat import env_get
 import socket
@@ -48,8 +49,79 @@ def gpu_model_cache() -> ModelCache:
         _GPU_MODEL_CACHE = ModelCache(
             publish_current_model=lambda m: _publish_current_model(m),
             lease=build_lease(),
+            pre_load_check=_box_load_gate,
         )
     return _GPU_MODEL_CACHE
+
+
+#: Settle the post-eviction verify: an evicted server (ollama ``keep_alive:0``) usually
+#: drops the model by the time its POST returns, but the box is RE-PROBED up to
+#: ``_GATE_SETTLE_TRIES`` times (sleeping ``_GATE_SETTLE_SLEEP_S`` between) so a
+#: slightly-slow unload never spuriously refuses an otherwise-clean load. Returns the
+#: moment the box is clean. Injectable (``_GATE_SLEEP``) so tests run with a virtual clock.
+_GATE_SETTLE_SLEEP_S = 0.5
+_GATE_SETTLE_TRIES = 3
+_GATE_SLEEP = time.sleep
+
+
+def _box_load_gate(model_id: str) -> None:
+    """LAST-DEFENCE gate wired into the warm cache — CLEAR-THEN-LOAD, not refuse-and-wait.
+
+    A ``ModelCache`` load is always IN-PROCESS (native diffusion, e.g. sdxl), so
+    before the weights hit VRAM this makes the box hold ONLY this model: it evicts every
+    OTHER serving kind via its own lever — a resident ollama model gets ``keep_alive:0``,
+    a losing vLLM its stop hook, a ComfyUI a ``/free`` — then re-observes and REFUSES
+    (``ModelAlreadyLoadedError``) only if a foreign model SURVIVED eviction (an
+    un-evictable second model must fail the load, never silently coexist). Every
+    probe/evict is best-effort: a dead endpoint degrades to 'saw nothing' and can't wedge
+    the load. Logs which kind(s) it cleared so "what server type held the box" is visible."""
+    from queue_workflows import llm_probe, model_residency
+    from queue_workflows.config import get_config
+    from queue_workflows.envcompat import env_get
+    from queue_workflows.llm_backends import factory as _llm_factory
+
+    cfg = get_config()
+    label = env_get(cfg.host_label_env, "") or "this-box"
+    comfyui_url = (env_get("QUEUE_WORKFLOWS_COMFYUI_URL") or cfg.comfyui_url or "").strip()
+
+    def _reprobe() -> list:
+        # Poll until the box is clean (only this in-process model, or empty) or the
+        # grace runs out — absorbs a slow ollama unload without a spurious refusal.
+        residents = model_residency.probe_box_residents()
+        for _ in range(_GATE_SETTLE_TRIES - 1):
+            if not [r for r in residents
+                    if not (r.server == llm_probe.INPROCESS and r.model == model_id)]:
+                return residents
+            _GATE_SLEEP(_GATE_SETTLE_SLEEP_S)
+            residents = model_residency.probe_box_residents()
+        return residents
+
+    def _stop_vllm() -> None:
+        fn = cfg.vllm_stop_fn
+        if fn is not None:
+            fn()
+        else:
+            log.error(
+                "[box] %s: a vLLM must be evicted to load %s but no stop hook is wired "
+                "(set_vllm_lifecycle) — it may survive as a 2nd model.", label, model_id,
+            )
+
+    evicted = model_residency.clear_box_for(
+        llm_probe.INPROCESS, model_id, model_residency.probe_box_residents(),
+        unload_ollama=lambda models: llm_probe.unload_ollama_models(
+            _llm_factory.resolve_base_url("ollama"), models),
+        stop_vllm=_stop_vllm,
+        free_comfyui=lambda: llm_probe.comfyui_free(comfyui_url),
+        reprobe=_reprobe,
+        label=label,
+    )
+    if evicted:
+        log.warning(
+            "[box] %s: cleared %s to load %s:%s — one model per box",
+            label,
+            ", ".join(sorted({f"{r.server}:{r.model}" for r in evicted})),
+            llm_probe.INPROCESS, model_id,
+        )
 
 
 def _reset_gpu_model_cache_for_tests() -> None:
