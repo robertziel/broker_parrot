@@ -395,6 +395,132 @@ def _disk_root_used_mb() -> int | None:
     return int(used // (1024 * 1024))
 
 
+# ── CPU hardware stats (stdlib /proc + /sys; no psutil) ───────────────────
+#
+# On a unified-memory SoC the CPU shares the die and power budget with the
+# GPU, so its temperature / frequency / throttle counter are part of the same
+# box-health story the GPU metrics tell. Each reader is best-effort and
+# returns None on any failure so a missing sensor never breaks the sample.
+
+
+def _proc_stat_jiffies() -> tuple[int, int]:
+    """(idle, total) CPU jiffies from the aggregate ``cpu`` line of /proc/stat.
+    idle counts idle + iowait; total is the sum of all fields."""
+    with open("/proc/stat") as f:
+        vals = [int(x) for x in f.readline().split()[1:]]
+    idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+    return idle, sum(vals)
+
+
+def _read_cpu_percent(interval: float = 0.05, snapshot: Callable[[], tuple[int, int]] | None = None) -> float | None:
+    """Overall CPU utilisation % over a short sampling window (two /proc/stat
+    reads ``interval`` s apart — deterministic, no cross-call state, ~50 ms at
+    the recorder cadence). ``snapshot`` is an injection seam for tests."""
+    snap = snapshot or _proc_stat_jiffies
+    try:
+        idle0, total0 = snap()
+        if interval:
+            time.sleep(interval)
+        idle1, total1 = snap()
+    except Exception:  # noqa: BLE001 — best-effort
+        return None
+    dt = total1 - total0
+    if dt <= 0:
+        return None
+    return round(100.0 * (1.0 - (idle1 - idle0) / dt), 1)
+
+
+def _read_cpu_freq_mhz() -> float | None:
+    """Mean current core frequency (MHz) — cpufreq ``scaling_cur_freq`` (kHz)
+    across cores, else /proc/cpuinfo ``cpu MHz``. A drop is a throttle tell."""
+    freqs = []
+    for f in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq"):
+        try:
+            with open(f) as fh:
+                freqs.append(int(fh.read().strip()))
+        except (OSError, ValueError):
+            continue
+    if freqs:
+        return round(sum(freqs) / len(freqs) / 1000.0)
+    mhz = []
+    try:
+        with open("/proc/cpuinfo") as fh:
+            for line in fh:
+                if line.lower().startswith("cpu mhz"):
+                    mhz.append(float(line.split(":", 1)[1]))
+    except (OSError, ValueError):
+        return None
+    return round(sum(mhz) / len(mhz)) if mhz else None
+
+
+def _read_cpu_temp_c() -> float | None:
+    """CPU package temperature (°C) — the hottest input of an hwmon named for a
+    CPU sensor (coretemp / k10temp / zenpower / cpu_thermal / x86_pkg_temp),
+    else a CPU-typed thermal zone. None when the box exposes none."""
+    for hw in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        try:
+            with open(os.path.join(hw, "name")) as f:
+                name = f.read().strip()
+        except OSError:
+            continue
+        if name in ("coretemp", "k10temp", "zenpower", "cpu_thermal", "x86_pkg_temp"):
+            temps = []
+            for t in glob.glob(os.path.join(hw, "temp*_input")):
+                try:
+                    with open(t) as f:
+                        temps.append(int(f.read().strip()))
+                except (OSError, ValueError):
+                    continue
+            if temps:
+                return round(max(temps) / 1000.0, 1)
+    for z in sorted(glob.glob("/sys/class/thermal/thermal_zone*")):
+        try:
+            with open(os.path.join(z, "type")) as f:
+                zt = f.read().strip().lower()
+            if any(k in zt for k in ("x86_pkg", "cpu", "coretemp")):
+                with open(os.path.join(z, "temp")) as f:
+                    return round(int(f.read().strip()) / 1000.0, 1)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _read_cpu_throttle_count() -> int | None:
+    """Summed per-core thermal-throttle counter (Intel
+    ``thermal_throttle/core_throttle_count``) — the CPU analogue of the GPU
+    violation counters; a rising delta = the CPU is being thermally clamped.
+    None on platforms that don't expose it (e.g. most ARM/GB10)."""
+    counts = []
+    for f in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/thermal_throttle/core_throttle_count"):
+        try:
+            with open(f) as fh:
+                counts.append(int(fh.read().strip()))
+        except (OSError, ValueError):
+            continue
+    return sum(counts) if counts else None
+
+
+def _cpu_stats() -> dict[str, Any]:
+    """Assemble the CPU hardware stats; each sub-probe is guarded so this never
+    raises and always returns the full key set (missing sensors ⇒ None)."""
+    out: dict[str, Any] = {}
+    for key, probe in (
+        ("percent", _read_cpu_percent),
+        ("freq_mhz", _read_cpu_freq_mhz),
+        ("temp_c", _read_cpu_temp_c),
+        ("throttle_count", _read_cpu_throttle_count),
+    ):
+        try:
+            out[key] = probe()
+        except Exception:  # noqa: BLE001 — a dead sub-probe records None
+            out[key] = None
+    try:
+        out["ncpu"] = os.cpu_count()
+    except Exception:  # noqa: BLE001
+        out["ncpu"] = None
+    return out
+
+
 def deep_sample() -> dict[str, Any]:
     """One full hardware sample. Every probe is individually guarded so the
     key set is stable even when a probe fails — consumers can rely on the
@@ -407,6 +533,7 @@ def deep_sample() -> dict[str, Any]:
         ("mem", _read_meminfo, {}),
         ("load1", _read_load1, None),
         ("disk_root_used_mb", _disk_root_used_mb, None),
+        ("cpu", _cpu_stats, {}),
     ):
         try:
             sample[key] = probe()

@@ -5,6 +5,29 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.5] — 2026-07-18
+
+### Added
+- **CPU hardware stats in the `hw_watch` flight recorder** — `deep_sample()`
+  gains a `cpu` block (stdlib `/proc` + `/sys`, no `psutil`): utilisation %,
+  mean core frequency, package temperature (coretemp / k10temp / zenpower /
+  cpu_thermal), and the summed core thermal-throttle counter (the CPU analogue
+  of the GPU violation counters). On a unified-memory SoC the CPU shares the
+  die and power budget with the GPU, so its thermals belong in the same
+  box-health record. Best-effort per sub-probe — a missing sensor yields
+  `None`, never a raise.
+
+### Fixed
+- **Per-node-job box placement (`avoid_box` / `force_box`) now reaches the
+  enqueued node-jobs.** The dispatcher's `_nodes_of` dropped the placement
+  fields when expanding a run, so migration 0020's constraints never made it
+  onto the rows; they are now threaded through.
+
+### Docs
+- README: a screenshot of an example operator front-end built directly on the
+  engine's telemetry (the `hw_watch_samples` flight recorder + `worker_heartbeats`
+  + `worker_controls`) — per-box GPU/CPU temperature, power, clock, and throttle.
+
 ## [1.0.4] — 2026-07-17
 
 ### Added — one model per physical GPU box (cross-project arbitration)
