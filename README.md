@@ -23,6 +23,10 @@ As of **v1.0.0 the default backend is SQLite** — a daemon-less local file, zer
 
 > **There's no bundled dashboard — the engine emits what a dashboard needs.** Live per-host CPU/GPU/RAM over `pg_notify('hw_metrics', …)`, `worker_heartbeats`, the `node_queue.*_snapshot()` read models, and the `worker_controls` ON/OFF toggles are all there. Bring your own front-end — it's a great task to hand a coding agent. A newer **broker web service + operator panel** ([`docs/broker.md`](docs/broker.md), [screenshot](#-one-broker-for-many-projects)) also ships as a pure-stdlib, server-rendered option.
 
+Here's an example of a richer front-end built directly on that telemetry — a fleet **hardware + queue** operator panel. It reads the engine's `hw_watch_samples` flight recorder (migration 0021), `worker_heartbeats`, and `worker_controls` straight from the DB and draws a 1-hour trail per box: GPU **and** CPU temperature, power, **clock speed**, and throttle, plus worker ON/OFF control. Below, `box-a` runs uncapped and is hitting its power-brake (⚡), while `box-b`'s GPU clock is pinned flat at 2100 MHz and stays stable — the kind of operational story the engine's raw telemetry makes visible:
+
+![A fleet hardware + queue operator panel built on the engine's telemetry — per-box GPU/CPU temperature, power, clock, and throttle over the last hour, with worker ON/OFF control](docs/images/flight-deck-panel.png)
+
 ---
 
 ## Table of Contents

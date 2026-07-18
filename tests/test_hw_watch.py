@@ -165,15 +165,60 @@ def test_recorder_records_nothing_when_no_tier_due():
 def test_deep_sample_has_stable_shape_even_when_probes_fail(monkeypatch):
     for probe in (
         "_gpu_deep", "_read_thermal_zones", "_read_hwmon_temps",
-        "_read_meminfo", "_read_load1", "_disk_root_used_mb",
+        "_read_meminfo", "_read_load1", "_disk_root_used_mb", "_cpu_stats",
     ):
         monkeypatch.setattr(
             hw_watch, probe,
             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("probe down")),
         )
     sample = hw_watch.deep_sample()
-    for key in ("gpu", "tz", "hwmon", "mem", "load1", "disk_root_used_mb"):
+    for key in ("gpu", "tz", "hwmon", "mem", "load1", "disk_root_used_mb", "cpu"):
         assert key in sample
+
+
+# ── CPU hardware stats ───────────────────────────────────────────────────
+#
+# On a unified-memory SoC (GB10) the CPU shares the die + power budget with
+# the GPU, so CPU temp / freq / throttle are part of the same box-health
+# story. All stdlib (/proc, /sys) — no psutil dependency for the recorder.
+
+
+def test_cpu_percent_from_jiffy_delta():
+    # idle unchanged (+0), total +100 → 100% busy
+    seq = iter([(1000, 2000), (1000, 2100)])
+    assert hw_watch._read_cpu_percent(interval=0.0, snapshot=lambda: next(seq)) == 100.0
+    # idle +100, total +200 → 50% busy
+    seq = iter([(1000, 2000), (1100, 2200)])
+    assert hw_watch._read_cpu_percent(interval=0.0, snapshot=lambda: next(seq)) == 50.0
+
+
+def test_cpu_percent_none_when_no_time_passed():
+    seq = iter([(1000, 2000), (1000, 2000)])   # dt = 0
+    assert hw_watch._read_cpu_percent(interval=0.0, snapshot=lambda: next(seq)) is None
+
+
+def test_cpu_stats_has_stable_shape():
+    stats = hw_watch._cpu_stats()
+    for key in ("percent", "freq_mhz", "temp_c", "throttle_count", "ncpu"):
+        assert key in stats
+    assert stats["ncpu"] is None or stats["ncpu"] >= 1
+
+
+def test_cpu_stats_survives_sub_probe_failure(monkeypatch):
+    for p in ("_read_cpu_percent", "_read_cpu_freq_mhz", "_read_cpu_temp_c",
+              "_read_cpu_throttle_count"):
+        monkeypatch.setattr(hw_watch, p,
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+    stats = hw_watch._cpu_stats()          # must not raise
+    assert stats["percent"] is None and stats["temp_c"] is None
+
+
+def test_deep_sample_includes_cpu(monkeypatch):
+    monkeypatch.setattr(hw_watch, "_cpu_stats",
+                        lambda: {"percent": 42.0, "temp_c": 61.0, "freq_mhz": 3200,
+                                 "throttle_count": 0, "ncpu": 20})
+    sample = hw_watch.deep_sample()
+    assert sample["cpu"]["percent"] == 42.0 and sample["cpu"]["temp_c"] == 61.0
 
 
 def test_deep_sample_collects_real_probe_data():

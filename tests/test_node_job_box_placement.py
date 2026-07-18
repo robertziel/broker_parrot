@@ -128,3 +128,31 @@ def test_dispatcher_reads_avoid_and_force_off_the_node_spec(monkeypatch):
             "avoid_box": ["box-a"], "force_box": ["box-c"]}
     dispatcher._enqueue(run_id, node, run)
     assert seen["avoid_box"] == ["box-a"] and seen["force_box"] == ["box-c"]
+
+
+# ── _nodes_of carries the flags from the pipeline schema node ─────────────────
+
+
+def test_nodes_of_threads_avoid_and_force_from_the_schema(monkeypatch):
+    # The bug this pins: _nodes_of builds each node dict from a WHITELIST of
+    # schema keys, so placement injected by a schema provider (e.g. a host's
+    # default avoid_box) was silently dropped before _enqueue's
+    # node.get("avoid_box") — every node_job got NULL despite the schema.
+    schema = {
+        "nodes": [
+            {"id": "prep", "gpu": False, "inputs": []},
+            {"id": "render", "gpu": True, "model": "sdxl", "depends_on": ["prep"],
+             "inputs": [], "avoid_box": ["box-a", "box-b"], "force_box": ["box-c"]},
+        ],
+    }
+    monkeypatch.setattr(dispatcher, "_pipeline_schema", lambda name: schema)
+    workflow = {
+        "name": "wf", "mode": "node",
+        "steps": [{"id": "s", "kind": "pipeline", "pipeline": "p"}],
+    }
+    nodes = dispatcher._nodes_of(workflow)
+    render = next(n for n in nodes if n["id"] == "s/render")
+    assert render["avoid_box"] == ["box-a", "box-b"]
+    assert render["force_box"] == ["box-c"]
+    prep = next(n for n in nodes if n["id"] == "s/prep")
+    assert prep["avoid_box"] is None and prep["force_box"] is None

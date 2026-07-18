@@ -161,6 +161,14 @@ def _nodes_of(
                 # also carry its own ``skip_if``. Node-level wins; step-level is
                 # the fallback.
                 "skip_if": sn.get("skip_if") or step_skip_if,
+                # Per-node PHYSICAL-BOX placement (migration 0020). This dict is
+                # a WHITELIST — a schema key not copied here is silently dropped
+                # before ``_enqueue_node``'s ``node.get("avoid_box")``, which is
+                # exactly how placement injected by a schema provider used to
+                # vanish (stamped NULL on every node_job despite the schema
+                # carrying it). Thread both fields through explicitly.
+                "avoid_box": sn.get("avoid_box"),
+                "force_box": sn.get("force_box"),
             })
     return out
 
