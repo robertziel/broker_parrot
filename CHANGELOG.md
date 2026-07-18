@@ -5,6 +5,73 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.6] — 2026-07-19
+
+### Added — ComfyUI as a first-class queue citizen
+- **Built-in `comfyui` render node** (`queue_workflows/builtin_nodes/comfyui.py`)
+  — one node_job = one whole ComfyUI render: stage inputs, POST the API-format
+  graph, poll to completion, collect the output. The reusable submit client +
+  box-acquisition live in `queue_workflows/comfyui.py` (`ensure_comfyui_box`
+  clears rival server kinds off the card, optionally boots the server via the
+  host-wired `set_comfyui_lifecycle`, then ready-probes).
+- **Pool-lane fixes for ComfyUI boxes**: a box serving ComfyUI (no LLM server)
+  can claim no-model ComfyUI render jobs, and never defers them to an
+  LLM-capacity peer (the fill-before-spill gate is LLM-work-only — deferring a
+  render to a box without ComfyUI starved it forever).
+
+### Added — per-box supervisor (`box_agent`)
+- **`queue_workflows/box_agent.py` + `queue-box-agent` console script** — ONE
+  agent per physical box that treats `worker_controls` as the single source of
+  truth and reconciles the box's actually-running worker lanes to match it
+  every 30 s: start a desired-on lane that isn't running, stop a desired-off
+  one, restart one that died. Lanes are declared in a JSON manifest (argv +
+  env per lane; an env value of `null` REMOVES the inherited key, so a lane on
+  a pinned baked engine never silently inherits the agent's own `PYTHONPATH`
+  tree). Control rows are fetched per-lane-DSN FAIL-OPEN (an unreachable
+  control DB defaults its lanes ON), tolerate a pre-0019 schema (no `project`
+  column), and SIGTERM/SIGINT forward to every lane so claim workers drain
+  gracefully when the container stops. Ends the "parked in compose but the DB
+  says on" split-brain: whether a lane runs is decided in exactly one place.
+
+### Added — operator control
+- **`stop_policy="drain"`** — parking a worker now has a keep-the-last-job
+  mode: the control watcher FLAGS the worker (process lives, watcher stays
+  armed so an escalation to `hard` still lands), and the claim loop parks at
+  its next iteration boundary — between jobs, never mid-job — via the existing
+  park-until-ON gate. The in-flight job and the box's inference server are
+  untouched (the server-stop moved inside the `hard` handler). The GPU pool
+  feeder also stops claiming while draining. Proven end-to-end on live
+  LISTEN/NOTIFY: a gate-held in-flight job completes with zero requeues, new
+  work stays unclaimed while parked, and the ON flip resumes claiming
+  (`tests/test_drain_end_to_end.py`).
+
+### Added — reliability
+- **Over-claim reaper** — the runtime safety-fallback for the per-box slot
+  arbiter: if a box is ever RUNNING more gpu jobs than its advertised
+  `worker_heartbeats.concurrency` (a bypassed claim path, a counter bug), a
+  NodePool sweep re-queues the NEWEST over-capacity job(s) resume-style (keep
+  the oldest running; no `watchdog_retries` bump; CAS so a just-finished job is
+  never yanked; a terminal parent cancels instead). Interval-gated (10 s), ON
+  by default, `QUEUE_WORKFLOWS_DISABLE_OVER_CLAIM_REAPER` to disable.
+
+### Added — telemetry
+- **Fan speed in the `hw_watch` flight recorder** — every hwmon `fan*_input`
+  tachometer (chassis/CPU/GPU) plus the GPU's own `fan.speed` %; `deep_sample`
+  derives `fan_rpm_max` / `gpu_fan_pct` graph-ready. `None` ⇒ no fan sensor
+  (distinct from a powered-off box, which writes no row at all).
+- **CPU/SoC temperature on ARM boards** — the CPU temp probe falls back to the
+  `acpitz` thermal zone on SoCs whose hwmon exposes no coretemp/k10temp analog.
+
+### Fixed
+- **A no-model ComfyUI render is its own box-lease server kind.** The
+  cross-project box lease keyed EVERY no-model job to the shared
+  `__llm_server__` slot, so a ComfyUI render and an ollama dispatch on one box
+  were treated as the same "model" and co-resided on the card. A
+  ComfyUI-serving worker's no-model job now keys to a distinct
+  `COMFYUI_SERVER_SLOT`, so the two kinds mutually exclude (while two ComfyUI
+  renders still share); `_model_still_resident` probes ComfyUI residency when
+  a URL is configured, else releases at job end via the active-jobs guard.
+
 ## [1.0.5] — 2026-07-18
 
 ### Added

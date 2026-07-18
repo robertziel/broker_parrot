@@ -459,7 +459,7 @@ def llm_config_for(
 # ── stop policies (the extensibility seam) ────────────────────────────────────
 
 
-def _apply_hard_stop(worker: Any, *, on_exit: Callable[[int], None]) -> None:
+def _apply_hard_stop(worker: Any, *, on_exit: Callable[[int], None]) -> bool:
     """HARD stop: re-queue this worker's in-flight job(s) and terminate the
     process to free RAM/VRAM immediately.
 
@@ -469,10 +469,13 @@ def _apply_hard_stop(worker: Any, *, on_exit: Callable[[int], None]) -> None:
     restarts the container; on boot it re-reads ``worker_controls`` and PARKS
     while still OFF. ``on_exit`` defaults to ``os._exit`` (injected in tests).
 
-    The re-queue (+ busy-ghost clear) runs FIRST so the in-flight job redistributes
-    immediately and the GPU-busy gauge drops this worker, mirroring the watchdog
-    trip path; a failure there is swallowed — the hard exit must happen regardless
-    (the lease-reclaim safety net recovers any row we couldn't re-queue)."""
+    The box's inference server is stopped first (gpu lane only — frees the VRAM
+    with the worker), then the re-queue (+ busy-ghost clear) so the in-flight job
+    redistributes immediately and the GPU-busy gauge drops this worker, mirroring
+    the watchdog trip path; a failure there is swallowed — the hard exit must
+    happen regardless (the lease-reclaim safety net recovers any row we couldn't
+    re-queue). Returns ``True``: the worker is stopping."""
+    _stop_inference_server(getattr(worker, "queue", ""))
     try:
         n = worker.requeue_inflight_for_control()
         log.warning(
@@ -486,6 +489,28 @@ def _apply_hard_stop(worker: Any, *, on_exit: Callable[[int], None]) -> None:
             "[worker-control] re-queue before hard stop failed; exiting anyway",
         )
     on_exit(EXIT_CONTROL_HARD_STOP)
+    return True
+
+
+def _apply_drain_stop(worker: Any, *, on_exit: Callable[[int], None]) -> bool:
+    """DRAIN stop (operator "park, but keep the last job"): flag the worker so its
+    claim loop parks at the NEXT iteration boundary — after the in-flight job
+    finishes — instead of claiming again. Nothing is killed: the running job, the
+    process, and the box's inference server (which the in-flight job may be
+    mid-call against) are all untouched; ``on_exit`` is never invoked.
+
+    Returns ``False``: the worker keeps living, so the watcher stays armed — an
+    operator can still ESCALATE a slow drain to ``hard`` (the panel's force-kill)
+    and the next watcher tick dispatches it."""
+    if not getattr(worker, "drain_requested", False):
+        log.warning(
+            "[worker-control:%s] DRAIN for host=%s — claiming stops at the next "
+            "boundary; the in-flight job is KEPT (escalate with stop_policy=hard "
+            "to kill it)",
+            getattr(worker, "queue", "?"), getattr(worker, "host", "?"),
+        )
+    worker.request_drain()
+    return False
 
 
 def _stop_inference_server(queue: str) -> None:
@@ -510,12 +535,15 @@ def _stop_inference_server(queue: str) -> None:
         )
 
 
-#: Stop-policy registry: ``policy name -> handler(worker, *, on_exit)``. The
-#: extensibility seam — add ``"drain"`` / ``"pause"`` here (each a new handler)
-#: with no migration or API change. ``set_worker_control`` validates a requested
-#: policy against these keys, and the watcher dispatches through it.
-STOP_POLICIES: dict[str, Callable[..., None]] = {
+#: Stop-policy registry: ``policy name -> handler(worker, *, on_exit) -> bool``
+#: (``True`` = the worker is stopping, the watcher may retire; ``False`` = the
+#: worker lives on — keep watching). The extensibility seam — ``"pause"`` still
+#: slots in here with no migration or API change. ``set_worker_control``
+#: validates a requested policy against these keys, and the watcher dispatches
+#: through it.
+STOP_POLICIES: dict[str, Callable[..., Any]] = {
     "hard": _apply_hard_stop,
+    "drain": _apply_drain_stop,
 }
 
 
@@ -567,12 +595,9 @@ class WorkerControlWatcher:
             return False
         if not row or row.get("desired_state") != STATE_OFF:
             return False
-        # GPU toggle governs the machine's inference SERVER too: turning the gpu
-        # worker OFF stops the box's LLM server to free the GPU's VRAM. Policy-
-        # independent (any OFF), gpu-lane-only, best-effort, and BEFORE the exit so
-        # the VRAM is released as we go down. A CPU/download lane OFF never touches
-        # the server. Unset hook ⇒ no-op (byte-compatible).
-        _stop_inference_server(self._queue)
+        # The inference-server stop lives INSIDE the hard handler (drain must not
+        # stop the server the in-flight job may be mid-call against; the eventual
+        # boot-park after a hard restart keeps it down via the park gate).
         policy = row.get("stop_policy") or "hard"
         handler = STOP_POLICIES.get(policy)
         if handler is None:
@@ -581,8 +606,10 @@ class WorkerControlWatcher:
                 "%r; falling back to hard", self._queue, policy,
             )
             handler = STOP_POLICIES["hard"]
-        handler(self._worker, on_exit=self._on_exit)
-        return True
+        # A handler returns True when the worker is STOPPING (hard: exit) — the
+        # watcher retires. False (drain: flagged, worker lives) keeps it armed so
+        # an escalation to hard on the next tick still lands.
+        return bool(handler(self._worker, on_exit=self._on_exit))
 
     def start(self) -> None:
         if not self._enabled:

@@ -55,6 +55,14 @@ DEFAULT_TTL_S = 120.0
 #: per card across all projects).
 LLM_SERVER_SLOT = "__llm_server__"
 
+#: The lease key for a NO-MODEL ComfyUI render job. A ComfyUI render puts ComfyUI's
+#: OWN model on the card — a different SERVER KIND from an ollama dispatch — so it
+#: must NOT share :data:`LLM_SERVER_SLOT`; a DISTINCT key makes a ComfyUI render and
+#: an ollama job mutually exclude on one box (while two ComfyUI renders still share).
+#: Used when the worker serves ComfyUI (a wired ComfyUI lifecycle or a configured
+#: ComfyUI URL) and the job carries no ``required_model``.
+COMFYUI_SERVER_SLOT = "__comfyui_server__"
+
 
 class ModelLeaseDenied(RuntimeError):
     """Raised when a worker may not load a model because a LIVE holder on this box

@@ -52,6 +52,12 @@ from typing import Any, Callable
 #: ``backends._BACKEND_ALIASES`` (+ the relational ``sqlite``/``pg``), inlined so
 #: ``config`` stays a leaf — importing ``backends`` here would cycle (it imports
 #: ``config.get_config``). ``configure()`` re-validates against the registry.
+# Engine BUILT-IN pool-lane node modules (shipped in queue_workflows.builtin_nodes):
+# always exempt from the gpu required-model guard and always resolvable, in every
+# project, regardless of host configuration. See EngineConfig.effective_vlm_pool_node_modules
+# and resolve_node_module's builtin fallback.
+BUILTIN_POOL_NODE_MODULES: frozenset[str] = frozenset({"comfyui"})
+
 _DB_BACKEND_ALIASES = {
     "sqlite": "sqlite", "pg": "pg", "postgres": "pg", "postgresql": "pg",
     "redis": "redis", "mongo": "mongodb", "mongodb": "mongodb",
@@ -292,6 +298,19 @@ class EngineConfig:
     inference_server_start_fn: Callable[[], None] | None = None
     inference_server_stop_fn: Callable[[], None] | None = None
 
+    # ── ComfyUI box lifecycle (host-provided) ─────────────────────────────────
+    #: Bring the box's ComfyUI server up / down. Unlike the evict-only ``comfyui_free``
+    #: lever (which just drops its models), these START/STOP the server itself, so
+    #: ComfyUI can be a FIRST-CLASS box tenant: when a node_job requests comfyui,
+    #: :func:`queue_workflows.comfyui.acquire_box_for_comfyui` clears every rival
+    #: serving kind off the card and then calls ``comfyui_start_fn()`` to ensure
+    #: ComfyUI holds the box. The host wires these to whatever it runs (e.g.
+    #: ``docker start/stop vg-comfy`` over the UDS). Both default ``None`` ⇒ no-op
+    #: (a deployment that never wires them keeps ComfyUI as an already-running,
+    #: externally-managed server). See :func:`queue_workflows.set_comfyui_lifecycle`.
+    comfyui_start_fn: Callable[[], None] | None = None
+    comfyui_stop_fn: Callable[[], None] | None = None
+
     # ── per-host dead-worker bounce (host-provided) ───────────────────────────
     #: ``Callable[[host_label, queue, container], bool]`` — restart a wedged worker
     #: the orchestrator flagged dead (``worker_heartbeats.last_flagged_dead_at``).
@@ -396,12 +415,25 @@ class EngineConfig:
 
     # ── derived accessors ──────────────────────────────────────────────────────
 
+    @property
+    def effective_vlm_pool_node_modules(self) -> frozenset[str]:
+        """The host-configured pool modules UNIONED with the engine's built-ins.
+
+        Built-in queue citizens (the ``comfyui`` render node) must pass the gpu
+        no-model guard and route to the pool lane for EVERY project, including one
+        that sets its own ``vlm_pool_node_modules`` — union, never replace."""
+        return frozenset(self.vlm_pool_node_modules) | BUILTIN_POOL_NODE_MODULES
+
     def resolve_node_module(self, node_module: str):
         """Import + return the module for a stored ``node_module`` value.
 
         Honours an injected :attr:`node_resolver` first; otherwise builds the
         dotted name from :attr:`node_module_package` (``"<pkg>.<node_module>"``
         when a package is set, else ``node_module`` verbatim) and imports it.
+        When that import fails and the name matches an engine BUILT-IN node
+        (``queue_workflows.builtin_nodes.<name>``), the builtin is the fallback —
+        host nodes always win; built-ins make capabilities like the ComfyUI render
+        job work with zero host glue.
         """
         if self.node_resolver is not None:
             return self.node_resolver(node_module)
@@ -412,7 +444,12 @@ class EngineConfig:
             if self.node_module_package
             else node_module
         )
-        return importlib.import_module(dotted)
+        try:
+            return importlib.import_module(dotted)
+        except ImportError:
+            if node_module in BUILTIN_POOL_NODE_MODULES:
+                return importlib.import_module(f"queue_workflows.builtin_nodes.{node_module}")
+            raise
 
     def resolve_llm_server(self, job: dict) -> Any:
         """Resolve the LLM server endpoint for ``job`` via the injected

@@ -400,3 +400,53 @@ def test_interval_knobs_have_sane_defaults(monkeypatch):
     assert hw_watch.history_interval_s() == 60.0
     assert hw_watch.detail_retention_s() == 3600
     assert hw_watch.history_retention_s() == 86400
+
+
+# ── CPU/SoC temp: GB10 (ARM) acpitz fallback ────────────────────────────────
+#
+# Regression fence for the blind spot that masked a CPU-thermal hard-power-off:
+# _read_cpu_temp_c() only knew x86/AMD CPU sensors, so on the ARM GB10 (whose SoC
+# temp is exposed only via generic acpitz zones) it returned None → "CPU TEMP: no
+# data" while the SoC was actually at ~95-98C.
+
+def _fake_sysfs(monkeypatch, tmp_path, *, hwmon=None, zones=None):
+    """Redirect /sys/class/{hwmon,thermal} globs to a tmp tree; real glob otherwise."""
+    import glob as _g
+    real = _g.glob
+    hroot = tmp_path / "hwmon"; troot = tmp_path / "thermal"
+    hroot.mkdir(); troot.mkdir()
+    for i, (name, temps) in enumerate(hwmon or []):
+        d = hroot / f"hwmon{i}"; d.mkdir()
+        (d / "name").write_text(name)
+        for j, t in enumerate(temps, 1):
+            (d / f"temp{j}_input").write_text(str(t))
+    for i, (ztype, temp) in enumerate(zones or []):
+        d = troot / f"thermal_zone{i}"; d.mkdir()
+        (d / "type").write_text(ztype); (d / "temp").write_text(str(temp))
+
+    def fake(pat):
+        p = (pat.replace("/sys/class/hwmon", str(hroot))
+                .replace("/sys/class/thermal", str(troot)))
+        return real(p)
+    monkeypatch.setattr(hw_watch.glob, "glob", fake)
+
+
+def test_cpu_temp_gb10_falls_back_to_hottest_acpitz(monkeypatch, tmp_path):
+    # ARM GB10: no CPU hwmon, only generic acpitz zones.
+    _fake_sysfs(monkeypatch, tmp_path,
+                hwmon=[("acpi_fan", [])],
+                zones=[("acpitz", 72000), ("acpitz", 95000), ("acpitz", 88000)])
+    assert hw_watch._read_cpu_temp_c() == 95.0     # SoC package temp, no longer None
+
+
+def test_cpu_temp_prefers_coretemp_over_acpitz_on_x86(monkeypatch, tmp_path):
+    # x86: a real coretemp must win; the hot acpitz zone must NOT shadow it.
+    _fake_sysfs(monkeypatch, tmp_path,
+                hwmon=[("coretemp", [61000, 58000])],
+                zones=[("acpitz", 99000)])
+    assert hw_watch._read_cpu_temp_c() == 61.0
+
+
+def test_cpu_temp_none_when_nothing_exposed(monkeypatch, tmp_path):
+    _fake_sysfs(monkeypatch, tmp_path, hwmon=[], zones=[])
+    assert hw_watch._read_cpu_temp_c() is None
