@@ -125,17 +125,18 @@ def test_invalid_desired_state_rejected():
 
 
 def test_unregistered_stop_policy_rejected():
+    # 'pause' stays a reserved, unimplemented name ('drain' became real 2026-07-19)
     with pytest.raises(ValueError):
         worker_control.set_worker_control(
-            "h", "cpu", desired_state="off", stop_policy="drain",
+            "h", "cpu", desired_state="off", stop_policy="pause",
         )
     assert worker_control.get_worker_control("h", "cpu") is None
 
 
-def test_stop_policies_registry_has_hard_only_for_now():
+def test_stop_policies_registry_has_hard_and_drain():
     assert "hard" in worker_control.STOP_POLICIES
-    # drain/pause are reserved names not yet implemented (the seam for later).
-    assert "drain" not in worker_control.STOP_POLICIES
+    # drain (park-keep-last-job) implemented 2026-07-19; pause stays reserved.
+    assert "drain" in worker_control.STOP_POLICIES
     assert "pause" not in worker_control.STOP_POLICIES
 
 

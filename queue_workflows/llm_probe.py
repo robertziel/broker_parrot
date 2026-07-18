@@ -327,6 +327,28 @@ def comfyui_loaded(
     return used >= int(vram_floor)
 
 
+def comfyui_reachable(
+    base_url: str | None,
+    *,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+    get_json_fn=None,
+) -> bool:
+    """Is the ComfyUI at ``base_url`` UP and answering (regardless of a loaded model)?
+
+    Distinct from :func:`comfyui_loaded` (which asks "is it holding a model"): right
+    after a fresh start ComfyUI holds no model but IS ready to accept a prompt. Readiness
+    = ``/system_stats`` returns a JSON object. Used as the ``acquire_box_for_comfyui``
+    ready gate. Never raises (``False`` on any failure / unreachable)."""
+    if not base_url:
+        return False
+    get_json = get_json_fn or _default_get_json
+    try:
+        data = get_json(f"{str(base_url).rstrip('/')}/system_stats", timeout_s)
+    except Exception:
+        return False
+    return isinstance(data, dict) and bool(data)
+
+
 def comfyui_free(
     base_url: str | None,
     *,

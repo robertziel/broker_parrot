@@ -227,7 +227,7 @@ def _nvidia_deep() -> list[dict[str, Any]]:
             "nvidia-smi",
             "--query-gpu=temperature.gpu,power.draw,power.draw.instant,"
             "clocks.sm,utilization.gpu,utilization.memory,pstate,"
-            "clocks_throttle_reasons.active,memory.used,memory.total",
+            "clocks_throttle_reasons.active,memory.used,memory.total,fan.speed",
             "--format=csv,noheader,nounits",
         ],
         stderr=subprocess.DEVNULL, timeout=2,
@@ -235,7 +235,9 @@ def _nvidia_deep() -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for line in raw.splitlines():
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) != 10:
+        # fan.speed is [N/A] on fanless / passively-cooled parts (many GB10 units);
+        # tolerate both the 11-field (with fan) and legacy 10-field shape.
+        if len(parts) not in (10, 11):
             continue
         out.append({
             "temp_c": _num(parts[0]),
@@ -248,6 +250,7 @@ def _nvidia_deep() -> list[dict[str, Any]]:
             "throttle_hex": parts[7] or None,
             "vram_used_mb": _num(parts[8]),
             "vram_total_mb": _num(parts[9]),
+            "fan_pct": _num(parts[10]) if len(parts) == 11 else None,
         })
     return out
 
@@ -369,6 +372,29 @@ def _read_hwmon_temps() -> list[dict[str, Any]]:
     return out
 
 
+def _read_hwmon_fans() -> list[dict[str, Any]]:
+    """Every hwmon ``fan*_input`` (tachometer RPM) with its chip name — chassis /
+    CPU / GPU fans. A box with no fan tach (many SoCs, some GB10 units) yields ``[]``,
+    so the panel shows the fan chart as n/a rather than a false zero."""
+    out: list[dict[str, Any]] = []
+    for hw in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        try:
+            with open(os.path.join(hw, "name")) as f:
+                name = f.read().strip()
+        except OSError:
+            continue
+        rpms: list[int] = []
+        for fan in sorted(glob.glob(os.path.join(hw, "fan*_input"))):
+            try:
+                with open(fan) as f:
+                    rpms.append(int(f.read().strip()))
+            except (OSError, ValueError):
+                continue
+        if rpms:
+            out.append({"name": name, "rpms": rpms})
+    return out
+
+
 def _read_meminfo() -> dict[str, int]:
     wanted = {
         "MemTotal": "total_kb", "MemFree": "free_kb",
@@ -454,9 +480,17 @@ def _read_cpu_freq_mhz() -> float | None:
 
 
 def _read_cpu_temp_c() -> float | None:
-    """CPU package temperature (°C) — the hottest input of an hwmon named for a
-    CPU sensor (coretemp / k10temp / zenpower / cpu_thermal / x86_pkg_temp),
-    else a CPU-typed thermal zone. None when the box exposes none."""
+    """CPU/SoC package temperature (°C).
+
+    Prefers a dedicated x86/AMD CPU hwmon (coretemp / k10temp / zenpower /
+    cpu_thermal / x86_pkg_temp) or a CPU-typed thermal zone. FALLBACK for
+    ARM/GB10 (Grace-Blackwell): those boards expose no coretemp and no
+    CPU-typed zone — the SoC package temperature is readable ONLY through the
+    generic ``acpitz`` thermal zones, so return the HOTTEST acpitz. On a GB10
+    the CPU shares the die with the GPU and it is the SoC package that hits the
+    EC thermal cutoff; without this fallback CPU temp reads "no data" — the
+    exact blind spot that masked a CPU-thermal hard-power-off as a mystery.
+    None only when the box truly exposes nothing."""
     for hw in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
         try:
             with open(os.path.join(hw, "name")) as f:
@@ -482,6 +516,19 @@ def _read_cpu_temp_c() -> float | None:
                     return round(int(f.read().strip()) / 1000.0, 1)
         except (OSError, ValueError):
             continue
+    # ARM / GB10 fallback: hottest generic acpitz zone = the SoC package temp.
+    acpitz: list[int] = []
+    for z in sorted(glob.glob("/sys/class/thermal/thermal_zone*")):
+        try:
+            with open(os.path.join(z, "type")) as f:
+                if "acpitz" not in f.read().strip().lower():
+                    continue
+            with open(os.path.join(z, "temp")) as f:
+                acpitz.append(int(f.read().strip()))
+        except (OSError, ValueError):
+            continue
+    if acpitz:
+        return round(max(acpitz) / 1000.0, 1)
     return None
 
 
@@ -530,6 +577,7 @@ def deep_sample() -> dict[str, Any]:
         ("gpu", _gpu_deep, []),
         ("tz", _read_thermal_zones, []),
         ("hwmon", _read_hwmon_temps, []),
+        ("fan", _read_hwmon_fans, []),
         ("mem", _read_meminfo, {}),
         ("load1", _read_load1, None),
         ("disk_root_used_mb", _disk_root_used_mb, None),
@@ -539,6 +587,14 @@ def deep_sample() -> dict[str, Any]:
             sample[key] = probe()
         except Exception:  # noqa: BLE001 — a dead probe records its empty shape
             sample[key] = empty
+    # Fan speed, graph-ready: the loudest tach across every hwmon fan is the headline
+    # "fan speed" (RPM); the GPU's own fan % rides alongside. Derived at sample time so
+    # the panel plots one number without re-walking the fan array. None ⇒ no fan sensor
+    # (n/a on the chart), distinct from a powered-off box (no row at all).
+    rpms = [r for fan in sample["fan"] for r in fan.get("rpms", [])]
+    sample["fan_rpm_max"] = max(rpms) if rpms else None
+    sample["gpu_fan_pct"] = next(
+        (g.get("fan_pct") for g in sample["gpu"] if g.get("fan_pct") is not None), None)
     # Derived, graph-ready: per-GPU 0-100 throttle severity + the box-level
     # worst (what a fleet chart plots). Computed at sample time so readers
     # (the panel reads the DB directly, no engine import) never re-decode.

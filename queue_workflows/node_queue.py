@@ -1399,6 +1399,99 @@ def running_lease_snapshot(*, queue: str | None = None) -> list[tuple[str, Any]]
         return [(r["id"], r["lease_expires_at"]) for r in cur.fetchall()]
 
 
+# ── Over-claim reaper (runtime fallback for the per-box slot arbiter) ────────
+#
+# The slot arbiter (``claim_next_gpu_job(max_running=…)``) prevents an over-claim
+# AT THE CLAIM. This is the runtime backstop for when that prevention is bypassed
+# — a claim path that forgets ``max_running``, a counter bug, a race a future
+# lane opens: if a box is RUNNING more jobs than its advertised concurrency,
+# re-queue the NEWEST over-capacity job(s) so the box converges to capacity
+# instead of two jobs contending on one GPU until a lease lapses. Per
+# ``(host, queue, project)`` — the same grouping the arbiter uses; a cross-DB
+# over-claim (two projects on one physical box) is the box lease's domain, not
+# visible from one DB.
+
+
+def pick_over_claim_victims(rows: list[tuple[str, Any]], capacity: int) -> list[str]:
+    """PURE: given a box's running ``(job_id, started_at)`` rows and its
+    ``capacity``, return the ids to re-queue — the NEWEST ``len - capacity``,
+    keeping the oldest ``capacity`` running. A ``None`` ``started_at`` sorts
+    oldest (kept — an anomalous row isn't aggressively reaped). Deterministic
+    id tie-break; the ``r[1] is not None`` guard means ``None`` is never
+    compared to a timestamp."""
+    cap = max(int(capacity), 0)
+    ordered = sorted(rows, key=lambda r: (r[1] is not None, r[1], r[0]))
+    return [job_id for job_id, _ in ordered[cap:]]
+
+
+def requeue_over_claimed_running(job_id: str) -> int:
+    """Re-queue ONE over-capacity running job, resume-style (front-of-queue, NO
+    ``watchdog_retries`` bump — an over-claim isn't the job's fault). CAS on
+    ``status = 'running'`` so a job that just finished is never yanked; a
+    terminal parent flips it to ``cancelled`` instead of re-queuing a ghost (the
+    :func:`requeue_running_if_lease_frozen` pattern). Double-run across the
+    hand-off is covered by the JobStatusWatcher (clearing ``claimed_by``
+    self-kills a somehow-still-alive claimant)."""
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE workflow_node_jobs AS j
+            SET status = CASE WHEN r.status = 'running' THEN 'queued' ELSE 'cancelled' END,
+                started_at = CASE WHEN r.status = 'running' THEN NULL ELSE j.started_at END,
+                claimed_by = NULL,
+                lease_expires_at = NULL,
+                priority = CASE WHEN r.status = 'running' THEN LEAST(j.priority, 10) ELSE j.priority END,
+                is_priority = CASE WHEN r.status = 'running' THEN TRUE ELSE j.is_priority END,
+                finished_at = CASE WHEN r.status = 'running' THEN j.finished_at ELSE now() END
+            FROM workflow_runs r
+            WHERE r.id::text = j.run_id
+              AND j.id = %(id)s
+              AND j.status = 'running'
+            """,
+            {"id": job_id},
+        )
+        return cur.rowcount or 0
+
+
+def reap_over_claimed_boxes(*, queue: str = "gpu") -> list[dict[str, Any]]:
+    """Runtime over-claim backstop: for every ``(claimed_by, project)`` on
+    ``queue`` running MORE jobs than that box advertises
+    (``worker_heartbeats.concurrency``), re-queue the newest over-capacity
+    job(s). Skips a box with no heartbeat (capacity unknown — the lease /
+    dead-worker sweeps own the vanished-worker case). Returns one dict per
+    re-queued victim for the caller to log; a requeue that races a terminal
+    loses the CAS and is simply not counted."""
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, claimed_by, project, started_at FROM workflow_node_jobs "
+            "WHERE status = 'running' AND queue = %s AND claimed_by IS NOT NULL",
+            (queue,),
+        )
+        running = cur.fetchall()
+        cur.execute(
+            "SELECT host_label, project, concurrency FROM worker_heartbeats "
+            "WHERE queue = %s",
+            (queue,),
+        )
+        caps = {(r["host_label"], r["project"]): r["concurrency"] for r in cur.fetchall()}
+
+    groups: dict[tuple[str, str], list[tuple[str, Any]]] = {}
+    for r in running:
+        groups.setdefault((r["claimed_by"], r["project"]), []).append(
+            (r["id"], r["started_at"]))
+
+    reaped: list[dict[str, Any]] = []
+    for (host, project), rows in groups.items():
+        cap = caps.get((host, project))
+        if cap is None or len(rows) <= cap:
+            continue
+        for job_id in pick_over_claim_victims(rows, cap):
+            if requeue_over_claimed_running(job_id):
+                reaped.append({"job_id": job_id, "host": host, "project": project,
+                               "running": len(rows), "capacity": cap})
+    return reaped
+
+
 # ── Worker capacity heartbeat (DRY upsert) ──────────────────────────────────
 #
 # Single home for the ``worker_heartbeats`` INSERT … ON CONFLICT so the two

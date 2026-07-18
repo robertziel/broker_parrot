@@ -1469,6 +1469,38 @@ class ClaimWorker:
         # Operator ON/OFF control watcher — started in ``run_forever`` after the
         # boot park-gate (None until then; stopped in the finally).
         self._control_watcher: Any = None
+        # DRAIN flag (stop_policy="drain"): set by the control watcher; the claim
+        # loop parks at its next iteration boundary — after the in-flight job —
+        # instead of claiming again. The in-flight job is never touched.
+        self._drain_evt = threading.Event()
+
+    @property
+    def drain_requested(self) -> bool:
+        """True once an operator OFF with ``stop_policy='drain'`` has been seen and
+        the worker hasn't parked-and-resumed yet."""
+        return self._drain_evt.is_set()
+
+    def request_drain(self) -> None:
+        """Flag this worker to park at the next claim-loop boundary (the control
+        watcher's drain handler). Idempotent; never interrupts the in-flight job."""
+        self._drain_evt.set()
+
+    def _drain_park_if_requested(self) -> bool:
+        """Claim-loop boundary hook: when a drain is pending, park via the existing
+        park-until-ON gate (LISTEN + safety poll), then clear the flag and resume
+        claiming. Returns True iff it parked. Unlike the boot park, the heartbeat
+        keeps beating here — the panel shows the box parked from worker_controls,
+        and the kept in-flight job stays attributable to a live worker."""
+        if not self._drain_evt.is_set():
+            return False
+        log.warning(
+            "[claim-worker:%s] drain boundary reached for host=%s — PARKED "
+            "(in-flight work finished; not claiming) until turned back ON",
+            self.queue, self.host,
+        )
+        self._park_until_enabled()
+        self._drain_evt.clear()
+        return True
 
     @property
     def _is_ingest(self) -> bool:
@@ -1628,6 +1660,39 @@ class ClaimWorker:
             box=self._physical_box(),
         )
 
+    def _pool_gpu_serving_ok(self) -> bool:
+        """Is a GPU serving backend up for the pool lane on this box?
+
+        The pool lane's no-model jobs POST to a per-host server. Classically that's the
+        LLM (``_llm_gpu_ok``, set by the heartbeat probe). But a ComfyUI render box has
+        NO LLM — its comfyui_render jobs POST to ComfyUI — so a reachable ComfyUI is an
+        equally-valid backend. Open the gate when EITHER is up; else the render-only box
+        would skip claiming comfyui_render forever."""
+        if self._llm_gpu_ok:
+            return True
+        from queue_workflows import llm_probe
+        from queue_workflows.config import get_config
+        from queue_workflows.envcompat import env_get
+        url = (env_get("QUEUE_WORKFLOWS_COMFYUI_URL") or get_config().comfyui_url or "").strip()
+        return bool(url) and llm_probe.comfyui_reachable(url)
+
+    def _pool_should_defer(self, par: int) -> bool:
+        """Fill-before-spill, LLM boxes only. The consolidation heuristic
+        (:func:`node_queue.vlm_pool_should_defer`) exists so light VLM load packs onto
+        one LLM box. A box whose pool gate opened via ComfyUI (``_llm_gpu_ok`` False)
+        serves box-placed RENDER jobs — a 'fresher LLM peer' can never claim those, so
+        deferring to it starves the queue (observed: GB10s idle on queued comfyui jobs
+        while an LLM box's heartbeat kept them deferring). Such a box never defers."""
+        if not self._llm_gpu_ok:
+            return False
+        try:
+            return bool(node_queue.vlm_pool_should_defer(self.host, par))
+        except Exception:
+            log.exception(
+                "[claim-worker:gpu:pool] defer check failed; claiming (spread fallback)"
+            )
+            return False
+
     def _claim_pool(self) -> dict | None:
         """Claim the next job for the POOL lane (gpu only): no-model GPU jobs
         (``require_model=False``) — VLM facade work that POSTs to a per-host
@@ -1643,7 +1708,7 @@ class ClaimWorker:
         own once the server is back on GPU. The two other skips (insufficient VRAM,
         operator OFF) are enforced elsewhere (capacity gate / worker-control park)."""
         from queue_workflows import model_registry
-        if not self._llm_gpu_ok:
+        if not self._pool_gpu_serving_ok():
             return None
         job = node_queue.claim_next_gpu_job(
             0, None,
@@ -2052,6 +2117,11 @@ class ClaimWorker:
                 pool = self._ensure_pool(par)
                 claimed_any = False
                 while not self._stop.is_set():
+                    # Drain (stop_policy="drain"): the pool lane must also stop
+                    # claiming; in-flight pool jobs finish on their own threads.
+                    # The inline loop owns the actual park-until-ON.
+                    if self.drain_requested:
+                        break
                     # FILL-BEFORE-SPILL gate (additive): if a fresh
                     # higher-ranked vLLM/ollama peer still has free VLM
                     # capacity, DEFER this cycle — let that machine fill its
@@ -2063,15 +2133,7 @@ class ClaimWorker:
                     # no-fresh-higher-peer case returns False ⇒ byte-identical
                     # to today. Checked BEFORE reserving a slot so a deferral
                     # leaves the in-flight counter untouched.
-                    try:
-                        defer = node_queue.vlm_pool_should_defer(self.host, par)
-                    except Exception:
-                        log.exception(
-                            "[claim-worker:gpu:pool] defer check failed; "
-                            "claiming (spread fallback)"
-                        )
-                        defer = False
-                    if defer:
+                    if self._pool_should_defer(par):
                         break
                     with self._pool_lock:
                         # Budget = PAR minus the inline diffusion slot when
@@ -2377,13 +2439,30 @@ class ClaimWorker:
             self._box_lease = build_lease()
         return self._box_lease
 
+    def _box_serves_comfyui(self) -> bool:
+        """Does THIS worker put ComfyUI on its box? Then a no-model job here is a
+        ComfyUI render (ComfyUI's own server kind), NOT an ollama LLM dispatch — so it
+        must key to a DISTINCT box-lease slot, else a render and an ollama job on one
+        card wrongly share the LLM slot (the cross-project over-claim). Signalled by a
+        wired ComfyUI lifecycle (the usual case — a host-managed ComfyUI leaves the URL
+        unset but still wires the lifecycle) or a configured ComfyUI URL."""
+        from queue_workflows.envcompat import env_get
+        cfg = get_config()
+        url = (env_get("QUEUE_WORKFLOWS_COMFYUI_URL") or cfg.comfyui_url or "").strip()
+        return bool(url) or cfg.comfyui_start_fn is not None
+
     def _effective_gpu_model(self, job: dict) -> str:
         """The model this job puts on the card: its ``required_model`` (a
-        diffusion / ModelCache job), else the LLM-server slot sentinel (a no-model
-        ollama-dispatch job — the box's LLM server holds one model, so all such
-        jobs share the slot)."""
-        from queue_workflows.gpu_model_lease import LLM_SERVER_SLOT
-        return job.get("required_model") or LLM_SERVER_SLOT
+        diffusion / ModelCache job), else a no-model job's SERVER-KIND slot — the
+        ComfyUI-render slot when this worker serves ComfyUI, otherwise the ollama
+        LLM-server slot. Each server holds one model, so all jobs of a kind share
+        its slot; the two sentinels differ, so a render and an ollama dispatch
+        mutually exclude on one box (one server per card across all projects)."""
+        from queue_workflows.gpu_model_lease import COMFYUI_SERVER_SLOT, LLM_SERVER_SLOT
+        required = job.get("required_model")
+        if required:
+            return required
+        return COMFYUI_SERVER_SLOT if self._box_serves_comfyui() else LLM_SERVER_SLOT
 
     def _acquire_box_or_spill(self, job: dict) -> bool:
         """ONE-MODEL-PER-BOX admission, across ALL projects on this physical GPU.
@@ -2423,12 +2502,21 @@ class ClaimWorker:
 
     def _model_still_resident(self, held: str) -> bool:
         """Is ``held`` still on the card? For the LLM slot: any model loaded on the
-        box's ollama. For a diffusion model: the warm ModelCache still holds it."""
-        from queue_workflows.gpu_model_lease import LLM_SERVER_SLOT
+        box's ollama. For the ComfyUI slot: ComfyUI reports a model resident (needs a
+        configured URL to probe — an unset URL, the host-managed-ComfyUI case, reads
+        not-resident, so the box releases at job end via the active-jobs guard rather
+        than warm-holding on a card it can't see). For a diffusion model: the warm
+        ModelCache still holds it."""
+        from queue_workflows.gpu_model_lease import COMFYUI_SERVER_SLOT, LLM_SERVER_SLOT
         if held == LLM_SERVER_SLOT:
             from queue_workflows import llm_probe
             from queue_workflows.llm_backends import factory as _llm_factory
             return bool(llm_probe.loaded_models(_llm_factory.resolve_base_url("ollama")))
+        if held == COMFYUI_SERVER_SLOT:
+            from queue_workflows import llm_probe
+            from queue_workflows.envcompat import env_get
+            url = (env_get("QUEUE_WORKFLOWS_COMFYUI_URL") or get_config().comfyui_url or "").strip()
+            return bool(url) and llm_probe.comfyui_loaded(url)
         return getattr(self.model_cache, "current_model", None) == held
 
     def _box_lease_tick(self) -> None:
@@ -2624,14 +2712,20 @@ class ClaimWorker:
         from queue_workflows.db import listen_with_reconnect
         def _body(listen_conn):
             while not self._stop.is_set():
+                # Drain-park boundary (stop_policy="drain"): the watcher flags us;
+                # we park HERE — between jobs, never mid-job — until turned ON.
+                self._drain_park_if_requested()
                 # Drain greedily until the queue is empty.
                 try:
-                    while not self._stop.is_set() and self.run_once():
+                    while not self._stop.is_set() and not self.drain_requested \
+                            and self.run_once():
                         pass
                 except Exception:
                     log.exception("[claim-worker:%s] run_once failed", self.queue)
                 if self._stop.is_set():
                     break
+                if self.drain_requested:
+                    continue                 # park at the top of the loop, not idle-wait
                 # Idle: block on the wake NOTIFY with a safety-poll timeout.
                 for _ in listen_conn.notifies(
                     timeout=NOTIFY_POLL_TIMEOUT_S, stop_after=1,

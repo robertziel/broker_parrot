@@ -86,13 +86,14 @@ def test_check_once_noop_when_on_or_absent():
 def test_check_once_falls_back_to_hard_for_unknown_policy():
     """An OFF row whose stop_policy isn't (yet) implemented must still stop the
     worker — fall back to hard rather than ignore the operator. The bad policy is
-    written directly, bypassing set_worker_control's guard."""
+    written directly, bypassing set_worker_control's guard. ('drain' became a real
+    policy 2026-07-19, so the unknown example is now 'pause' — still reserved.)"""
     worker = _worker("fb")
     _running_node_job("fb", queue="cpu")
     with connection() as c, c.cursor() as cur:
         cur.execute(
             "INSERT INTO worker_controls (host_label, queue, desired_state, stop_policy) "
-            "VALUES ('fb', 'cpu', 'off', 'drain')"
+            "VALUES ('fb', 'cpu', 'off', 'pause')"
         )
     exits: list[int] = []
     w = worker_control.WorkerControlWatcher(
@@ -247,3 +248,81 @@ def test_check_once_swallows_db_error_returns_false(monkeypatch):
     )
     assert w.check_once() is False
     assert exits == []
+
+
+# ── stop_policy="drain": park after the in-flight job, never kill it ──────────
+#
+# The operator ask (2026-07-19): parking a box must stop NEW claims but KEEP the
+# running job ("if already running and changed, keep last job"). hard remains the
+# escalation (the panel's force-kill). Drain: the watcher FLAGS the worker and
+# stays alive (escalation to hard still works); the claim loop parks at its next
+# iteration boundary — after the in-flight job finishes — via the existing
+# park-until-ON gate; the in-flight job and the box's inference server are
+# untouched.
+
+
+def test_check_once_drain_flags_worker_keeps_job_and_process():
+    worker = _worker("host-d")
+    job_id = _running_node_job("host-d", queue="cpu")
+    worker_control.set_worker_control(
+        host_label="host-d", queue="cpu", desired_state="off", stop_policy="drain",
+    )
+    exits: list[int] = []
+    w = worker_control.WorkerControlWatcher(
+        worker=worker, on_exit=lambda code: exits.append(code),
+    )
+    assert w.check_once() is False          # worker LIVES; watcher stays armed
+    assert exits == []                      # no process exit
+    assert worker.drain_requested is True   # claim loop will park at the boundary
+    row = node_queue.get_node_job(job_id)
+    assert row["status"] == "running"       # the last job is KEPT
+    assert row["claimed_by"] == "host-d"
+
+
+def test_drain_does_not_stop_the_inference_server(monkeypatch):
+    # hard stops the box's LLM server (frees VRAM before exit); drain must NOT —
+    # the in-flight job may be mid-call against that very server.
+    import queue_workflows
+    stopped = []
+    queue_workflows.set_inference_server_lifecycle(
+        start_fn=None, stop_fn=lambda: stopped.append(1))
+    try:
+        worker = _worker("host-d2", queue="gpu")
+        worker_control.set_worker_control(
+            host_label="host-d2", queue="gpu", desired_state="off", stop_policy="drain",
+        )
+        w = worker_control.WorkerControlWatcher(worker=worker, on_exit=lambda c: None)
+        assert w.check_once() is False
+        assert stopped == []                # server untouched during drain
+    finally:
+        queue_workflows.set_inference_server_lifecycle(start_fn=None, stop_fn=None)
+
+
+def test_drain_is_idempotent_across_watcher_ticks():
+    worker = _worker("host-d3")
+    worker_control.set_worker_control(
+        host_label="host-d3", queue="cpu", desired_state="off", stop_policy="drain",
+    )
+    w = worker_control.WorkerControlWatcher(worker=worker, on_exit=lambda c: None)
+    assert w.check_once() is False and w.check_once() is False
+    assert worker.drain_requested is True   # still just flagged, still alive
+
+
+def test_drain_park_boundary_parks_then_clears_and_resumes(monkeypatch):
+    worker = _worker("host-d4")
+    parked = []
+    monkeypatch.setattr(worker, "_park_until_enabled", lambda: parked.append(1) or True)
+    worker.request_drain()
+    assert worker._drain_park_if_requested() is True
+    assert parked == [1]                    # parked via the existing ON-wait gate
+    assert worker.drain_requested is False  # cleared — claiming resumes
+    assert worker._drain_park_if_requested() is False
+    assert parked == [1]                    # no park when nothing requested
+
+
+def test_set_worker_control_accepts_drain_now():
+    worker_control.set_worker_control(
+        host_label="host-d5", queue="gpu", desired_state="off", stop_policy="drain",
+    )
+    row = worker_control.get_worker_control("host-d5", "gpu")
+    assert row["stop_policy"] == "drain"

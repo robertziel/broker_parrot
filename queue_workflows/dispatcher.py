@@ -253,7 +253,7 @@ def _assert_gpu_nodes_declare_model(
     run expansion so a mis-declared schema can't ship a model-blind GPU node.
     """
     cfg = get_config()
-    exempt = set(cfg.vlm_pool_node_modules) | set(
+    exempt = set(cfg.effective_vlm_pool_node_modules) | set(
         getattr(cfg, "gpu_self_load_node_modules", frozenset())
     )
     offenders: list[str] = []

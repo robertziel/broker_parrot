@@ -294,6 +294,26 @@ def set_inference_server_lifecycle(
         cfg.inference_server_stop_fn = stop_fn
 
 
+def set_comfyui_lifecycle(
+    start_fn: Callable[[], None] | None,
+    stop_fn: Callable[[], None] | None,
+) -> None:
+    """Wire the host's ComfyUI START/STOP levers so ComfyUI can be a first-class box
+    tenant (not just an evict-only loser).
+
+    ``start_fn() -> None`` brings up this box's ComfyUI server (e.g. ``docker start
+    vg-comfy`` over the UDS); ``stop_fn() -> None`` takes it down. When a node_job
+    requests comfyui, :func:`queue_workflows.comfyui.acquire_box_for_comfyui` clears
+    the box of rival serving kinds and calls ``start_fn`` to ensure ComfyUI holds the
+    card. Either ``None`` ⇒ that direction is a no-op, so a deployment that manages
+    ComfyUI externally (an always-up container) keeps today's behaviour. See
+    :attr:`queue_workflows.config.EngineConfig.comfyui_start_fn`."""
+    cfg = get_config()
+    with cfg._lock:
+        cfg.comfyui_start_fn = start_fn
+        cfg.comfyui_stop_fn = stop_fn
+
+
 def set_worker_bounce(fn: Callable[[str, str, str], bool] | None) -> None:
     """Wire the per-host dead-worker bounce action. ``fn(host_label, queue,
     container) -> bool`` restarts a worker the orchestrator flagged dead, returning

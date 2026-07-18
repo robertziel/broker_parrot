@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import pytest
 
+import queue_workflows
 from queue_workflows import claim_worker
+from queue_workflows.config import get_config
 from queue_workflows.gpu_model_lease import (
-    LLM_SERVER_SLOT, FileLeaseStore, ModelLease,
+    COMFYUI_SERVER_SLOT, LLM_SERVER_SLOT, FileLeaseStore, ModelLease,
 )
 
 
@@ -48,6 +50,79 @@ def test_effective_model_is_required_model_when_set():
 def test_effective_model_is_llm_slot_for_a_no_model_job():
     assert _worker()._effective_gpu_model({"required_model": None}) == LLM_SERVER_SLOT
     assert _worker()._effective_gpu_model({}) == LLM_SERVER_SLOT
+
+
+# ── a ComfyUI render is its OWN server kind, NOT the ollama LLM slot ──────────
+#
+# THE CROSS-PROJECT OVER-CLAIM THIS FIXES: a no-model ComfyUI render used to key to
+# the SAME ``__llm_server__`` slot as a no-model ollama-dispatch job → the box lease
+# treated them as the same "model" and SHARED the card → two GPU consumers on one box
+# (fatal on a marginal GPU). A ComfyUI-serving worker's no-model job must key to a
+# DISTINCT slot so it EXCLUDES an ollama job (and vice versa), while two ComfyUI
+# renders still share. Signalled by a wired ComfyUI lifecycle or a configured ComfyUI URL.
+
+
+def test_effective_model_is_comfyui_slot_when_the_worker_serves_comfyui():
+    queue_workflows.set_comfyui_lifecycle(start_fn=lambda: None, stop_fn=None)
+    assert _worker()._effective_gpu_model({"required_model": None}) == COMFYUI_SERVER_SLOT
+    assert _worker()._effective_gpu_model({}) == COMFYUI_SERVER_SLOT
+    assert _worker()._effective_gpu_model({"required_model": "sdxl"}) == "sdxl"  # real model still wins
+
+
+def test_comfyui_url_also_signals_a_comfyui_serving_box():
+    get_config().comfyui_url = "http://box:8188"
+    assert _worker()._effective_gpu_model({"required_model": None}) == COMFYUI_SERVER_SLOT
+
+
+def test_comfyui_render_and_ollama_job_MUTUALLY_EXCLUDE_on_one_box(monkeypatch, tmp_path):
+    # The exact observed collision: an ollama dispatch and a ComfyUI render, both
+    # no-model, on ONE physical box. Before the fix they shared __llm_server__; now
+    # they are different server kinds → the second one spills.
+    llm = _worker(host="lm-gpu", lease=_file_lease(tmp_path, "lm:1"))
+    vid = _worker(host="vg-gpu", lease=_file_lease(tmp_path, "vg:1"))
+    monkeypatch.setattr(llm, "_box_serves_comfyui", lambda: False)   # ollama dispatch
+    monkeypatch.setattr(vid, "_box_serves_comfyui", lambda: True)    # ComfyUI render
+    requeued = []
+    monkeypatch.setattr(claim_worker.node_queue, "requeue_job_for_retry",
+                        lambda jid: requeued.append(jid))
+    assert llm._acquire_box_or_spill({"id": "score", "required_model": None}) is True
+    assert vid._acquire_box_or_spill({"id": "render", "required_model": None}) is False
+    assert requeued == ["render"]           # the render spilled — no 2/1
+    assert vid._box_held_model is None
+
+
+def test_comfyui_render_excludes_a_later_ollama_job_too(monkeypatch, tmp_path):
+    # Symmetric: the render takes the box first, an ollama job is then refused.
+    vid = _worker(host="vg-gpu", lease=_file_lease(tmp_path, "vg:1"))
+    llm = _worker(host="lm-gpu", lease=_file_lease(tmp_path, "lm:1"))
+    monkeypatch.setattr(vid, "_box_serves_comfyui", lambda: True)
+    monkeypatch.setattr(llm, "_box_serves_comfyui", lambda: False)
+    monkeypatch.setattr(claim_worker.node_queue, "requeue_job_for_retry", lambda jid: None)
+    assert vid._acquire_box_or_spill({"id": "render", "required_model": None}) is True
+    assert llm._acquire_box_or_spill({"id": "score", "required_model": None}) is False
+
+
+def test_two_comfyui_renders_share_the_comfyui_slot(tmp_path):
+    a = _file_lease(tmp_path, "a")
+    b = _file_lease(tmp_path, "b")
+    assert a.acquire(COMFYUI_SERVER_SLOT) is True
+    assert b.acquire(COMFYUI_SERVER_SLOT) is True   # same kind ⇒ both may hold (no over-denial)
+
+
+def test_residency_comfyui_slot_probes_comfyui_loaded(monkeypatch):
+    from queue_workflows import llm_probe
+    get_config().comfyui_url = "http://box:8188"
+    monkeypatch.setattr(llm_probe, "comfyui_loaded", lambda url: True)
+    assert _worker()._model_still_resident(COMFYUI_SERVER_SLOT) is True
+    monkeypatch.setattr(llm_probe, "comfyui_loaded", lambda url: False)
+    assert _worker()._model_still_resident(COMFYUI_SERVER_SLOT) is False
+
+
+def test_residency_comfyui_slot_without_a_url_is_not_resident():
+    # host-managed ComfyUI with comfyui_url unset ⇒ unprobeable ⇒ not-resident, so the
+    # box RELEASES once the render's job count hits 0 (the active-jobs guard holds it
+    # for the render's whole life). No false warm-hold on a card it can't see.
+    assert _worker()._model_still_resident(COMFYUI_SERVER_SLOT) is False
 
 
 # ── the acquire-or-spill gate ────────────────────────────────────────────────

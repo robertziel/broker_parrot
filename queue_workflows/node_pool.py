@@ -256,6 +256,25 @@ class NodePool:
         )
         self._unassignable_last_run: float = 0.0
 
+        # Over-claim reaper — the runtime SAFETY-FALLBACK for the per-box slot
+        # arbiter (``claim_next_gpu_job(max_running=…)``). The arbiter PREVENTS an
+        # over-claim at the claim; if it is ever bypassed (a claim path that
+        # forgets max_running, a counter bug, a future lane), a box can RUN more
+        # jobs than its advertised ``concurrency``. This sweep re-queues the
+        # newest over-capacity job(s) so the box self-heals to capacity within one
+        # tick. Per ``(host, gpu, project)`` — one DB's view; a cross-DB
+        # over-claim (two projects on one physical box) is the box lease's domain.
+        # ON by default (a safety net should not need opt-in); set
+        # ``QUEUE_WORKFLOWS_DISABLE_OVER_CLAIM_REAPER`` to disable.
+        self._over_claim_disabled: bool = bool(
+            env_get("QUEUE_WORKFLOWS_DISABLE_OVER_CLAIM_REAPER")
+        )
+        self._over_claim_interval_s: float = float(
+            env_get("QUEUE_WORKFLOWS_OVER_CLAIM_SWEEP_INTERVAL_S", "10")
+        )
+        self._over_claim_last_run: float = 0.0
+        self._over_claim_now_fn = None  # test seam; None ⇒ time.time
+
     def start(self) -> None:
         if self._register_builtins is not None:
             try:
@@ -545,6 +564,14 @@ class NodePool:
         except Exception:
             log.exception("[node-pool] frozen-lease sweep failed")
 
+        # 5c) Over-claim reaper — runtime safety-fallback for the per-box slot
+        # arbiter: if a box RUNS more gpu jobs than its advertised concurrency
+        # (prevention was bypassed), re-queue the newest over-capacity job(s).
+        try:
+            self._sweep_over_claimed_boxes()
+        except Exception:
+            log.exception("[node-pool] over-claim sweep failed")
+
         # 6) Node-event retention — prune workflow_node_events older than the
         # retention window (append-only growth control; hourly-gated).
         try:
@@ -796,6 +823,34 @@ class NodePool:
                     "[node-pool] frozen-lease reclaim failed for %s "
                     "(lease-reclaim remains the backstop)", job_id,
                 )
+
+    def _sweep_over_claimed_boxes(self) -> None:
+        """Runtime SAFETY-FALLBACK for the per-box slot arbiter: re-queue the
+        newest over-capacity gpu job(s) on any box RUNNING more than its
+        advertised ``concurrency`` (see :func:`node_queue.reap_over_claimed_boxes`).
+        The arbiter prevents an over-claim at the claim; this heals one that got
+        through. Interval-gated (default 10 s); ON by default — disable with
+        ``QUEUE_WORKFLOWS_DISABLE_OVER_CLAIM_REAPER``. Per-DB (per-project) — a
+        cross-project over-claim on one physical box is the box lease's domain,
+        invisible from here."""
+        if self._over_claim_disabled:
+            return
+        import time as _time
+
+        now_fn = self._over_claim_now_fn or _time.time
+        now = now_fn()
+        if now - self._over_claim_last_run < self._over_claim_interval_s:
+            return
+        self._over_claim_last_run = now
+
+        for v in node_queue.reap_over_claimed_boxes(queue="gpu"):
+            log.error(
+                "[node-pool] OVER-CLAIM: box %s [project=%s] was RUNNING %d gpu "
+                "job(s) with capacity %d — re-queued newest job %s (slot arbiter "
+                "was bypassed; oldest job keeps its slot)",
+                v.get("host"), v.get("project"), v.get("running"),
+                v.get("capacity"), v.get("job_id"),
+            )
 
     def _sweep_orphan_queued_jobs(self) -> None:
         """Flip ``queued`` jobs of already-terminal runs to ``cancelled``.
