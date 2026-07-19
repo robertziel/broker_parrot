@@ -47,22 +47,29 @@ from queue_workflows.broker_service.schema import RESOURCES, ensure_schema
 
 _JOB_STATUSES = ("queued", "granted", "running", "done", "failed", "killed")
 
-#: The broker_parrot brand mark — a geometric hooked-beak parrot head in a slate
-#: rounded-square badge, drawn on a 32×32 grid so it stays crisp from a header logo
-#: down to a 16px browser-tab favicon. One string, two uses: inlined in the panel
-#: header and served verbatim at ``GET /favicon.svg`` (self-contained, ``xmlns`` set).
+#: The broker_parrot brand mark — a parrot MANAGING DATA: perched on a database
+#: cylinder (the queue store), tail sweeping down it, hooked beak turned toward the
+#: queue rows it dispatches (two in flight, one completed-green). Slate rounded-square
+#: badge on a 32×32 grid so it stays crisp from a header logo down to a 16px
+#: browser-tab favicon. One string, two uses: inlined in the panel header and served
+#: verbatim at ``GET /favicon.svg`` (self-contained, ``xmlns`` set). The same art
+#: ships as ``docs/images/logo.svg`` (the README hero).
 _BRAND_SVG = (
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" '
-    'aria-label="broker_parrot">'
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="broker_parrot">'
     '<rect width="32" height="32" rx="7" fill="#0f172a"/>'
-    '<path d="M14.6 10.2 C12.9 5.4 10.2 3.8 8.4 4.2 C9.7 6.4 10.7 8.4 11.6 10.6 Z" fill="#38bdf8"/>'
-    '<path d="M12.4 10.9 C10.2 6.9 7.4 6.1 6 7.1 C8.2 8.2 9.8 9.6 11.1 11.1 Z" fill="#22c55e"/>'
-    '<circle cx="15" cy="15.6" r="6.2" fill="#f8fafc"/>'
-    '<path d="M17.5 10.9 C24 10.3 27.5 13.3 25 16.5 C23.7 18.2 21.4 18.8 20 17.5 '
-    'C21 16.5 20.8 14.3 18 13.7 Z" fill="#fbbf24"/>'
-    '<path d="M18 17.3 C19.6 18.3 21.4 18.5 22.4 17.7 C21.4 19.7 18.8 20.3 17 19.1 Z" fill="#f59e0b"/>'
-    '<circle cx="13.7" cy="14.4" r="1.7" fill="#0f172a"/>'
-    "</svg>"
+    '<path d="M4.6 20.8 L4.6 25.4 C4.6 26.9 7.6 27.9 10 27.9 C12.4 27.9 15.4 26.9 15.4 25.4 L15.4 20.8 Z" fill="#334155"/>'
+    '<ellipse cx="10" cy="20.8" rx="5.4" ry="2.2" fill="#475569"/>'
+    '<rect x="19.6" y="19.6" width="8.4" height="2.5" rx="1.25" fill="#38bdf8"/>'
+    '<rect x="19.6" y="23.2" width="6.2" height="2.5" rx="1.25" fill="#38bdf8" opacity="0.72"/>'
+    '<rect x="19.6" y="26.8" width="4.2" height="2.5" rx="1.25" fill="#22c55e"/>'
+    '<path d="M8.6 21 C7.2 15 8.8 8.3 13.3 6.3 C17.3 4.6 21.3 6.6 22.1 9.8 C22.8 12.9 21.3 15.4 18.3 16.9 L13.6 21 Z" fill="#22c55e"/>'
+    '<path d="M11.4 13.4 C9.9 16.5 10.6 19.6 12.8 21 C15 19.5 15.7 16.2 14.5 13.2 Z" fill="#0d9488"/>'
+    '<path d="M9.2 20.8 C7.2 23.6 6.5 26.1 7.2 27.6 C9.2 26.6 10.7 24.5 11.3 21.6 Z" fill="#f43f5e"/>'
+    '<circle cx="17.2" cy="10.1" r="2.7" fill="#f8fafc"/>'
+    '<circle cx="17.9" cy="9.9" r="1.15" fill="#0f172a"/>'
+    '<path d="M19.4 8.9 C23.4 8.4 25.5 10.3 24.5 12.5 C23.8 14 22 14.6 20.7 13.8 C21.6 12.8 21.3 11.1 19.2 10.4 Z" fill="#fbbf24"/>'
+    '<path d="M20.9 13.7 C22.1 14.4 23.5 14.4 24.3 13.7 C23.7 15.3 21.7 15.8 20.3 14.8 Z" fill="#f59e0b"/>'
+    '</svg>'
 )
 
 #: When set, every route except ``/healthz`` + ``/favicon.svg`` requires

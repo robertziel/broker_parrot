@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="broker_parrot">
+  <rect width="32" height="32" rx="7" fill="#0f172a"/>
+  <!-- database cylinder (the queue store) -->
+  <path d="M4.6 20.8 L4.6 25.4 C4.6 26.9 7.6 27.9 10 27.9 C12.4 27.9 15.4 26.9 15.4 25.4 L15.4 20.8 Z" fill="#334155"/>
+  <ellipse cx="10" cy="20.8" rx="5.4" ry="2.2" fill="#475569"/>
+  <!-- queue rows the parrot dispatches -->
+  <rect x="19.6" y="19.6" width="8.4" height="2.5" rx="1.25" fill="#38bdf8"/>
+  <rect x="19.6" y="23.2" width="6.2" height="2.5" rx="1.25" fill="#38bdf8" opacity="0.72"/>
+  <rect x="19.6" y="26.8" width="4.2" height="2.5" rx="1.25" fill="#22c55e"/>
+  <!-- parrot perched on the DB, facing right -->
+  <path d="M8.6 21 C7.2 15 8.8 8.3 13.3 6.3 C17.3 4.6 21.3 6.6 22.1 9.8 C22.8 12.9 21.3 15.4 18.3 16.9 L13.6 21 Z" fill="#22c55e"/>
+  <!-- wing on the body -->
+  <path d="M11.4 13.4 C9.9 16.5 10.6 19.6 12.8 21 C15 19.5 15.7 16.2 14.5 13.2 Z" fill="#0d9488"/>
+  <!-- tail sweeping down the cylinder -->
+  <path d="M9.2 20.8 C7.2 23.6 6.5 26.1 7.2 27.6 C9.2 26.6 10.7 24.5 11.3 21.6 Z" fill="#f43f5e"/>
+  <!-- eye patch + eye -->
+  <circle cx="17.2" cy="10.1" r="2.7" fill="#f8fafc"/>
+  <circle cx="17.9" cy="9.9" r="1.15" fill="#0f172a"/>
+  <!-- hooked beak, attached to the head -->
+  <path d="M19.4 8.9 C23.4 8.4 25.5 10.3 24.5 12.5 C23.8 14 22 14.6 20.7 13.8 C21.6 12.8 21.3 11.1 19.2 10.4 Z" fill="#fbbf24"/>
+  <path d="M20.9 13.7 C22.1 14.4 23.5 14.4 24.3 13.7 C23.7 15.3 21.7 15.8 20.3 14.8 Z" fill="#f59e0b"/>
+</svg>
