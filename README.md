@@ -11,15 +11,112 @@ _Python package: **`queue_workflows`** (import name unchanged) · built on Postg
 Orchestrate work across a handful of heterogeneous CPU/GPU boxes with nothing but a database you already run. No Celery, no Redis to babysit, no cluster scheduler. Insert a row and the work is enqueued; a dead worker's lease lapses and its job re-runs somewhere healthy.
 
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL%20v3%20or%20later-blue.svg)](LICENSE)
+[![Free for open source](https://img.shields.io/badge/free-open%20source%20%26%20personal-brightgreen.svg)](#️-license--free-for-open-use-commercial-licensing-available)
+[![Commercial license](https://img.shields.io/badge/commercial%20license-hello%40robertz.co-orange.svg)](mailto:hello@robertz.co)
+[![Agent friendly](https://img.shields.io/badge/🤖%20agent-friendly-8A2BE2.svg)](#-agent-friendly--just-type-it)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](#installation)
 [![SQLite](https://img.shields.io/badge/sqlite-default-003B57.svg)](#installation)
 [![Postgres](https://img.shields.io/badge/postgres-14%2B-336791.svg)](#installation)
+
+**[Quickstart](#-quickstart--60-seconds-zero-servers)** ·
+**[Agent setup](#-agent-friendly--just-type-it)** ·
+**[Docs](#-documentation)** ·
+**[License](#️-license--free-for-open-use-commercial-licensing-available)**
+
+_Free for personal, research & open-source use (AGPL). Commercial license? **[hello@robertz.co](mailto:hello@robertz.co)**_
 
 </div>
 
 **queue_workflows** is a small, self-hosted workflow engine where **the database _is_ the message bus**. Inserting a row enqueues work; a trigger fires `LISTEN/NOTIFY` inside the writer's own transaction, so there's never a "queued but never woken" gap. Workers claim jobs with `SELECT … FOR UPDATE SKIP LOCKED`, renew a lease while they run, and a dead or wedged worker's job is automatically re-queued onto a healthy peer. It runs DAG node-jobs and periodic background jobs across boxes you already own, lets you flip any machine's worker **ON/OFF** on demand, and keeps a GPU model resident across same-model jobs.
 
 As of **v1.0.0 the default backend is SQLite** — a daemon-less local file, zero server to stand up — so you can `import`, `configure()`, and run with nothing else installed. Point it at **Postgres** for a real fleet with one line.
+
+---
+
+## ⚡ Quickstart — 60 seconds, zero servers
+
+The whole engine in one file. No database server, no broker, no YAML — SQLite is the default backend, and every line below is the public API:
+
+```bash
+pip install "queue_workflows @ git+https://github.com/robertziel/broker_parrot"
+```
+
+```python
+# quickstart.py — run it with:  python quickstart.py
+import types, uuid
+
+import queue_workflows
+from queue_workflows import db, dispatcher, node_queue, run_store
+from queue_workflows.claim_worker import ClaimWorker
+
+queue_workflows.configure()                     # SQLite file — nothing to install or run
+
+# A "node" is any module with a run() function. Register one inline:
+hello = types.ModuleType("hello")
+hello.run = lambda **_: {"greeting": "hello, world"}
+queue_workflows.set_node_resolver(lambda name: hello)
+
+# One workflow -> one pipeline -> one node.
+queue_workflows.set_workflow_provider(
+    lambda n: {"name": "hi", "mode": "node",
+               "steps": [{"id": "s", "kind": "pipeline", "pipeline": "hi"}]},
+    lambda n: {"name": "hi", "nodes": [{"id": "hello", "node": "hello"}]},
+)
+
+db.bootstrap()                                  # applies the migration chain (idempotent)
+
+run_id = str(uuid.uuid4())
+run_store.insert_run(run_id=run_id, workflow_name="hi")   # inserting a row IS enqueuing
+dispatcher.start_run(run_id)                              # fan out the ready nodes
+
+ClaimWorker(queue="cpu", host="laptop").run_once()        # claim + execute the node
+print(node_queue.list_jobs_for_run(run_id)[0]["status"])  # -> completed
+```
+
+That's the whole loop: **a row went in, a worker claimed it with `SKIP LOCKED`, the node ran, the terminal state and its dispatch event committed in one transaction.** Growing up from here is configuration, not rearchitecture:
+
+1. **Real project layout** — nodes as modules, pipelines/workflows as JSON files → [`docs/setup.md`](docs/setup.md)
+2. **A real fleet** — `configure(db_backend="pg")` + one process per role (`queue-orchestrator`, `queue-claim-worker --queue cpu|gpu`, `queue-scheduler`) → [`docs/deployment.md`](docs/deployment.md)
+3. **GPU boxes** — warm-model cache, affinity routing, watchdogs, per-box arbitration → [`docs/gpu_and_llm.md`](docs/gpu_and_llm.md)
+
+---
+
+## 🤖 Agent-friendly — just type it
+
+This repo is written to be **driven by a coding agent** (Claude Code, Cursor, Codex, …): the docs are the spec, the test suite is the behavioral contract, all host wiring funnels through one `configure()` seam, and the safe-by-default SQLite backend means an agent can verify its own work end-to-end without touching your infrastructure. **You describe the jobs; the agent wires the engine.**
+
+Copy-paste this into your agent, edit the two bracketed lines, and let it work:
+
+```text
+Set up broker_parrot (python package queue_workflows,
+https://github.com/robertziel/broker_parrot) as the job queue for this project.
+
+My jobs: [e.g. "fetch RSS feeds every 15 min, then summarize each new article
+with an LLM on my GPU box, then publish the summary — fetch/publish are CPU,
+summarize is GPU"].
+My database: [e.g. "the Postgres this app already uses, DSN in env MYAPP_DB_URL"
+— or "just SQLite for now"].
+
+Steps:
+1. pip install "queue_workflows @ git+https://github.com/robertziel/broker_parrot"
+2. Read docs/setup.md and docs/configuration.md for the wiring pattern.
+3. Create a nodes/ package (one run() module per job), pipelines/*.schema.json
+   (the DAG: ids, depends_on, gpu flags), definitions/*.json (the workflow),
+   and an engine.py that calls queue_workflows.configure(...),
+   set_workflow_provider(...), and db.bootstrap().
+4. For periodic work use register_ingest_task + set_ingest_schedule
+   (docs/configuration.md) instead of cron.
+5. Prove it: enqueue one run with run_store.insert_run + dispatcher.start_run,
+   execute it with ClaimWorker(queue="cpu").run_once(), and show me the
+   completed status. Use the SQLite default for this proof even if production
+   is Postgres.
+6. Give me the production launch commands (queue-orchestrator,
+   queue-claim-worker per queue, queue-scheduler) from docs/deployment.md.
+```
+
+Every claim in that prompt is backed by a doc the agent can read: the engine never imports your app (the seam is `configure()` + hooks), the suite refuses to run against a non-`_test` database, and one end-to-end round-trip — enqueue → claim → execute → completed — is exactly what the `run_once()` API is for.
+
+---
 
 > **There's no bundled dashboard — the engine emits what a dashboard needs.** Live per-host CPU/GPU/RAM over `pg_notify('hw_metrics', …)`, `worker_heartbeats`, the `node_queue.*_snapshot()` read models, and the `worker_controls` ON/OFF toggles are all there. Bring your own front-end — it's a great task to hand a coding agent. A newer **broker web service + operator panel** ([`docs/broker.md`](docs/broker.md), [screenshot](#-one-broker-for-many-projects)) also ships as a pure-stdlib, server-rendered option.
 
@@ -31,13 +128,15 @@ Here's an example of a richer front-end built directly on that telemetry — a f
 
 ## Table of Contents
 
+- [Quickstart — 60 seconds, zero servers](#-quickstart--60-seconds-zero-servers)
+- [Agent-friendly — just type it](#-agent-friendly--just-type-it)
 - [Why broker_parrot?](#-why-broker_parrot)
 - [How it compares (vs. Triton Inference Server)](#-how-it-compares-vs-triton-inference-server)
 - [Highlights](#-highlights)
 - [Installation](#installation)
 - [Core concepts](#-core-concepts)
 - [Architecture at a glance](#-architecture-at-a-glance)
-- [Example implementation](#-example-implementation)
+- [Setting up a real project](#-setting-up-a-real-project)
 - [Turning workers on/off](#️-turning-workers-onoff--the-operator-control-plane)
 - [Host-defined queues + ingest jobs](#️-host-defined-queues--parametrised-ingest-jobs)
 - [One broker for many projects](#-one-broker-for-many-projects)
@@ -47,7 +146,8 @@ Here's an example of a richer front-end built directly on that telemetry — a f
 - [Tests](#-tests)
 - [Documentation](#-documentation)
 - [Background](#-background)
-- [License](#️-license)
+- [Contributing](#-contributing)
+- [License — free for open use, commercial licensing available](#️-license--free-for-open-use-commercial-licensing-available)
 
 ---
 
@@ -203,179 +303,17 @@ The full treatment — including the watchdog stack and the host-agnostic hook s
 
 ---
 
-## 🛠 Example implementation
+## 🛠 Setting up a real project
 
-Here's the whole thing end-to-end: a trivial node, a pipeline that references it, a workflow that runs that pipeline, the host wiring, and a worker that executes it. Nothing here is pseudo-code — every call is part of the public API.
+The production-shaped walkthrough lives in **[`docs/setup.md`](docs/setup.md)** — a real node module, the pipeline + workflow JSON, the `configure()` wiring, the three processes, and kicking off a run. Every snippet there is the public API, end to end. (Prefer to delegate? The [agent prompt](#-agent-friendly--just-type-it) above walks a coding agent through exactly that page.)
 
-### 1. Define a node — one `run()` function
-
-A node is a module exposing a single `run(...)`. The engine introspects the signature and **auto-wires well-known kwargs** by name — `out` (the run's output dir), `status_callback`, `cancel_event`, `inputs`, `model_handle` — so you only declare the ones you use. Return a JSON-able dict; its keys become the node's `context_delta` for downstream `$from` refs.
-
-```python
-# myapp/nodes/greet.py
-from pathlib import Path
-from typing import Any
-
-
-def run(out: Path, name: str = "world", status_callback: Any = None) -> dict:
-    """Trivial CPU node: write a file, return a tiny summary."""
-    if status_callback:
-        status_callback(0.5, "greeting")
-
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "hello.txt").write_text(f"hello, {name}!\n")
-
-    return {"primary_file": f"{out.name}/hello.txt", "greeted": name}
+```text
+your-app/
+├── nodes/            # one run() module per job — no base class, no decorator
+├── pipelines/        # *.schema.json — the DAG: ids, depends_on, gpu flags
+├── definitions/      # *.json — workflows stringing pipeline steps together
+└── engine.py         # configure() + set_workflow_provider() + db.bootstrap()
 ```
-
-No base class, no decorator, no registration call — discovery is by dotted module name (configured below).
-
-### 2. Reference it from a pipeline + workflow
-
-Two small JSON files. The **pipeline schema owns the DAG** (`nodes` with `id` / `node` / `depends_on` / `gpu` / `inputs` / `outputs`); the **workflow** strings one or more pipeline steps together and maps run-level context into them.
-
-<details>
-<summary><code>myapp/pipelines/greet.schema.json</code> — the DAG (one node, CPU)</summary>
-
-```json
-{
-  "name": "greet",
-  "display_name": "greet · hello world",
-  "requires_gpu": false,
-  "inputs": {
-    "type": "object",
-    "properties": {
-      "name": { "type": "string", "default": "world", "maxLength": 64 }
-    }
-  },
-  "outputs": {
-    "primary_file": { "type": "file", "mime": "text/plain" },
-    "summary_keys": ["greeted"]
-  },
-  "nodes": [
-    {
-      "id": "greet",
-      "node": "greet",
-      "depends_on": [],
-      "inputs":  [{ "name": "name", "from": "pipeline.name" }],
-      "outputs": [{ "name": "hello.txt", "kind": "text" }],
-      "gpu": false
-    }
-  ]
-}
-```
-
-`"node": "greet"` resolves to the `myapp.nodes.greet` module via the `node_module_package` prefix set in step 3. `"gpu": false` routes the node-job to the `cpu` queue (set `true` for `gpu`).
-
-</details>
-
-<details>
-<summary><code>myapp/definitions/greet.json</code> — the workflow (one pipeline step)</summary>
-
-```json
-{
-  "name": "greet",
-  "display_name": "greet — hello world",
-  "mode": "node",
-  "steps": [
-    {
-      "id": "greet",
-      "kind": "pipeline",
-      "pipeline": "greet",
-      "inputs": { "name": { "$from": "parcel.label" } }
-    }
-  ]
-}
-```
-
-The `$from` ref pulls `name` out of the run's `context` at execute time — late resolution: workers re-resolve refs when they pick up the job, not when it's enqueued.
-
-</details>
-
-### 3. Wire the host (`configure` + seams) and bootstrap
-
-One startup module does the wiring. `configure()` only mutates the keys you pass; `db.bootstrap()` applies the engine's migration chain idempotently. The full hook reference is [`docs/configuration.md`](docs/configuration.md).
-
-```python
-# myapp/engine.py
-import json
-from pathlib import Path
-
-import queue_workflows
-from queue_workflows import db
-
-DEFS = Path(__file__).parent / "definitions"
-PIPES = Path(__file__).parent / "pipelines"
-
-
-def _load_workflow(name: str) -> dict:
-    return json.loads((DEFS / f"{name}.json").read_text())
-
-
-def _pipeline_schema(name: str) -> dict:
-    return json.loads((PIPES / f"{name}.schema.json").read_text())
-
-
-def init() -> None:
-    # 1. configure the engine (every key is optional)
-    queue_workflows.configure(
-        db_backend="pg",                    # v1.0.0: default is now "sqlite" — opt in for Postgres
-        db_url_env="MYAPP_DB_URL",          # env var holding the DSN
-        node_module_package="myapp.nodes",  # "greet" -> myapp.nodes.greet
-        container_prefix="myapp-",          # cgroup attribution for hw_metrics
-    )
-
-    # 2. tell the dispatcher where the DAG definitions live
-    queue_workflows.set_workflow_provider(_load_workflow, _pipeline_schema)
-
-    # 3. apply the engine's migration chain (idempotent)
-    db.bootstrap()
-```
-
-> 💡 The DSN lives in the `MYAPP_DB_URL` **environment variable**, not in code — `configure(db_url_env=...)` only names the variable to read. Keep secrets in your secrets store.
-
-### 4. Launch the processes (console scripts)
-
-Independent processes run against the one database. You run a **claim worker per queue per host**; the **orchestrator** drives DAG fan-out + lease reclaim; the **scheduler** fires periodic ingest jobs (skip it if you have none). Each process calls `myapp.engine.init()` at startup, then hands off. See [`docs/deployment.md`](docs/deployment.md).
-
-```bash
-queue-orchestrator                 # DAG dispatch loop + dead-worker lease reclaim (bootstraps migrations)
-queue-claim-worker --queue cpu     # claims & runs cpu node-jobs (our greet node)
-queue-claim-worker --queue gpu     # add one per GPU host for gpu-routed nodes
-queue-scheduler                    # optional — only if you registered ingest tasks
-```
-
-Or call the entry points directly from your own bootstrap:
-
-```python
-from myapp.engine import init
-import queue_workflows
-
-init()
-queue_workflows.claim_worker.main(["--queue", "cpu"])
-```
-
-### 5. Kick off a run
-
-Enqueuing work is inserting a `workflow_runs` row and expanding its DAG — `start_run()` enqueues every node whose `depends_on` is empty, the `NOTIFY` rides the transaction, and a listening worker wakes immediately.
-
-```python
-import uuid
-from myapp.engine import init
-from queue_workflows import run_store, dispatcher
-
-init()
-
-run_id = str(uuid.uuid4())
-run_store.insert_run(
-    run_id=run_id,
-    workflow_name="greet",
-    context={"parcel": {"label": "Ada"}},   # feeds the $from ref → name="Ada"
-)
-dispatcher.start_run(run_id)                 # fan out the initial ready nodes
-```
-
-The `cpu` worker from step 4 claims the `greet` node, runs it, writes `hello.txt`, and flips the run to `completed`. That's the whole loop — **inserting a row is enqueuing the work.**
 
 ---
 
@@ -518,6 +456,7 @@ The suite **forces a `*_test` DB** and applies the engine migration chain — it
 
 The [`docs/`](docs/) set:
 
+- [`setup.md`](docs/setup.md) — the full project walkthrough: a real node, the pipeline + workflow JSON, `configure()` wiring, the three processes, and kicking off a run.
 - [`architecture.md`](docs/architecture.md) — the mental model: the DB as the bus, the three process roles, the claim mechanism, DAG dispatch + the durable outbox, and the host-agnostic seam.
 - [`configuration.md`](docs/configuration.md) — the complete host-wiring reference: `configure()`, every `set_*` / `register_*` hook, the env knobs, and the default philosophy.
 - [`schema.md`](docs/schema.md) — the database schema and the full migration chain (Postgres and SQLite), plus the idempotency contracts.
@@ -533,20 +472,36 @@ The [`docs/`](docs/) set:
 
 ## 📦 Background
 
-The engine was extracted from a larger self-hosted stack into this standalone, open-source package so it can be reused and shared on its own. Contributions — bug reports, backend providers, docs, and rough edges — are welcome.
+The engine was extracted from a larger self-hosted stack into this standalone, open-source package so it can be reused and shared on its own. It runs a real multi-box CPU/GPU fleet in production every day — the reliability layers (leases, watchdogs, the over-claim reaper, the box-agent supervisor) each exist because something actually failed that way first.
 
 ---
 
-## ⚖️ License
+## 🤝 Contributing
 
-**GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)**
-© Robert Zieliński — see [`LICENSE`](LICENSE).
+Contributions are welcome — bug reports, storage-backend providers, docs fixes, and rough edges all count. The house rules are short:
 
-Free to use, modify, and distribute — **including commercially** — provided
-derivative works stay under the AGPL and remain source-available. AGPL §13 extends
-that to networked use: if you run a modified version of this engine as a service
-that users interact with over a network, those users must be offered its source.
-Simply *running* an unmodified copy behind your own app triggers no obligation.
+- **Tests are the spec.** The suite is written test-first; a behavior change comes with the test that pins it (`tests/test_invariant_*.py` for engine guarantees).
+- **Stay host-agnostic.** The engine imports nothing from any host app — new tunables go through `configure()` / `envcompat` with a safe default (two guard tests enforce this).
+- **SQLite + Postgres both green.** `QUEUE_WORKFLOWS_TEST_SQLITE=1 python -m pytest` needs no servers at all.
+
+If broker_parrot saved you from standing up a broker, a ⭐ helps others find it.
+
+---
+
+## ⚖️ License — free for open use, commercial licensing available
+
+**Free for personal, research, and open-source use** under the
+**GNU Affero General Public License v3.0 or later** ([`LICENSE`](LICENSE))
+© Robert Zieliński.
+
+- 🆓 **Personal projects, research, homelabs, open source** — use it, modify it,
+  ship it. The AGPL asks one thing back: derivative works stay source-available
+  under the same license (AGPL §13 extends that to modified versions run as a
+  network service). Simply *running* an unmodified copy behind your own app
+  triggers no obligation.
+- 💼 **Commercial product where the AGPL's copyleft doesn't fit?** A commercial
+  license without the AGPL obligations is available — **let's talk:
+  [hello@robertz.co](mailto:hello@robertz.co)**.
 
 Previous releases stay under the terms they shipped with: versions ≤ 1.0.1 under
 MIT, version 1.0.2 under PolyForm Noncommercial 1.0.0.
