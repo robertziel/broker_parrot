@@ -2,7 +2,7 @@
 
 # 🦜 broker_parrot
 
-_Python package: **`queue_workflows`** (import name unchanged) · built on Postgres (or SQLite)._
+_A self-hosted job fleet on the database you already run — Postgres or SQLite._
 
 ### Turn the machines you already own into one self-healing job fleet.
 
@@ -27,7 +27,7 @@ _Free for personal, research & open-source use (AGPL). Commercial license? **[he
 
 </div>
 
-**queue_workflows** is a small, self-hosted workflow engine where **the database _is_ the message bus**. Inserting a row enqueues work; a trigger fires `LISTEN/NOTIFY` inside the writer's own transaction, so there's never a "queued but never woken" gap. Workers claim jobs with `SELECT … FOR UPDATE SKIP LOCKED`, renew a lease while they run, and a dead or wedged worker's job is automatically re-queued onto a healthy peer. It runs DAG node-jobs and periodic background jobs across boxes you already own, lets you flip any machine's worker **ON/OFF** on demand, and keeps a GPU model resident across same-model jobs.
+**broker_parrot** is a small, self-hosted workflow engine where **the database _is_ the message bus**. Inserting a row enqueues work; a trigger fires `LISTEN/NOTIFY` inside the writer's own transaction, so there's never a "queued but never woken" gap. Workers claim jobs with `SELECT … FOR UPDATE SKIP LOCKED`, renew a lease while they run, and a dead or wedged worker's job is automatically re-queued onto a healthy peer. It runs DAG node-jobs and periodic background jobs across boxes you already own, lets you flip any machine's worker **ON/OFF** on demand, and keeps a GPU model resident across same-model jobs.
 
 As of **v1.0.0 the default backend is SQLite** — a daemon-less local file, zero server to stand up — so you can `import`, `configure()`, and run with nothing else installed. Point it at **Postgres** for a real fleet with one line.
 
@@ -163,9 +163,9 @@ The pitch in one line: **the database you already run is the most durable thing 
 
 ## 🆚 How it compares (vs. Triton Inference Server)
 
-People often ask how this relates to [NVIDIA Triton Inference Server](https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/index.html). **They solve different problems and compose rather than compete.** Triton is a *model server* — it loads models into one process and answers inference requests synchronously, optimized for raw throughput. queue_workflows is a *durable job orchestrator* — it routes async work across a fleet of boxes with crash recovery, using the database as the bus. Triton makes one model fast on one node; queue_workflows reliably moves a unit of work to whichever node holds the right warm model and survives failure. You can even run **Triton (or vLLM/ollama) _as a node body inside_ a queue_workflows job** — the engine schedules and recovers the work, Triton serves the tensors.
+People often ask how this relates to [NVIDIA Triton Inference Server](https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/index.html). **They solve different problems and compose rather than compete.** Triton is a *model server* — it loads models into one process and answers inference requests synchronously, optimized for raw throughput. broker_parrot is a *durable job orchestrator* — it routes async work across a fleet of boxes with crash recovery, using the database as the bus. Triton makes one model fast on one node; broker_parrot reliably moves a unit of work to whichever node holds the right warm model and survives failure. You can even run **Triton (or vLLM/ollama) _as a node body inside_ a broker_parrot job** — the engine schedules and recovers the work, Triton serves the tensors.
 
-| Dimension | **queue_workflows** | **Triton Inference Server** |
+| Dimension | **broker_parrot** | **Triton Inference Server** |
 |---|---|---|
 | **Category** | Durable async workflow / job-queue engine | Real-time model inference server |
 | **Core interaction** | `INSERT` a row → job runs later, durably | HTTP/gRPC request → synchronous response |
@@ -182,7 +182,7 @@ People often ask how this relates to [NVIDIA Triton Inference Server](https://do
 | **Background / periodic work** | First-class **ingest jobs** + scheduler ticker | Out of scope — request-driven only |
 | **Dependencies** | Just a **database** (SQLite default, or Postgres via psycopg 3; optional redis/mongo) | NVIDIA runtime / CUDA; typically GPU + K8s for scale |
 
-**Where they overlap:** both keep models warm and care about GPU efficiency. **Where they don't:** Triton has no durable queue, no DAG, no cross-host crash-recovery, no operator ON/OFF, and no periodic work; queue_workflows has no dynamic batching, no native framework backends, and isn't a low-latency request server. Use Triton to make an inference *fast*; use queue_workflows to make the *work* reliable across the fleet.
+**Where they overlap:** both keep models warm and care about GPU efficiency. **Where they don't:** Triton has no durable queue, no DAG, no cross-host crash-recovery, no operator ON/OFF, and no periodic work; broker_parrot has no dynamic batching, no native framework backends, and isn't a low-latency request server. Use Triton to make an inference *fast*; use broker_parrot to make the *work* reliable across the fleet.
 
 ---
 
@@ -204,7 +204,7 @@ People often ask how this relates to [NVIDIA Triton Inference Server](https://do
 
 Requires **Python 3.10+**. As of **v1.0.0 the default backend is SQLite** — a daemon-less local file, zero server to run — so the only hard runtime dependency is `psycopg` (used by the SQLite *and* Postgres paths). For a Postgres deployment (**14+**), opt in with `configure(db_backend="pg")` or `export QUEUE_WORKFLOWS_DB_BACKEND=pg`.
 
-Not on PyPI yet — install straight from GitHub:
+Not on PyPI yet — install straight from GitHub (the distribution/import name in code is `queue_workflows`):
 
 ```bash
 pip install "queue_workflows @ git+https://github.com/robertziel/broker_parrot"
