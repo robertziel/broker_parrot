@@ -1,6 +1,8 @@
 <div align="center">
 
-# 🦜 broker_parrot
+<img src="docs/images/logo.svg" width="112" alt="broker_parrot — a parrot perched on a database, dispatching queue jobs">
+
+# broker_parrot
 
 _A self-hosted job fleet on the database you already run — Postgres or SQLite._
 
