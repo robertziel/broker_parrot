@@ -169,3 +169,34 @@ def test_reclaim_expired_pool_lease(pool):
     reclaimed = gpu_pool.reclaim_expired_pool_leases()
     assert tid in reclaimed
     assert gpu_pool.get_pool_task(tid)["status"] == "queued"   # recoverable
+
+
+def test_a_contended_lease_file_DENIES_within_bounds_instead_of_blocking(tmp_path):
+    """Found live: a plain flock(LOCK_EX) blocked FOREVER on a fd another
+    process kept open — on the HEARTBEAT thread, freezing heartbeats for 18 minutes.
+    The store must deny within ~2s; every caller already treats deny as spill."""
+    import fcntl, threading, time as _t
+    from queue_workflows import gpu_model_lease as gml
+
+    store = gml.FileLeaseStore(str(tmp_path))
+    lease = gml.ModelLease(store=store, box_id="boxy", holder="me", ttl_s=60,
+                           now_fn=_t.time)
+    path = store.path_for("boxy") if hasattr(store, "path_for") else None
+    # First touch creates the file.
+    assert lease.acquire("m1") is True
+    lease.release()
+    import glob, os
+    f = path or glob.glob(os.path.join(str(tmp_path), "*boxy*"))[0]
+    blocker = open(f, "a+")
+    fcntl.flock(blocker.fileno(), fcntl.LOCK_EX)     # a peer wedges the file
+    out = {}
+    def _try():
+        t0 = _t.monotonic()
+        out["granted"] = lease.acquire("m2")
+        out["took"] = _t.monotonic() - t0
+    th = threading.Thread(target=_try, daemon=True)
+    th.start(); th.join(6)
+    assert not th.is_alive(), "acquire must NEVER hang on a foreign flock"
+    assert out["granted"] is False, "contention reads as DENIED (spill)"
+    assert out["took"] < 4, f"bounded wait, took {out['took']:.1f}s"
+    fcntl.flock(blocker.fileno(), fcntl.LOCK_UN); blocker.close()

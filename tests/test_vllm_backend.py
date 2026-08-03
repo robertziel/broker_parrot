@@ -581,11 +581,11 @@ def test_default_served_model_fn_returns_first_id(monkeypatch):
     def _get(url, timeout=None):
         seen["url"] = url
         return _FakeResp(
-            json_data={"data": [{"id": "Qwen/X"}, {"id": "other/Y"}]}
+            json_data={"data": [{"id": "an LLM/X"}, {"id": "other/Y"}]}
         )
 
     _install_fake_httpx(monkeypatch, _get)
-    assert _default_served_model_fn("http://h:8000") == "Qwen/X"
+    assert _default_served_model_fn("http://h:8000") == "an LLM/X"
     # Probes the /v1/models endpoint built off base_url (not a stray path).
     assert seen["url"] == "http://h:8000/v1/models"
 

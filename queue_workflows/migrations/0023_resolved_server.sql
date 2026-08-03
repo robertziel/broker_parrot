@@ -1,0 +1,18 @@
+-- 0023 — stamp the RESOLVED server kind on a claimed node-job.
+--
+-- WHY. The box-slot arbiter enforced ONE number per box, but a box serving
+-- {ollama,vllm} earns PAR slots only for vLLM work: ollama SERIALISES per model,
+-- so ollama-resolved jobs admitted 3-wide just queue inside the daemon while
+-- holding node-job slots (observed live — "ollama allows 1!!"). Per-kind caps need
+-- to know which server each RUNNING job resolved to, so the claim stamps it:
+--
+--   resolved_server — the kind this job will be served by, computed AT CLAIM TIME
+--   as the first element of the row's ordered ``server_types`` that the claiming
+--   box serves, falling back to the row's first preference (cold worker). NULL for
+--   an unconstrained row ON PURPOSE: the per-kind caps govern LLM-served work only
+--   — a comfyui pool job or in-process diffusion row is not throttled by ollama's
+--   serialisation, so NULL-stamped rows are EXEMPT (bounded by the legacy budget).
+--
+-- The dispatch-time resolver reuses the stamp, so the kind the arbiter counted is
+-- the kind that actually serves — one decision, made once, at claim.
+ALTER TABLE workflow_node_jobs ADD COLUMN IF NOT EXISTS resolved_server TEXT;

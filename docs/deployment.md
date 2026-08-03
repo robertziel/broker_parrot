@@ -11,7 +11,7 @@ Every process role in [architecture](architecture.md) ships as a `pip`-installed
 | Script | Module | Role |
 |---|---|---|
 | `queue-orchestrator` | `queue_workflows.orchestrator:main` | Bootstraps migrations (`db.bootstrap`) then runs `NodePool` — dispatch loop, outbox drain, lease-reclaim sweeps, `InputListener`. **The only process that bootstraps.** |
-| `queue-claim-worker --queue=<name>` | `queue_workflows.claim_worker:main` | One worker process, concurrency-1 by contract. `--queue` ∈ `{cpu, gpu}` (DAG node-jobs) ∪ `config.ingest_queues` (default `{fetch, load}`). |
+| `queue-claim-worker --queue=<name>` | `queue_workflows.claim_worker:main` | One worker process, concurrency-1 by default (`--threads N` widens the **cpu** lane — §2.5). `--queue` ∈ `{cpu, gpu}` (DAG node-jobs) ∪ `config.ingest_queues` (default `{fetch, load}`). |
 | `queue-scheduler` | `queue_workflows.scheduler:main` | PG-native ingest ticker — sleeps to the next scheduled minute, enqueues `ingest_jobs` rows. |
 | `queue-worker-control --queue=<name> --on\|--off` | `queue_workflows.worker_control:main` | Operator CLI for the ON/OFF control plane (migration 0012) — flips a `(host, queue)` `worker_controls` row; see [worker_control](worker_control.md). |
 | `queue-broker` | `queue_workflows.broker:main` | Stand up / inspect the **shared broker** DB (migration 0017 multitenant model) — bootstrap once, then `--status` to view every project's queue depth. See [broker](broker.md). |
@@ -26,7 +26,7 @@ The first five scripts are the **v1 client model** (a project runs its own orche
 
 ### Why
 
-A claim worker is one-job-per-process by contract (`architecture.md`: "scale by adding workers, not threads"). The naive way to get N-way parallelism is `deploy.replicas: N` — N containers, each running one worker process. But an idle claim worker is tiny (tens of MiB), so N replicas buys N containers' worth of per-container overhead (extra namespaces, one shim per container, scheduler churn, a cluttered `docker ps`) for **zero** additional throughput: each process still claims via `SELECT … FOR UPDATE SKIP LOCKED`, so what matters is the process count, not the container count. Running the N processes inside ONE container keeps identical N-way parallelism (N processes = N concurrent jobs, each independently claiming) while dropping the per-container tax.
+A claim worker is one-job-per-process by default (§2.5 covers the opt-in cpu thread lane and when it is — and is not — the better lever). The naive way to get N-way parallelism is `deploy.replicas: N` — N containers, each running one worker process. But an idle claim worker is tiny (tens of MiB), so N replicas buys N containers' worth of per-container overhead (extra namespaces, one shim per container, scheduler churn, a cluttered `docker ps`) for **zero** additional throughput: each process still claims via `SELECT … FOR UPDATE SKIP LOCKED`, so what matters is the process count, not the container count. Running the N processes inside ONE container keeps identical N-way parallelism (N processes = N concurrent jobs, each independently claiming) while dropping the per-container tax.
 
 ### Panel display: advertise N, don't let it default to 1
 
@@ -58,11 +58,64 @@ workers-claim-cpu:
 
 GPU lanes are typically already single-process (one persistent warm `ModelCache` per host — see [gpu_and_llm](gpu_and_llm.md)), so in practice this mainly consolidates the `cpu` lane, where N is largest and the per-container overhead multiplies most.
 
+## 2.5 The other lever: N threads in ONE cpu process (`cpu_worker_threads`)
+
+`cpu_worker_threads` (env `QUEUE_WORKFLOWS_CPU_WORKER_THREADS`, `configure(cpu_worker_threads=N)`, or `queue-claim-worker --queue=cpu --threads N`) lets **one** process claim and run up to N node-jobs concurrently, on an in-process pool of N long-lived worker threads. Default `1` = the serial worker, with no pool created at all.
+
+**Pick the right lever — this is not a free upgrade over §2:**
+
+| | N processes (§2) | N threads (this section) |
+|---|---|---|
+| CPU-bound pure-Python node | **the only real parallelism** — separate GILs | ~no speedup: the GIL serialises them |
+| IO-bound node (HTTP, DB waits, subprocess/ffmpeg) | works, N× the RAM baseline | **the cheaper win** — one interpreter, one import of the node package |
+| Memory | N × per-process baseline | one process |
+| Blast radius of a watchdog trip | kills 1 job's process | kills the process ⇒ **all N** (siblings are re-queued first, see below) |
+| Supervision | needs `run_claim_lane.sh` | plain `queue-claim-worker` |
+
+They compose: M containers × P processes × N threads all claim independently through `SKIP LOCKED`.
+
+**Operational consequences of N > 1:**
+
+- **Connection pool (Postgres).** Each concurrent job wants its own claim/terminal txn plus a lease renewer and watchers — roughly 4–5 pooled connections under load. The pool cap defaults to 10 (`QUEUE_WORKFLOWS_DB_POOL_MAX`), so budget **≈ 4–5 × N** and raise the cap before raising the thread count, or jobs will block on pool checkout. Postgres' own `max_connections` is the fleet-wide ceiling. On the **sqlite** backend (the v1.0.0 default) there is no pool to size — `connection()` hands out one process-shared connection under a global lock held for the whole `with` block, so N threads serialise on every DB touch. That is fine for an IO-bound lane whose waiting happens outside the DB, and a reason not to reach for a large N there.
+- **Starving the heartbeat is the real failure mode, not slowness.** The heartbeat and every `LeaseRenewer` are ordinary threads competing with N job bodies for the GIL. This has already bitten once with wide cpu concurrency (`node_pool.py`): a worker's beat thread was starved past the 30 s staleness window while its jobs' leases kept renewing, and 23 live jobs were yanked mid-flight — which is why the dead-worker sweep is now flag-only. Widening the lane raises the blast radius of the same starvation: a starved beat draws a spurious `DEAD WORKER:` flag (which a host-supervisor is told to bounce on), and a starved renewer lets `NodePool` reclaim a *live* job, whose owner then self-exits on its `JobStatusWatcher` (77) and takes the other N−1 with it. Keep N modest, and prefer processes when the bodies hold the GIL.
+- **The wall-clock budget does not scale with N.** A cpu job is still policed by `Watchdog` against `budget_for(job)` (exit 75), and that budget is per-job wall clock. N GIL-contending threads stretch every job's wall clock while doing no more work, so raising the knob on CPU-bound nodes pushes them toward a trip whose blast radius is all N. Another reason the knob is for IO-bound work.
+- **A watchdog trip is still a process exit.** A Python thread cannot be killed, so a wedged body is only stopped by killing the process — which takes the N−1 healthy siblings with it. The trip therefore re-queues those siblings first (resume-style: front of the queue, **no** `watchdog_retries` bump — see [watchdogs](watchdogs.md)), so they redistribute immediately instead of waiting out their leases. This is the real cost of the thread lever: one bad job briefly costs N.
+
+### A single job that needs more than one slot — `cpu_slots`
+
+The lane width says how many jobs run at once; it says nothing about how much of the worker *one* job needs. A node whose body runs its own threads (an ffmpeg fan-out, a thread-pooled HTTP sweep) would otherwise land N-to-a-process on an N-wide lane and oversubscribe the box. Declare its width on the node (migration 0024):
+
+```jsonc
+// workflow JSON
+{ "id": "fence_detect", "node": "detect_fences", "queue": "cpu", "cpu_slots": 3 }
+```
+
+```python
+# or when enqueuing directly
+node_queue.enqueue_node_job(..., queue="cpu", cpu_slots=3)
+```
+
+On a `--threads=4` lane that job holds **3 of the 4 slots** — exactly one ordinary job runs beside it, and a second is refused until it finishes. The reservation is enforced in the **claim**, so it binds before the body starts rather than being an afterthought.
+
+Three properties worth knowing:
+
+- **A serial worker ignores it completely.** At the default `threads=1` a job already owns the whole process, so any `cpu_slots` value runs there unchanged — no fleet impact until you widen a lane.
+- **A job wider than the lane is not excluded outright.** `cpu_slots=9` on a 3-wide lane can never "fit" arithmetically; the weight is clamped to the lane width, so it becomes claimable as soon as the lane is idle and then occupies the whole worker. (Excluding it instead would be invisible queue rot.)
+- **⚠ But a wide job CAN be starved by a stream of narrow ones — there is no aging and no reservation.** The fit test is a `WHERE` filter, so it silently overrides the claim's `ORDER BY`: while the lane stays busier than `threads − cpu_slots`, a wide job waits *regardless of `is_priority` or `priority`*. Measured on a saturated 4-wide lane, a `cpu_slots=3` job flagged `is_priority` **and** `priority=0` — the absolute head of the queue — was passed over while 66 lower-priority 1-slot jobs went ahead of it. On a lightly-loaded lane it gets in promptly; the point is that admission is a function of load, not of priority. **If a wide node's latency matters, give it its own lane** (a second container with its own `--threads`) rather than relying on priority to get it scheduled.
+- **It reserves capacity, it does not hand you threads.** The engine sets the slots aside; the node body still creates its own pool. Size that pool to the `cpu_slots` you declared.
+- **cpu queue only.** The column is read solely by the cpu claim; setting `cpu_slots` on a `gpu` node stores the value and changes nothing (gpu has its own PAR budget).
+
+`NULL`/absent = 1 = an ordinary job, so every existing workflow is unchanged.
+
+**One host-hook caveat.** With N > 1 the node body — and therefore the `set_invoke_context` wrapper around it — runs on a pool thread. Per-node state kept in a `ContextVar` is safe (each thread gets its own context); a hook that stashes per-node state in a **module global** would race between concurrent jobs. Check yours before raising the knob.
+
+The heartbeat advertises N automatically when the lane is widened, so the panel reads `CPU x/N` (display-only — the cpu claim is `SKIP LOCKED` and is never gated by it). Operator ON/OFF, drain, and SIGTERM all handle N in flight: hard-stop re-queues every held row, drain waits for in-flight to reach zero before parking, and shutdown waits for in-flight jobs so leases drain inside `stop_grace_period`.
+
 ## 3. Migrations at deploy time
 
 Only the **orchestrator** calls `db.bootstrap()`. On Postgres it's concurrency-safe: it takes a `pg_advisory_xact_lock` keyed on the version table **before** even `CREATE TABLE IF NOT EXISTS`, so if many orchestrators (e.g. every project's orchestrator, all pointed at one shared broker) boot at once against the same DB, the lock serializes them — the winner applies the pending chain and commits, every waiter's post-lock read then sees the winner's work already done and applies nothing. On SQLite the advisory lock is a no-op; that's fine because SQLite is a single-machine deploy where, by convention, only the orchestrator ever calls `bootstrap()` — claim workers and the scheduler never do.
 
-Every other process — claim workers, the scheduler — calls `db.wait_for_schema(min_version)` instead of bootstrapping, and **blocks** (polling `current_schema_version`, default 120 s timeout) until the ledger reaches the version that queue depends on, rather than racing the orchestrator's migration run. `min_version` is per queue-family: DAG node-jobs (`cpu`/`gpu`) require schema ≥ 6 (`_NODE_REQUIRED_VERSION`); ingest queues require schema ≥ 8 (`_INGEST_REQUIRED_VERSION`, migration 0008's multi-tenant ingest). This means the current chain (0001‥0019 — see [schema](schema.md)) is far ahead of what a worker actually gates on: worker-control (0012) is read-optional and a pre-0012 DB is treated as all-ON, so a fleet doesn't need to be fully caught up to schema HEAD for workers to run — only orchestrators applying new migrations need to.
+Every other process — claim workers, the scheduler — calls `db.wait_for_schema(min_version)` instead of bootstrapping, and **blocks** (polling `current_schema_version`, default 120 s timeout) until the ledger reaches the version that queue depends on, rather than racing the orchestrator's migration run. `min_version` is per queue-family: DAG node-jobs (`cpu`/`gpu`) require schema ≥ 6 (`_NODE_REQUIRED_VERSION`); ingest queues require schema ≥ 8 (`_INGEST_REQUIRED_VERSION`, migration 0008's multi-tenant ingest). This means the current chain (0001‥0024 — see [schema](schema.md)) is far ahead of what a worker actually gates on: worker-control (0012) is read-optional and a pre-0012 DB is treated as all-ON, so a fleet doesn't need to be fully caught up to schema HEAD for workers to run — only orchestrators applying new migrations need to. **The exception is a WIDENED cpu lane**: `cpu_slots` (0024) is read by the claim itself, so a `--threads > 1` worker against a pre-0024 schema errors on every claim and silently claims nothing (the gate is still 6). Apply 0024 before widening a lane.
 
 A host with its own domain tables runs a **second** chain against its own ledger, by calling `db.bootstrap(migrations_dir=..., version_table=...)` with its own directory and version-table name — "two ORMs / two chains, one Postgres." The engine never sees or touches the host's chain.
 

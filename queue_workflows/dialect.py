@@ -110,6 +110,42 @@ class Dialect:
         Pair with :meth:`array_param` to encode the bound value."""
         return f"{value_expr} = ANY({array_param}::text[])"
 
+    def arrays_overlap(self, array_col: str, array_param: str) -> str:
+        """True iff the array COLUMN ``array_col`` shares at least one element with
+        the bound list parameter ``array_param`` — the per-node-job LLM server
+        preference gate (migration 0022): a worker claims a row iff the kinds it
+        serves INTERSECT the row's preference. pg has a native operator.
+
+        Also accepts a second array COLUMN as ``array_param`` (both sides rendered
+        as columns) — the stranded-row sweep joins ``server_types`` against
+        ``llm_servers_available``."""
+        if array_param.startswith("%"):
+            # Any bound parameter (named %(x)s OR positional %s) needs the cast; a
+            # column reference never starts with '%'. The old '%(' test silently
+            # dropped the cast for positional params (round-3 audit, LOW).
+            return f"{array_col} && {array_param}::text[]"
+        return f"{array_col} && {array_param}"
+
+    def array_to_text(self, array_col: str) -> str:
+        """Render an array column as human-readable text (for a reason message)."""
+        return f"array_to_string({array_col}, ',')"
+
+    def array_is_empty(self, array_col: str) -> str:
+        """True iff the array column holds ZERO elements (NOT NULL, just empty)."""
+        return f"cardinality({array_col}) = 0"
+
+    def first_overlap(self, array_col: str, array_param: str) -> str:
+        """The FIRST element of the ordered array COLUMN that appears in the bound
+        list parameter — the per-job server preference resolved in SQL, so the claim
+        can stamp the kind the arbiter just counted (migration 0023). NULL when
+        nothing overlaps."""
+        return (f"(SELECT s.k FROM unnest({array_col}) WITH ORDINALITY AS s(k, ord) "
+                f"WHERE s.k = ANY({array_param}::text[]) ORDER BY s.ord LIMIT 1)")
+
+    def array_first(self, array_col: str) -> str:
+        """The first element of the array column (its top preference)."""
+        return f"({array_col})[1]"
+
     def array_param(self, values: Any) -> Any:
         """Encode a python list for binding as an array parameter. pg binds a
         list directly (psycopg adapts to ``text[]``)."""
@@ -199,6 +235,30 @@ class SqliteDialect(Dialect):
     def value_in_param_array(self, value_expr: str, array_param: str) -> str:
         # array_param is bound as a JSON-text list (see array_param()).
         return f"{value_expr} IN (SELECT value FROM json_each({array_param}))"
+
+    def arrays_overlap(self, array_col: str, array_param: str) -> str:
+        # Both sides are JSON-text lists on sqlite (columns or bound params alike);
+        # the overlap is a correlated EXISTS over the column's elements filtered by
+        # the other side's elements.
+        return (
+            f"EXISTS (SELECT 1 FROM json_each({array_col}) "
+            f"WHERE value IN (SELECT value FROM json_each({array_param})))"
+        )
+
+    def array_to_text(self, array_col: str) -> str:
+        # JSON text is already readable enough for a reason message.
+        return array_col
+
+    def array_is_empty(self, array_col: str) -> str:
+        return f"json_array_length({array_col}) = 0"
+
+    def first_overlap(self, array_col: str, array_param: str) -> str:
+        return (f"(SELECT j1.value FROM json_each({array_col}) j1 "
+                f"WHERE j1.value IN (SELECT value FROM json_each({array_param})) "
+                f"ORDER BY j1.key LIMIT 1)")
+
+    def array_first(self, array_col: str) -> str:
+        return f"(SELECT value FROM json_each({array_col}) ORDER BY key LIMIT 1)"
 
     def array_param(self, values: Any) -> Any:
         import json

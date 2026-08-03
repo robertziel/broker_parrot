@@ -38,9 +38,9 @@ def test_ready_sorted_groups_by_model_in_process_ready(monkeypatch):
         calls["n"] += 1
         if calls["n"] == 1:
             return [
-                _node("n_qwen_1", model="qwen_edit"),
+                _node("n_qwen_1", model="img_edit"),
                 _node("n_flux_1", model="flux_kontext"),
-                _node("n_qwen_2", model="qwen_edit"),
+                _node("n_qwen_2", model="img_edit"),
                 _node("n_flux_2", model="flux_kontext"),
             ]
         return []
@@ -50,9 +50,9 @@ def test_ready_sorted_groups_by_model_in_process_ready(monkeypatch):
         run_id="r", wf={"steps": []}, run={"priority": 100},
     )
     assert n == 4
-    qwen_idx = [i for i, name in enumerate(seen) if name.startswith("n_qwen")]
+    chat_idx = [i for i, name in enumerate(seen) if name.startswith("n_qwen")]
     flux_idx = [i for i, name in enumerate(seen) if name.startswith("n_flux")]
-    assert max(qwen_idx) < min(flux_idx) or max(flux_idx) < min(qwen_idx), (
+    assert max(chat_idx) < min(flux_idx) or max(flux_idx) < min(chat_idx), (
         f"models interleaved: {seen!r}"
     )
 
@@ -71,9 +71,9 @@ def test_ready_sorted_preserves_in_model_order(monkeypatch):
         calls["n"] += 1
         if calls["n"] == 1:
             return [
-                _node("first", model="qwen_edit"),
-                _node("second", model="qwen_edit"),
-                _node("third", model="qwen_edit"),
+                _node("first", model="img_edit"),
+                _node("second", model="img_edit"),
+                _node("third", model="img_edit"),
             ]
         return []
     monkeypatch.setattr(dispatcher, "_find_ready_nodes", fake_find_ready)
@@ -99,7 +99,7 @@ def test_ready_sorted_pushes_modelless_to_end(monkeypatch):
         if calls["n"] == 1:
             return [
                 _node("modelless"),
-                _node("with_model", model="qwen_edit"),
+                _node("with_model", model="img_edit"),
             ]
         return []
     monkeypatch.setattr(dispatcher, "_find_ready_nodes", fake_find_ready)

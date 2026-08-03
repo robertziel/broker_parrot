@@ -103,7 +103,7 @@ def _gpu_probe() -> list[dict[str, Any]]:
 # Below this, a probed "total VRAM" is treated as UNKNOWN, not as a real cap.
 # Unified-memory GPUs make the smi "dedicated VRAM total" meaningless: an AMD
 # APU's rocm-smi reports a tiny carveout (observed 512 MB on box-b) while the
-# real model memory comes from shared system RAM, and a Grace-Blackwell box-c
+# real model memory comes from shared system RAM, and a Grace-class box-c
 # reports none at all. A reading this small can only be a carveout/parse
 # artifact — never a GPU that actually runs multi-GB diffusion models — so we
 # FAIL OPEN (return None ⇒ "capacity unknown" ⇒ the claim gate falls back to
@@ -176,7 +176,7 @@ def _which(cmd: str) -> bool:
 def _nvidia_smi() -> list[dict[str, Any]]:
     """Per-GPU dicts via ``nvidia-smi --query-gpu``. CSV (one row per GPU) with
     units stripped. Empty list if the CLI fails. Unified-memory parts (Grace
-    Blackwell box-c / Jetson) report ``[N/A]`` for VRAM — per-field permissive
+    an ARM GPU box / Jetson) report ``[N/A]`` for VRAM — per-field permissive
     parse turns that into 0 instead of dropping the row."""
     try:
         raw = subprocess.check_output(

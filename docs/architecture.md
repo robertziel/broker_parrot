@@ -60,7 +60,7 @@ Plus the `InputListener` (polls `workflow_input_submissions`; when a value lands
 
 ### Claim worker
 
-`claim_worker.ClaimWorker` (console script `queue-claim-worker --queue=<name>`) is **one process = one worker, concurrency-1 by contract** — there is no in-process thread pool claiming multiple jobs. `run_forever` opens a dedicated autocommit connection, issues `LISTEN <wake_channel>`, then loops:
+`claim_worker.ClaimWorker` (console script `queue-claim-worker --queue=<name>`) is **one process = one worker, concurrency-1 by default**. `run_forever` opens a dedicated autocommit connection, issues `LISTEN <wake_channel>`, then loops:
 
 ```
 LISTEN node_job_ready   (or ingest_job_ready for an ingest queue)
@@ -74,6 +74,10 @@ while running:
 ```
 
 The 1 s poll timeout is the belt-and-suspenders for a dropped NOTIFY (network hiccup, a PG restart mid-listen) — worst case a claimable row waits ~1 s longer than it should. Which claim function runs depends on the queue name: `cpu`/`gpu` (the reserved `_NODE_QUEUES`) draw DAG node-jobs from `workflow_node_jobs`; anything in `config.ingest_queues` (default `{fetch, load}`) draws standalone jobs from `ingest_jobs`. Before entering the loop each worker blocks on `db.wait_for_schema(min_version)` — only the orchestrator bootstraps, so a worker waits for the schema instead of racing the migration run.
+
+**Widening the cpu lane (opt-in).** `cpu_worker_threads` > 1 gives the cpu queue an in-process pool of N long-lived worker threads (`claim_worker._CpuLanePool`): `run_once` reserves a slot, claims, submits the body and returns, so one process holds up to N node-jobs — the same reserve-slot-then-claim *shape* as the GPU VLM pool lane, but not its executor (see [watchdogs](watchdogs.md) §7 for why the lane owns its threads). At the default `1` no pool is created at all and the body runs inline, byte-identical to the historical worker. Choose deliberately: for a **CPU-bound pure-Python** node the GIL serialises threads, so N *processes* ([deployment](deployment.md) §2) remain the only real parallelism; the thread knob is for **IO-bound** cpu nodes (HTTP, DB waits, a subprocess that releases the GIL). `gpu` is unaffected — it owns its own two-lane PAR budget — and ingest queues stay one-job-per-process.
+
+**A job that needs more than one slot.** Lane width is the worker's capacity; `workflow_node_jobs.cpu_slots` (migration 0024) is one job's *demand* — declare `"cpu_slots": 3` on a node whose body runs its own threads and it holds 3 of the lane's slots. The cpu claim enforces it (`LEAST(COALESCE(cpu_slots,1), lane_width) <= free_slots`), so the reservation exists before the body starts; the clamp lets a job wider than the whole worker run alone rather than starve. NULL = 1, and a serial worker ignores it entirely. See [deployment](deployment.md) §2.5.
 
 A GPU worker additionally owns the process-wide warm `ModelCache` (`gpu_model_cache.py`) and publishes its `current_model` to `worker_heartbeats` for the warm-model affinity tiebreak (§3). Every claimed job is bracketed by a `LeaseRenewer` and one or more watchdogs (wall-clock, stall, GPU-health) plus a `JobStatusWatcher`; the worker process as a whole runs one `WorkerControlWatcher` for the operator ON/OFF plane. All of that liveness machinery is covered in full in [watchdogs](watchdogs.md) and [worker_control](worker_control.md) — this doc only needs you to know it exists and brackets every claim.
 

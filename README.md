@@ -122,7 +122,7 @@ Every claim in that prompt is backed by a doc the agent can read: the engine nev
 
 > **There's no bundled dashboard — the engine emits what a dashboard needs.** Live per-host CPU/GPU/RAM over `pg_notify('hw_metrics', …)`, `worker_heartbeats`, the `node_queue.*_snapshot()` read models, and the `worker_controls` ON/OFF toggles are all there. Bring your own front-end — it's a great task to hand a coding agent. A newer **broker web service + operator panel** ([`docs/broker.md`](docs/broker.md), [screenshot](#-one-broker-for-many-projects)) also ships as a pure-stdlib, server-rendered option.
 
-Here's a real example built directly on that telemetry — a live fleet **hardware + queue** operator panel. It reads the engine's `hw_watch_samples` flight recorder (migration 0021), `worker_heartbeats`, and `worker_controls` straight from the DB and draws a 1-hour trail per box: GPU **and** CPU temperature, power, **clock speed**, and throttle, plus per-box worker ON/OFF control. This is an actual 3-box fleet under load — an AMD control hub and two NVIDIA GB10 GPU workers. The middle box is mid-render at 96% GPU with its board zone pinned near the thermal limit, so the recorder catches it hitting the **power brake** (⚡) and stacking up throttle seconds; the box on the right just finished a render and is cooling off. That's the operational story the engine's raw telemetry makes visible — and it's exactly the kind of front-end you can hand a coding agent to build:
+Here's a real example built directly on that telemetry — a live fleet **hardware + queue** operator panel. It reads the engine's `hw_watch_samples` flight recorder (migration 0021), `worker_heartbeats`, and `worker_controls` straight from the DB and draws a 1-hour trail per box: GPU **and** CPU temperature, power, **clock speed**, and throttle, plus per-box worker ON/OFF control. This is an actual 3-box fleet under load — an AMD control hub and two NVIDIA unified-memory GPU box GPU workers. The middle box is mid-render at 96% GPU with its board zone pinned near the thermal limit, so the recorder catches it hitting the **power brake** (⚡) and stacking up throttle seconds; the box on the right just finished a render and is cooling off. That's the operational story the engine's raw telemetry makes visible — and it's exactly the kind of front-end you can hand a coding agent to build:
 
 ![A live fleet hardware + queue operator panel built on the engine's telemetry — per-box GPU/CPU temperature, power, clock, and throttle over the last hour, with worker ON/OFF control](docs/images/flight-deck-panel.png)
 
@@ -174,7 +174,7 @@ People often ask how this relates to [NVIDIA Triton Inference Server](https://do
 | **Latency profile** | Async, seconds–hours; survives restarts | Sub-second request/response |
 | **Unit of work** | Arbitrary node body / ingest task (`run(...)`); a model call is just one kind | A model inference (tensors in → tensors out) |
 | **Multi-step / pipelines** | First-class **DAG** dispatch with a durable outbox, deps, skip-if, fan-out | Model **ensembles** + Business Logic Scripting |
-| **Throughput tricks** | None by design — concurrency-1 per worker by contract | **Dynamic batching**, concurrent model execution |
+| **Throughput tricks** | None by design — concurrency-1 per worker (opt-in cpu thread lane) | **Dynamic batching**, concurrent model execution |
 | **Model lifecycle** | Warm `ModelCache`, idle-unload, **warm-model affinity routing** across the fleet | Model repository: load/unload, versioning |
 | **Framework backends** | Host-agnostic — you bring `run(...)`; no framework coupling | TensorRT, PyTorch, ONNX, OpenVINO, vLLM, Python |
 | **Fleet & scheduling** | DB `FOR UPDATE SKIP LOCKED` claim + `LISTEN/NOTIFY`, lease + reclaim across N boxes | Per-node server; scaling delegated to **Kubernetes** |
@@ -199,6 +199,8 @@ People often ask how this relates to [NVIDIA Triton Inference Server](https://do
 - 📊 **Per-host telemetry** — live CPU/GPU/RAM and capacity stream over `pg_notify('hw_metrics', …)` plus `worker_heartbeats`, ready to drive a dashboard.
 - ⏰ **DB-native scheduler** — a built-in ticker enqueues recurring background jobs at scheduled minutes (with optional hour windows) — no cron, no external beat process.
 - 🗄️ **Pluggable store** — SQLite (default), Postgres, Redis, or MongoDB, behind one durable-queue contract.
+- 🧵 **Widen the cpu lane, per job** — one worker process can run N node-jobs (`--threads N`), and a job that needs more of the box declares `cpu_slots` so the claim reserves that much *before* its body starts. Defaults keep the classic one-job-per-process worker.
+- 🔀 **One LLM server at a time** — a box switching between ollama and vLLM drains the outgoing server before starting the incoming one, and concurrency follows the serving kind (ollama 1, vLLM its batch size) instead of one global number.
 
 ---
 
@@ -234,7 +236,7 @@ Three ideas carry the whole design. The full treatment is in [`docs/architecture
 **Three process roles, one database.** All three run as ordinary processes against the same DB:
 
 - **Orchestrator** — the only process that bootstraps migrations. It runs the DAG dispatch loop, drains the dispatch-event outbox, sweeps for lapsed leases and dead workers, and resumes parked input nodes. No node bodies run here.
-- **Claim worker** — **one process is one worker, concurrency-1 by contract.** It `LISTEN`s, greedily drains its queue on each wake, renews its lease while a job runs, and writes the terminal status + outbox event in one transaction. `cpu`/`gpu` draw DAG node-jobs; ingest-family queues draw standalone ingest jobs.
+- **Claim worker** — **one process is one worker, concurrency-1 by default** (the cpu lane opts into N-per-process via `cpu_worker_threads`). It `LISTEN`s, greedily drains its queue on each wake, renews its lease while a job runs, and writes the terminal status + outbox event in one transaction. `cpu`/`gpu` draw DAG node-jobs; ingest-family queues draw standalone ingest jobs.
 - **Scheduler** — a DB-native ticker that sleeps to the next scheduled minute and enqueues periodic `ingest_jobs` rows.
 
 **Leases make it self-healing.** A live worker renews `lease_expires_at` (~every 10 s), so lease length is independent of job duration. A dead or wedged worker stops renewing; its lease lapses; the orchestrator's reclaim sweep flips the row back to `queued` (re-firing the NOTIFY). Layered on top are wall-clock, no-progress, and GPU-health watchdogs — each re-queues-and-retries rather than failing — plus an out-of-process dead-worker detector for hardware hangs. See [`docs/watchdogs.md`](docs/watchdogs.md).

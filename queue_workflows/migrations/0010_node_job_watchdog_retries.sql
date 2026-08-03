@@ -5,7 +5,7 @@
 -- static-RAM, or the wall-clock Watchdog) used to mark the node-job ``failed``
 -- and write a ``failed`` dispatch event — which the orchestrator turns into a
 -- RUN-level failure (cancel siblings + flip the run to ``failed``). A single
--- transient wedge (e.g. the Blackwell qwen inference stall, where the worker
+-- transient wedge (e.g. the LLM inference stall, where the worker
 -- recovers fine on a fresh process) therefore killed the WHOLE workflow.
 --
 -- The new policy RE-QUEUES the node instead: the watchdog flips the row

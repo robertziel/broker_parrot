@@ -138,6 +138,34 @@ def update_run(run_id: str, **fields: Any) -> dict[str, Any] | None:
         return cur.fetchone()
 
 
+def mark_run_running_if_expanded(run_id: str) -> bool:
+    """Flip a still-``queued`` run to ``running`` once node-jobs exist for it.
+
+    The queued→running transition must ride the EXPANSION path
+    (:func:`dispatcher.start_run`), not only the orchestrator's dispatch loop:
+    a host that expands a run itself (``insert_run`` + ``start_run`` at trigger
+    time) otherwise leaves the row ``'queued'`` forever, because the loop's
+    flip was keyed on "I enqueued new rows" — always false for an
+    already-expanded run. Such a run is still claimable (the claim guard only
+    excludes cancelled/failed) yet invisible to consumers keyed on
+    ``status='running'`` — the blind spot that disarmed the VLM-pool
+    anti-starvation break.
+
+    Guarded on ``status='queued'`` + an EXISTS over the run's node-jobs, so it
+    is idempotent, never revives a terminal run, and is a no-op for an empty
+    expansion (a run with nothing to do stays ``'queued'`` for the phantom-run
+    reconciler, exactly as before). Returns True when the flip happened."""
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE workflow_runs SET status = 'running', updated_at = %s "
+            "WHERE id = %s AND status = 'queued' "
+            "  AND EXISTS (SELECT 1 FROM workflow_node_jobs j "
+            "              WHERE j.run_id = workflow_runs.id)",
+            (_now(), run_id),
+        )
+        return bool(cur.rowcount)
+
+
 def insert_run(
     *,
     run_id: str,
@@ -202,7 +230,7 @@ def reenqueue_running_for_resume(*, project: str | None = None) -> int:
     A row is ``running`` here only because a worker died mid-execution (crash,
     watchdog hard-exit, or an operator fleet-restart) without marking its node
     terminal. Such a run must go back to the queue so it can finish — possibly
-    on a *different* host (e.g. the Blackwell qwen stall hangs a box-c but
+    on a *different* host (e.g. the LLM stall hangs a box-c but
     completes on host-c). The old behaviour capped at 5 resumes then marked the
     run ``failed`` ("[auto-resume cap reached]"), which conflated a poison-pill
     run with a healthy one that merely rode through restarts/host-specific hangs

@@ -261,7 +261,7 @@ def test_execute_node_requeues_on_transient_gpu_error_under_cap():
     _install_fake_node("_ne_gpu_busy", lambda **_k: {"context_delta": {}})  # must NOT run
     job_id = node_queue.enqueue_node_job(
         run_id=run_id, node_id="g", node_module="_ne_gpu_busy", queue="gpu",
-        required_model="qwen_erase",
+        required_model="img_erase",
     )
     _set_running(job_id, retries=0)
 
@@ -282,7 +282,7 @@ def test_execute_node_fails_transient_gpu_error_at_cap(monkeypatch):
     _install_fake_node("_ne_gpu_busy2", lambda **_k: {"context_delta": {}})
     job_id = node_queue.enqueue_node_job(
         run_id=run_id, node_id="g", node_module="_ne_gpu_busy2", queue="gpu",
-        required_model="qwen_erase",
+        required_model="img_erase",
     )
     _set_running(job_id, retries=3)                 # already at the cap
 

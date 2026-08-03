@@ -2,7 +2,7 @@
 
 WHY. :mod:`queue_workflows.hw_metrics` is push-only — every sample is a
 ``NOTIFY`` and gone; nothing is retained. When a GPU box hard-dies there is no
-hardware trail to autopsy. The motivating incident: a GB10 box's firmware
+hardware trail to autopsy. The motivating incident: a unified-memory GPU box's firmware
 thermal protection killed the machine on every ``sdxl`` render with ZERO
 kernel trace — the GPU asserted a hardware slowdown (throttle mask ``0x48``)
 seconds before an OS-invisible power cut, at a board-zone temperature the OS
@@ -19,8 +19,10 @@ utilisation / pstate / **throttle-reason mask** (the smoking-gun field —
 ``0x20`` SW-thermal, ``0x40`` HW-thermal, ``0x08`` HW-brake) via nvidia-smi or
 rocm-smi, every ``/sys/class/thermal`` zone, every hwmon temp (NVMe / NIC /
 SoC), ``/proc/meminfo`` (unified-memory boxes live and die by host RAM),
-loadavg, and root-fs usage. Every probe is best-effort and vendor-guarded — a
-box without a GPU CLI just records the zones it has.
+loadavg, root-fs usage, and per-NIC network counters (``/proc/net/dev`` rx/tx
+bytes + errors, ``/sys/class/net`` link speed) — throughput is the delta
+between two samples (:func:`net_rates`). Every probe is best-effort and
+vendor-guarded — a box without a GPU CLI just records the zones it has.
 
 DESIGN CONTRACTS (match the repo's existing shapes):
 
@@ -116,7 +118,7 @@ def history_retention_s() -> int:
 
 # ── throttle index (mask → 0-100 severity) ────────────────────────────────
 #
-# The NVML throttle-reason mask is the smoking-gun field (the GB10 incident
+# The NVML throttle-reason mask is the smoking-gun field (the unified-memory GPU box incident
 # box died seconds after asserting 0x48) but a hex string doesn't graph.
 # ``throttle_index`` collapses it to a 0-100 severity — max over active bits,
 # because ONE hw-thermal bit already means "at the wall"; summing would
@@ -220,7 +222,7 @@ def _num(v: str) -> float | int | None:
 def _nvidia_deep() -> list[dict[str, Any]]:
     # power.draw.instant rides along with the averaged power.draw: the SPREAD
     # between them is the transient-amplitude proxy for power-delivery stress
-    # (GB10 exposes no input-rail telemetry at all — the brick is software-
+    # (unified-memory GPU box exposes no input-rail telemetry at all — the brick is software-
     # invisible, so GPU-side echoes are the only PSU watchdog signals).
     raw = subprocess.check_output(
         [
@@ -235,7 +237,7 @@ def _nvidia_deep() -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for line in raw.splitlines():
         parts = [p.strip() for p in line.split(",")]
-        # fan.speed is [N/A] on fanless / passively-cooled parts (many GB10 units);
+        # fan.speed is [N/A] on fanless / passively-cooled parts (many unified-memory GPU box units);
         # tolerate both the 11-field (with fan) and legacy 10-field shape.
         if len(parts) not in (10, 11):
             continue
@@ -374,7 +376,7 @@ def _read_hwmon_temps() -> list[dict[str, Any]]:
 
 def _read_hwmon_fans() -> list[dict[str, Any]]:
     """Every hwmon ``fan*_input`` (tachometer RPM) with its chip name — chassis /
-    CPU / GPU fans. A box with no fan tach (many SoCs, some GB10 units) yields ``[]``,
+    CPU / GPU fans. A box with no fan tach (many SoCs, some unified-memory GPU box units) yields ``[]``,
     so the panel shows the fan chart as n/a rather than a false zero."""
     out: list[dict[str, Any]] = []
     for hw in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
@@ -484,9 +486,9 @@ def _read_cpu_temp_c() -> float | None:
 
     Prefers a dedicated x86/AMD CPU hwmon (coretemp / k10temp / zenpower /
     cpu_thermal / x86_pkg_temp) or a CPU-typed thermal zone. FALLBACK for
-    ARM/GB10 (Grace-Blackwell): those boards expose no coretemp and no
+    ARM/unified-memory GPU box (Grace-class): those boards expose no coretemp and no
     CPU-typed zone — the SoC package temperature is readable ONLY through the
-    generic ``acpitz`` thermal zones, so return the HOTTEST acpitz. On a GB10
+    generic ``acpitz`` thermal zones, so return the HOTTEST acpitz. On a unified-memory GPU box
     the CPU shares the die with the GPU and it is the SoC package that hits the
     EC thermal cutoff; without this fallback CPU temp reads "no data" — the
     exact blind spot that masked a CPU-thermal hard-power-off as a mystery.
@@ -516,7 +518,7 @@ def _read_cpu_temp_c() -> float | None:
                     return round(int(f.read().strip()) / 1000.0, 1)
         except (OSError, ValueError):
             continue
-    # ARM / GB10 fallback: hottest generic acpitz zone = the SoC package temp.
+    # ARM / unified-memory GPU box fallback: hottest generic acpitz zone = the SoC package temp.
     acpitz: list[int] = []
     for z in sorted(glob.glob("/sys/class/thermal/thermal_zone*")):
         try:
@@ -536,7 +538,7 @@ def _read_cpu_throttle_count() -> int | None:
     """Summed per-core thermal-throttle counter (Intel
     ``thermal_throttle/core_throttle_count``) — the CPU analogue of the GPU
     violation counters; a rising delta = the CPU is being thermally clamped.
-    None on platforms that don't expose it (e.g. most ARM/GB10)."""
+    None on platforms that don't expose it (e.g. most ARM/unified-memory GPU box)."""
     counts = []
     for f in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/thermal_throttle/core_throttle_count"):
         try:
@@ -568,6 +570,173 @@ def _cpu_stats() -> dict[str, Any]:
     return out
 
 
+# ── network hardware stats (stdlib /proc/net/dev + /sys/class/net) ────────
+#
+# Network usage is a box-health signal like CPU/GPU load: a render stalled on a
+# model pull, a box that fell off the network, a NIC that renegotiated to a
+# lower link speed all show here. /proc/net/dev carries the cumulative rx/tx
+# byte + packet + error counters; /sys/class/net the link speed + carrier. Like
+# the GPU violation counters, the byte columns are MONOTONIC — throughput
+# (bytes/s) is the delta between two samples over their time gap (see
+# ``net_rates``); storing the raw counter keeps the sample STATELESS and lets a
+# reader reconstruct the rate at any window. Loopback and container/bridge
+# plumbing are excluded from the box headline (intra-host noise on a "network
+# usage" chart). All stdlib file reads; on a non-Linux host each returns empty.
+
+#: Prefixes of virtual interfaces whose bytes are intra-host noise (container /
+#: bridge plumbing) or a DOUBLE-COUNT of the physical wire (a VPN/tunnel
+#: encapsulates over it), so they're excluded from the per-NIC view and the box
+#: headline. A physical NIC (eth*/en*/wl*) and a bond (real AGGREGATED traffic —
+#: a bonded primary interface) are NOT here, so they DO count.
+_NET_VIRTUAL_PREFIXES = (
+    "docker", "veth", "br-", "virbr", "tap", "tun", "cni", "flannel",
+    "kube", "cali", "vnet", "vmnet", "vxlan", "wg", "tailscale", "zt",
+    "ppp", "gre", "sit",
+)
+
+
+def _iface_is_virtual(name: str) -> bool:
+    """True for loopback, container/bridge plumbing (``docker0``, ``veth*``,
+    ``br-*``), and VPN/tunnels (``tailscale0``, ``wg*`` — they double-count the
+    physical wire). A physical NIC and a bond are NOT virtual."""
+    return name == "lo" or name.startswith(_NET_VIRTUAL_PREFIXES)
+
+
+def _iface_is_enslaved(name: str, base: str = "/sys/class/net") -> bool:
+    """True when the interface is a bond/bridge SLAVE (has a ``master`` link).
+    Its bytes are already tallied by the master, so it is excluded from the box
+    headline — otherwise a bonded host double-counts ``bond0`` + both slaves.
+    It is still LISTED per-NIC (a slave going down is worth seeing)."""
+    return os.path.exists(os.path.join(base, name, "master"))
+
+
+def _parse_net_dev(text: str) -> dict[str, dict[str, int]]:
+    """Per-interface cumulative rx/tx counters from ``/proc/net/dev`` text.
+    Loopback is dropped (intra-host noise). Malformed rows are skipped; empty or
+    garbage input ⇒ ``{}``. The 16 columns are the kernel's fixed rx(8)+tx(8)
+    layout — we keep bytes / packets / errs / drop from each side."""
+    out: dict[str, dict[str, int]] = {}
+    for line in text.splitlines()[2:]:            # skip the two header rows
+        if ":" not in line:
+            continue
+        name, rest = line.split(":", 1)
+        name = name.strip()
+        if not name or name == "lo":
+            continue
+        cols = rest.split()
+        if len(cols) < 16:
+            continue
+        try:
+            n = [int(c) for c in cols[:16]]
+        except ValueError:
+            continue
+        out[name] = {
+            "rx_bytes": n[0], "rx_packets": n[1], "rx_errs": n[2], "rx_drop": n[3],
+            "tx_bytes": n[8], "tx_packets": n[9], "tx_errs": n[10], "tx_drop": n[11],
+        }
+    return out
+
+
+def _read_net_dev() -> dict[str, dict[str, int]]:
+    """Read + parse ``/proc/net/dev``; ``{}`` on a non-Linux host."""
+    try:
+        with open("/proc/net/dev") as f:
+            return _parse_net_dev(f.read())
+    except OSError:
+        return {}
+
+
+def _net_iface_meta(name: str, base: str = "/sys/class/net") -> dict[str, Any]:
+    """Link metadata for one interface from ``/sys/class/net``: ``operstate``
+    (``"up"``/``"down"``), ``carrier`` (bool), link ``speed_mbps`` (``None``
+    when the NIC reports no real rate — virtual ifaces and many down links read
+    ``-1`` or error), and ``physical`` (backed by a real ``device/`` symlink).
+    Every field is best-effort → ``None`` when unreadable."""
+    root = os.path.join(base, name)
+
+    def _read(rel: str) -> str | None:
+        try:
+            with open(os.path.join(root, rel)) as f:
+                return f.read().strip()
+        except OSError:
+            return None
+
+    speed_raw = _read("speed")
+    speed_mbps: int | None = None
+    if speed_raw is not None:
+        try:
+            s = int(speed_raw)
+            speed_mbps = s if s > 0 else None     # -1 on virtual/down ⇒ unknown
+        except ValueError:
+            speed_mbps = None
+    carrier_raw = _read("carrier")
+    return {
+        "operstate": _read("operstate"),
+        "carrier": (carrier_raw == "1") if carrier_raw is not None else None,
+        "speed_mbps": speed_mbps,
+        "physical": os.path.exists(os.path.join(root, "device")),
+    }
+
+
+def _net_stats() -> dict[str, Any]:
+    """Physical-interface counters + link metadata, plus the box headline the
+    panel plots. ``ifaces`` lists only the REAL NICs + bonds (container/bridge/
+    tunnel plumbing is dropped — a Docker host has ~100 ``veth*`` that are pure
+    noise here). ``rx_bytes``/``tx_bytes`` are the summed MONOTONIC counters
+    over the up, non-enslaved subset (a bond slave's bytes are already in the
+    master — excluding it stops a bonded host double-counting) — throughput is
+    their delta between two samples (:func:`net_rates`) — and ``speed_mbps`` is
+    the fastest up link (the capacity the usage line is read against)."""
+    devs = _read_net_dev()
+    ifaces: list[dict[str, Any]] = []
+    rx_total = tx_total = 0
+    speeds: list[int] = []
+    for name in sorted(devs):
+        if _iface_is_virtual(name):
+            continue
+        meta = _net_iface_meta(name)
+        enslaved = _iface_is_enslaved(name)
+        ifaces.append({"iface": name, **devs[name], **meta, "enslaved": enslaved})
+        if enslaved or meta["operstate"] == "down":
+            continue
+        rx_total += devs[name]["rx_bytes"]
+        tx_total += devs[name]["tx_bytes"]
+        if meta["speed_mbps"]:
+            speeds.append(meta["speed_mbps"])
+    return {
+        "ifaces": ifaces,
+        "rx_bytes": rx_total,
+        "tx_bytes": tx_total,
+        "speed_mbps": max(speeds) if speeds else None,
+    }
+
+
+def net_rates(
+    prev: dict[str, Any] | None,
+    curr: dict[str, Any] | None,
+    dt_s: float | None,
+) -> dict[str, float | None]:
+    """Throughput (bytes/s) between two samples' box-level network totals — the
+    "usage" a chart plots. ``prev``/``curr`` are two :func:`deep_sample` dicts
+    (or any mapping carrying ``net_rx_bytes``/``net_tx_bytes``); ``dt_s`` is the
+    gap between their ``created_at`` in seconds. The byte counters are monotonic,
+    so rate = Δbytes / Δt (the GPU-violations pattern). Each direction is
+    ``None`` — a graph GAP, not a zero — when a counter is missing, ``dt_s`` is
+    non-positive, or the counter went BACKWARDS (a reboot / iface reset / counter
+    wrap makes a negative rate meaningless)."""
+    def _rate(key: str) -> float | None:
+        if prev is None or curr is None or not dt_s or dt_s <= 0:
+            return None
+        a, b = prev.get(key), curr.get(key)
+        if a is None or b is None or b < a:
+            return None
+        return (b - a) / dt_s
+    return {
+        "rx_bytes_per_s": _rate("net_rx_bytes"),
+        "tx_bytes_per_s": _rate("net_tx_bytes"),
+    }
+
+
 def deep_sample() -> dict[str, Any]:
     """One full hardware sample. Every probe is individually guarded so the
     key set is stable even when a probe fails — consumers can rely on the
@@ -582,6 +751,7 @@ def deep_sample() -> dict[str, Any]:
         ("load1", _read_load1, None),
         ("disk_root_used_mb", _disk_root_used_mb, None),
         ("cpu", _cpu_stats, {}),
+        ("net", _net_stats, {}),
     ):
         try:
             sample[key] = probe()
@@ -616,6 +786,15 @@ def deep_sample() -> dict[str, Any]:
             vio = {}
         if vio:
             sample["gpu"][0]["violations"] = vio
+    # Network, graph-ready: box-level cumulative rx/tx counters + the fastest
+    # up-link speed. The panel plots usage = Δ(net_rx_bytes|net_tx_bytes) over
+    # the row gap (``net_rates`` is the blessed derivation) against the
+    # net_speed_mbps capacity line. Derived here so the panel (reads the DB
+    # directly, no engine import) plots without re-walking the iface array; None
+    # when the net probe failed (a graph gap, not a zero).
+    sample["net_rx_bytes"] = sample["net"].get("rx_bytes")
+    sample["net_tx_bytes"] = sample["net"].get("tx_bytes")
+    sample["net_speed_mbps"] = sample["net"].get("speed_mbps")
     return sample
 
 

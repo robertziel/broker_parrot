@@ -179,7 +179,7 @@ def test_cancel_orphaned_queued_jobs_sweeps_across_multiple_runs():
 
 
 def test_cancel_orphan_queued_jobs_default_is_TRUE():
-    """Default flipped ON by the 2026-07-16 ghost audit: a 'full' gpu queue turned
+    """Default flipped ON by the ghost audit: a 'full' gpu queue turned
     out to be 82 % ghosts (queued jobs of terminal runs), which poisoned every
     queue-depth-driven signal. Semantically safe — a terminal run's job can never
     be claimed — so the engine now cleans them up by default; hosts opt back out

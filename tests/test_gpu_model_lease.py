@@ -65,10 +65,10 @@ def test_file_store_enforces_one_model_across_holders(tmp_path):
     t = [1000.0]
     a = ModelLease(box_id="box-a", store=store, holder="proj-a:1", ttl_s=60, now_fn=lambda: t[0])
     b = ModelLease(box_id="box-a", store=store, holder="proj-b:2", ttl_s=60, now_fn=lambda: t[0])
-    assert a.acquire("qwen") is True            # first worker takes the box
-    assert b.acquire("qwen") is True            # same model → shared, fine
+    assert a.acquire("an LLM") is True            # first worker takes the box
+    assert b.acquire("an LLM") is True            # same model → shared, fine
     assert b.acquire("flux") is False           # DIFFERENT model while A live → denied
-    assert store.read("box-a").model == "qwen"
+    assert store.read("box-a").model == "an LLM"
     # A dies (stops renewing); 61 s later B may preempt
     t[0] += 61
     assert b.acquire("flux") is True
@@ -79,7 +79,7 @@ def test_file_store_release_frees_the_box(tmp_path):
     store = FileLeaseStore(str(tmp_path))
     a = ModelLease(box_id="box-a", store=store, holder="w1", ttl_s=60, now_fn=lambda: 1.0)
     b = ModelLease(box_id="box-a", store=store, holder="w2", ttl_s=60, now_fn=lambda: 1.0)
-    assert a.acquire("qwen") and not b.acquire("flux")
+    assert a.acquire("an LLM") and not b.acquire("flux")
     a.release()                                  # A unloads
     assert b.acquire("flux") is True             # box is free now
     assert store.read("box-a").model == "flux"
@@ -89,12 +89,12 @@ def test_acquire_or_raise(tmp_path):
     store = FileLeaseStore(str(tmp_path))
     a = ModelLease(box_id="b", store=store, holder="w1", now_fn=lambda: 1.0)
     b = ModelLease(box_id="b", store=store, holder="w2", now_fn=lambda: 1.0)
-    a.acquire_or_raise("qwen")
+    a.acquire_or_raise("an LLM")
     try:
         b.acquire_or_raise("flux")
         assert False, "expected denial"
     except ModelLeaseDenied as exc:
-        assert "qwen" in str(exc) and "flux" in str(exc)
+        assert "an LLM" in str(exc) and "flux" in str(exc)
 
 
 # ── config wiring: safe default + opt-in ─────────────────────────────────────

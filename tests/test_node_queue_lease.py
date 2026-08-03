@@ -350,7 +350,7 @@ def _claimed_running_job(queue="cpu", priority=100):
     run_id = make_run()
     job_id = node_queue.enqueue_node_job(
         run_id=run_id, node_id="n", node_module="x", queue=queue, priority=priority,
-        required_model=("qwen_edit" if queue == "gpu" else None),
+        required_model=("img_edit" if queue == "gpu" else None),
     )
     if queue == "gpu":
         node_queue.claim_next_gpu_job(0, host="host-x")
@@ -491,7 +491,7 @@ def test_heartbeat_llm_servers_defaults_to_ollama_baseline():
 
 
 def test_clear_current_model_nulls_the_busy_signal_and_ages_last_seen():
-    _heartbeat("host-a", "gpu", "qwen_edit")
+    _heartbeat("host-a", "gpu", "img_edit")
     out = node_queue.clear_worker_current_model("host-a", "gpu")
     assert out is not None and out["current_model"] is None
     with connection() as c, c.cursor() as cur:
@@ -505,7 +505,7 @@ def test_clear_current_model_nulls_the_busy_signal_and_ages_last_seen():
 
 
 def test_clear_current_model_keeps_last_seen_when_mark_stale_false():
-    _heartbeat("host-a", "gpu", "qwen_edit")
+    _heartbeat("host-a", "gpu", "img_edit")
     node_queue.clear_worker_current_model("host-a", "gpu", mark_stale=False)
     with connection() as c, c.cursor() as cur:
         cur.execute(
@@ -522,15 +522,15 @@ def test_clear_current_model_noop_returns_none_when_row_absent():
 
 
 def test_clear_current_model_only_touches_the_named_worker():
-    _heartbeat("host-a", "gpu", "qwen_edit")
-    _heartbeat("host-b", "gpu", "wan_i2v")
+    _heartbeat("host-a", "gpu", "img_edit")
+    _heartbeat("host-b", "gpu", "video-model-b")
     node_queue.clear_worker_current_model("host-a", "gpu")
     with connection() as c, c.cursor() as cur:
         cur.execute(
             "SELECT current_model FROM worker_heartbeats "
             "WHERE host_label='host-b' AND queue='gpu'"
         )
-        assert cur.fetchone()["current_model"] == "wan_i2v"
+        assert cur.fetchone()["current_model"] == "video-model-b"
 
 
 # ── NOTIFY trigger ───────────────────────────────────────────────────────────
@@ -670,6 +670,9 @@ def test_concurrent_gpu_claims_each_row_won_exactly_once():
     claimed = _drain_with_threads(
         lambda: node_queue.claim_next_gpu_job(
             0, current_model=None, host=f"w{threading.get_ident()}", lease_s=30,
+            # subject = claim-race atomicity; the kind law (width 1 per host for
+            # these undeclared rows) would cap each thread at one win — opt out.
+            kind_caps={},
         )
     )
 

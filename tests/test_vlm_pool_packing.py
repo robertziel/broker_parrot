@@ -55,7 +55,11 @@ def _beat(host: str, concurrency: int, *, age_s: float = 0.0,
 def _running_no_model_gpu_jobs(host: str, n: int) -> list[str]:
     """Create ``n`` RUNNING no-model gpu jobs owned by ``host`` via the real
     claim path (enqueue queued no-model gpu row → claim with
-    ``require_model=False`` stamps ``running`` + ``claimed_by=host``)."""
+    ``require_model=False`` stamps ``running`` + ``claimed_by=host``).
+
+    subject = the DEFER gate's peer-fullness arithmetic, which needs hosts
+    holding n > 1 undeclared rows; the kind law would stop that at width 1, so
+    the seeding opts out (``kind_caps={}``)."""
     ids: list[str] = []
     for i in range(n):
         run_id = make_run()
@@ -64,7 +68,7 @@ def _running_no_model_gpu_jobs(host: str, n: int) -> list[str]:
             queue="gpu",
         )
         job = node_queue.claim_next_gpu_job(
-            0, None, host=host, require_model=False,
+            0, None, host=host, require_model=False, kind_caps={},
         )
         assert job is not None and job["claimed_by"] == host
         assert job["required_model"] is None
@@ -94,12 +98,18 @@ def test_defer_true_when_equal_par_earlier_host_has_free_capacity():
     assert node_queue.vlm_pool_should_defer("bbb", 2) is True
 
 
-def _old_claimable_no_model_job(age_s: float) -> str:
-    """A QUEUED no-model gpu job with a RUNNING parent, created ``age_s`` ago —
-    the 'starving' work the anti-starvation break must claim rather than defer."""
-    run_id = make_run()  # status='running' by default → claimable parent
+def _old_claimable_no_model_job(
+    age_s: float, *, run_status: str = "running",
+    avoid_box: list[str] | None = None,
+) -> str:
+    """A QUEUED no-model gpu job with a claimable parent, created ``age_s`` ago —
+    the 'starving' work the anti-starvation break must claim rather than defer.
+    ``run_status`` / ``avoid_box`` shape the parent/placement so tests can pin
+    that the break counts EXACTLY what the claim SQL would serve."""
+    run_id = make_run(status=run_status)
     node_queue.enqueue_node_job(
         run_id=run_id, node_id="starving", node_module="x", queue="gpu",
+        avoid_box=avoid_box,
     )
     with connection() as c, c.cursor() as cur:
         cur.execute(
@@ -123,6 +133,37 @@ def test_anti_starvation_breaks_deferral_when_a_claimable_job_ages(monkeypatch):
     monkeypatch.setattr(node_queue, "VLM_POOL_MAX_DEFER_AGE_S", 5)
     _old_claimable_no_model_job(age_s=30)                       # older than the window
     assert node_queue.vlm_pool_should_defer("bbb", 2) is False  # deferral broken → claim
+
+
+def test_anti_starvation_counts_a_trigger_expanded_QUEUED_run(monkeypatch):
+    """THE STANDSTILL. A host that expands a run itself can leave it
+    ``'queued'`` (start_run now flips it, but the break must not depend on
+    that): the claim SQL serves jobs of ANY non-cancelled/failed run, so the
+    starvation view must count them identically — with the old
+    ``sr.status='running'`` guard, aging work under a 'queued' run was
+    invisible and every lower-ranked box deferred a claimable queue forever."""
+    _beat("aaa", concurrency=2)
+    _beat("bbb", concurrency=2)
+    monkeypatch.setattr(node_queue, "VLM_POOL_MAX_DEFER_AGE_S", 5)
+    _old_claimable_no_model_job(age_s=30, run_status="queued")
+    assert node_queue.vlm_pool_should_defer("bbb", 2) is False
+
+
+def test_anti_starvation_is_placement_aware(monkeypatch):
+    """The break counts only work THIS box could claim. An aging job whose
+    ``avoid_box`` lists M is not starving *for M* (its deferral stays) — but a
+    job avoiding the TOP-ranked box must arm every eligible box's break: the
+    top peer reads 'free capacity' forever precisely because it can never
+    claim that work (the box-c/box-a shape)."""
+    _beat("aaa", concurrency=2)
+    _beat("bbb", concurrency=2)
+    monkeypatch.setattr(node_queue, "VLM_POOL_MAX_DEFER_AGE_S", 5)
+    _old_claimable_no_model_job(age_s=30, avoid_box=["bbb-box"])
+    # bbb is excluded from the only aging job → not starving for bbb → defer.
+    assert node_queue.vlm_pool_should_defer("bbb", 2, box="bbb-box") is True
+    # A second aging job avoids the TOP box instead → bbb is eligible → claim.
+    _old_claimable_no_model_job(age_s=30, avoid_box=["aaa-box"])
+    assert node_queue.vlm_pool_should_defer("bbb", 2, box="bbb-box") is False
 
 
 def test_anti_starvation_ignores_a_FRESH_claimable_job(monkeypatch):
@@ -298,7 +339,9 @@ def test_pool_feeder_defers_when_gate_true(monkeypatch):
         lambda h, q: worker_control.LLMConfig(parallelism=2),
     )
     # Force the gate ON for this feeder's host.
-    monkeypatch.setattr(node_queue, "vlm_pool_should_defer", lambda h, p: True)
+    monkeypatch.setattr(
+        node_queue, "vlm_pool_should_defer", lambda h, p, **kw: True,
+    )
 
     run_id = make_run()
     job_id = node_queue.enqueue_node_job(
@@ -333,7 +376,7 @@ def test_pool_feeder_claims_when_gate_false(monkeypatch):
         worker_control, "llm_config_for",
         lambda h, q: worker_control.LLMConfig(parallelism=2),
     )
-    monkeypatch.setattr(node_queue, "vlm_pool_should_defer", lambda h, p: False)
+    monkeypatch.setattr(node_queue, "vlm_pool_should_defer", lambda h, p, **kw: False)
 
     # A fast no-op node so the claimed job runs to completion.
     import queue_workflows
@@ -376,7 +419,7 @@ def test_pool_feeder_uses_live_par_in_defer_check(monkeypatch):
     seen: list[tuple[str, int]] = []
     stop = threading.Event()
 
-    def spy(host, par):
+    def spy(host, par, **kw):
         seen.append((host, par))
         stop.set()
         return True   # defer so nothing is claimed (keeps the test cheap)

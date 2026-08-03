@@ -274,7 +274,7 @@ def test_reclaim_all_requeues_dead_workers_running_row():
     run_id = _make_run()
     job_id = node_queue.enqueue_node_job(
         run_id=run_id, node_id="a", node_module="x", queue="gpu",
-        required_model="qwen_edit", priority=100,
+        required_model="img_edit", priority=100,
     )
     force_lease(job_id, expires_in_s=600)  # fresh lease, but host-x has no heartbeat → dead
     assert node_queue.reclaim_expired_leases() == []  # sanity: not yet expired
@@ -300,7 +300,7 @@ def test_reclaim_all_leaves_live_workers_running_row():
     run_id = _make_run()
     job_id = node_queue.enqueue_node_job(
         run_id=run_id, node_id="a", node_module="x", queue="gpu",
-        required_model="qwen_edit", priority=100,
+        required_model="img_edit", priority=100,
     )
     force_lease(job_id, expires_in_s=600)  # claimed_by='host-x', running
     node_queue.upsert_worker_heartbeat(
@@ -330,7 +330,7 @@ def test_reclaim_all_requeues_gpu_job_when_only_cpu_heartbeat_is_fresh():
     run_id = _make_run()
     job_id = node_queue.enqueue_node_job(
         run_id=run_id, node_id="a", node_module="x", queue="gpu",
-        required_model="qwen_edit", priority=100,
+        required_model="img_edit", priority=100,
     )
     force_lease(job_id, expires_in_s=600)  # claimed_by='host-x', fresh gpu lease
     node_queue.upsert_worker_heartbeat(

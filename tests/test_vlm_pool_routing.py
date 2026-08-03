@@ -76,14 +76,14 @@ def test_vlm_facade_job_stays_in_pool():
 def test_model_backed_job_unaffected_by_pool_modules():
     """A model-backed job always belongs to the inline lane regardless of
     ``pool_modules``."""
-    job_id = _enqueue("qwen_fence_edit", required_model="qwen_edit")
+    job_id = _enqueue("img_fence_edit", required_model="img_edit")
 
     assert node_queue.claim_next_gpu_job(
         0, None, host="h", require_model=False, pool_modules=POOL,
     ) is None
     claimed = node_queue.claim_next_gpu_job(
-        0, "qwen_edit", host="h", require_model=True,
-        known_models=["qwen_edit"], pool_modules=POOL,
+        0, "img_edit", host="h", require_model=True,
+        known_models=["img_edit"], pool_modules=POOL,
     )
     assert claimed is not None and claimed["id"] == job_id
 
@@ -112,12 +112,16 @@ def test_lanes_disjoint_and_exhaustive_over_mixed_queue():
     backed = _enqueue("osediff_node", required_model="osediff")
 
     pool_ids, inline_ids = set(), set()
+    # subject = the require_model lane SPLIT; the kind law would stop the drain at
+    # each kind's width and hide a routing bug — opt out.
     while (j := node_queue.claim_next_gpu_job(
-            0, None, host="h", require_model=False, pool_modules=POOL)) is not None:
+            0, None, host="h", require_model=False, pool_modules=POOL,
+            kind_caps={})) is not None:
         pool_ids.add(j["id"])
     while (j := node_queue.claim_next_gpu_job(
             0, None, host="h", require_model=True,
-            known_models=["osediff"], pool_modules=POOL)) is not None:
+            known_models=["osediff"], pool_modules=POOL,
+            kind_caps={})) is not None:
         inline_ids.add(j["id"])
 
     assert pool_ids == {facade}

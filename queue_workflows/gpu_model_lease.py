@@ -63,6 +63,59 @@ LLM_SERVER_SLOT = "__llm_server__"
 #: ComfyUI URL) and the job carries no ``required_model``.
 COMFYUI_SERVER_SLOT = "__comfyui_server__"
 
+#: Prefix for SELF-MANAGING GPU work — a node that puts its OWN thing on the card
+#: and needs no server at all (Blender/EEVEE, a bespoke CUDA kernel, a rasteriser).
+#:
+#: These are the jobs the lease had no vocabulary for. Its subject was "which
+#: MODEL is on the card", so a job that is not a model had to borrow a key that
+#: is: :data:`LLM_SERVER_SLOT` unless the box happened to serve ComfyUI. Two real
+#: consequences, and the second is the serious one:
+#:
+#:   * every panel and heartbeat reported the box's LLM model as "in use" while
+#:     something entirely different held the card;
+#:   * sharing :data:`LLM_SERVER_SLOT` meant such a job did NOT exclude an ollama
+#:     dispatch — the lease granted both, and two unrelated workloads landed on
+#:     one card. The invariant the lease exists to enforce was off precisely for
+#:     the class of job that fits none of its categories.
+#:
+#: Per MODULE, not one shared key: two renders of the same node share a card
+#: happily (same occupant), while a Blender render and a video-model-a render must not.
+SELF_MANAGED_SLOT_PREFIX = "__gpu__:"
+
+
+def self_managed_slot(module: str) -> str:
+    """The lease key for self-managing GPU work from ``module``."""
+    return f"{SELF_MANAGED_SLOT_PREFIX}{module}"
+
+
+def describe_slot(slot: str | None) -> str:
+    """A slot rendered for humans — panels, heartbeats, log lines.
+
+    The sentinels are internal keys; printing them raw is what made a panel say
+    a model was loaded when none was. Anything that shows a lease holder should
+    come through here.
+    """
+    if not slot:
+        return "idle"
+    if slot == LLM_SERVER_SLOT:
+        return "LLM server"
+    if slot == COMFYUI_SERVER_SLOT:
+        return "ComfyUI render"
+    if slot.startswith(SELF_MANAGED_SLOT_PREFIX):
+        return f"GPU job: {slot[len(SELF_MANAGED_SLOT_PREFIX):]}"
+    return slot                      # a real model id — already human-readable
+
+
+def is_llm_slot(slot: str | None) -> bool:
+    """Whether ``slot`` is the box's LLM server. The negation is what tells a box
+    it may release its LLM RAM: something else owns the card now."""
+    return slot == LLM_SERVER_SLOT
+
+
+class LeaseContended(RuntimeError):
+    """The lease file stayed flock'd by another process past the bounded wait.
+    Treated exactly like a denial by every caller — deny/spill, never block."""
+
 
 class ModelLeaseDenied(RuntimeError):
     """Raised when a worker may not load a model because a LIVE holder on this box
@@ -163,7 +216,24 @@ class FileLeaseStore:
                     os.chmod(path, 0o666)   # cross-uid: root containers + host procs
                 except OSError:
                     pass
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            # NON-BLOCKING with a bounded retry — found live on box-c: a plain
+            # LOCK_EX blocks FOREVER when a crashed/stuck peer keeps the fd open,
+            # and this lock is taken on the HEARTBEAT thread (the switch hold, the
+            # lease tick) — the wedge froze heartbeats for 18 minutes. A lease that
+            # cannot be locked within ~2 s is treated as CONTENDED: acquire/renew
+            # read that as DENIED (the caller spills — its documented behaviour),
+            # release leaves the TTL to expire the entry. Liveness beats fairness
+            # here; nothing may ever block a worker thread on another process's fd.
+            deadline = time.monotonic() + 2.0
+            while True:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise LeaseContended(
+                            f"lease file {path} locked by another process for >2s")
+                    time.sleep(0.05)
             try:
                 fh.seek(0)
                 body = fh.read()
@@ -230,7 +300,14 @@ class ModelLease:
             return decide(state, model_id, self.holder, now, self.ttl_s)
 
         with self._lock:
-            granted = bool(self.store.update(self.box_id, txn))
+            try:
+                granted = bool(self.store.update(self.box_id, txn))
+            except LeaseContended:
+                # A file we cannot lock within the bound is a box we cannot claim:
+                # DENY (the caller spills), never block a worker thread.
+                log.warning("[gpu-model-lease] box %s lease file contended — "
+                            "treating as DENIED for %r", self.box_id, model_id)
+                return False
         if not granted:
             held = self.current().model
             log.warning("[gpu-model-lease] box %s DENIED %r — %r is resident (holder alive)",
@@ -254,7 +331,11 @@ class ModelLease:
             return None, release_state(state, self.holder)
 
         with self._lock:
-            self.store.update(self.box_id, txn)
+            try:
+                self.store.update(self.box_id, txn)
+            except LeaseContended:
+                log.warning("[gpu-model-lease] box %s contended on release — the "
+                            "TTL will expire this holder", self.box_id)
 
 
 def build_lease() -> ModelLease:

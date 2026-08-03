@@ -104,7 +104,7 @@ def test_resolve_inputs_resolves_upstream_pipeline_step_files_ref(tmp_path):
     on-disk ``<out_dir>/<step>/`` scan — exactly like an input step does.
 
     Regression pin for failed run ffc5d63c
-    (``qwen_fence_install_methods_experiment``): ``resolve_inputs_for_job`` only
+    (``edit_install_methods_experiment``): ``resolve_inputs_for_job`` only
     built ``run.context`` + siblings' ``context_delta`` keyed by ``node_id``
     (e.g. ``split_labeled_mask/split``). It NEVER did the on-disk
     ``<step>.files`` scan ``_run_context_for_refs`` does, so a ref to the STEP
@@ -132,8 +132,8 @@ def test_resolve_inputs_resolves_upstream_pipeline_step_files_ref(tmp_path):
 
     # The downstream PIPELINE node referencing the STEP's ``.files``.
     job_id = node_queue.enqueue_node_job(
-        run_id=run_id, node_id="install_masked_compose/qwen_fence_edit",
-        node_module="qwen_fence_edit", queue="gpu",
+        run_id=run_id, node_id="install_masked_compose/img_fence_edit",
+        node_module="img_fence_edit", queue="gpu",
         inputs={
             "mask_path": {
                 "$from": "split_labeled_mask.files",

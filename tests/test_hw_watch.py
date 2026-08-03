@@ -1,7 +1,7 @@
 """Hardware flight-recorder (migration 0021, ``queue_workflows/hw_watch.py``).
 
 Two-tier persisted hardware telemetry — the productized descendant of the
-ad-hoc "box-b blackbox" scripts that caught a GB10 box's firmware thermal
+ad-hoc "box-b blackbox" scripts that caught a unified-memory GPU box's firmware thermal
 kill (HW slowdown 0x48 asserted 7 s before an OS-invisible power cut):
 
 * ``detail``  tier — super-detailed samples (default every 2 s), retained 1 h.
@@ -166,19 +166,21 @@ def test_deep_sample_has_stable_shape_even_when_probes_fail(monkeypatch):
     for probe in (
         "_gpu_deep", "_read_thermal_zones", "_read_hwmon_temps",
         "_read_meminfo", "_read_load1", "_disk_root_used_mb", "_cpu_stats",
+        "_net_stats",
     ):
         monkeypatch.setattr(
             hw_watch, probe,
             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("probe down")),
         )
     sample = hw_watch.deep_sample()
-    for key in ("gpu", "tz", "hwmon", "mem", "load1", "disk_root_used_mb", "cpu"):
+    for key in ("gpu", "tz", "hwmon", "mem", "load1", "disk_root_used_mb", "cpu",
+                "net", "net_rx_bytes", "net_tx_bytes", "net_speed_mbps"):
         assert key in sample
 
 
 # ── CPU hardware stats ───────────────────────────────────────────────────
 #
-# On a unified-memory SoC (GB10) the CPU shares the die + power budget with
+# On a unified-memory SoC (unified-memory GPU box) the CPU shares the die + power budget with
 # the GPU, so CPU temp / freq / throttle are part of the same box-health
 # story. All stdlib (/proc, /sys) — no psutil dependency for the recorder.
 
@@ -234,7 +236,7 @@ def test_deep_sample_collects_real_probe_data():
 # field but doesn't graph. ``throttle_index`` collapses it to a 0-100 severity
 # (max over active bits — one HW-thermal bit already means "at the wall"), and
 # ``throttle_reasons`` decodes the bit names for tooltips. Calibration from the
-# GB10 incident: the box died seconds after 0x48 (HW slowdown + HW brake).
+# unified-memory GPU box incident: the box died seconds after 0x48 (HW slowdown + HW brake).
 
 
 def test_throttle_index_severity_ladder():
@@ -280,7 +282,7 @@ def test_deep_sample_carries_throttle_index(monkeypatch):
 
 # ── power-brake detection (the PSU watchdog signal) ──────────────────────
 #
-# GB10 exposes NO input-rail telemetry (no power_supply/typec/regulator
+# unified-memory GPU box exposes NO input-rail telemetry (no power_supply/typec/regulator
 # surfaces — verified on the incident box), so the GPU-side brake bits are
 # the only software-visible echo of a power-delivery event: 0x08 hw_slowdown
 # (NVML: thermal OR *external power brake assertion*) and 0x80 hw_power_brake.
@@ -357,6 +359,161 @@ def test_nvidia_deep_parses_instantaneous_power(monkeypatch):
     assert g["vram_used_mb"] is None                 # [N/A] on unified parts
 
 
+# ── network hardware stats (/proc/net/dev + /sys/class/net) ──────────────
+#
+# Network throughput is a box-health signal like CPU/GPU load: a stalled model
+# pull, a box that dropped off the network, or a NIC that renegotiated to a
+# lower link speed all show here. /proc/net/dev's byte columns are MONOTONIC
+# counters (like the GPU violation µs), so throughput is the delta between two
+# samples — stored raw, derived at read time via ``net_rates`` — which keeps
+# the sample stateless and lets a reader reconstruct the rate at any window.
+
+_PROC_NET_DEV = """\
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo: 1000000    5000    0    0    0     0          0         0  1000000    5000    0    0    0     0       0          0
+  eth0: 900000000 700000    1    2    0     0          0        10 120000000  400000    0    3    0     0       0          0
+ wlan0:       0        0    0    0    0     0          0         0        0        0    0    0    0     0       0          0
+garbage row without the expected column count
+"""
+
+
+def test_parse_net_dev_extracts_counters_and_drops_loopback():
+    devs = hw_watch._parse_net_dev(_PROC_NET_DEV)
+    assert "lo" not in devs                       # loopback = intra-host noise
+    assert set(devs) == {"eth0", "wlan0"}
+    e = devs["eth0"]
+    assert e["rx_bytes"] == 900000000 and e["tx_bytes"] == 120000000
+    assert e["rx_packets"] == 700000 and e["tx_packets"] == 400000
+    assert e["rx_errs"] == 1 and e["tx_drop"] == 3
+
+
+def test_parse_net_dev_tolerates_garbage():
+    assert hw_watch._parse_net_dev("") == {}
+    assert hw_watch._parse_net_dev("h1\nh2\nfoo: 1 2 3\n") == {}   # <16 columns
+
+
+def test_net_rates_derive_throughput_from_monotonic_counters():
+    prev = {"net_rx_bytes": 1000, "net_tx_bytes": 500}
+    curr = {"net_rx_bytes": 3000, "net_tx_bytes": 1500}
+    r = hw_watch.net_rates(prev, curr, dt_s=2.0)
+    assert r["rx_bytes_per_s"] == 1000.0          # (3000-1000)/2
+    assert r["tx_bytes_per_s"] == 500.0           # (1500-500)/2
+
+
+def test_net_rates_gap_reset_or_missing_reads_none_not_a_zero():
+    # counter went BACKWARDS (reboot / iface reset) → None, never a negative rate
+    assert hw_watch.net_rates(
+        {"net_rx_bytes": 5000}, {"net_rx_bytes": 10}, dt_s=2.0
+    )["rx_bytes_per_s"] is None
+    # non-positive dt → None
+    assert hw_watch.net_rates(
+        {"net_rx_bytes": 0}, {"net_rx_bytes": 10}, dt_s=0
+    )["rx_bytes_per_s"] is None
+    # missing counter / missing sample → None
+    assert hw_watch.net_rates(
+        {}, {"net_rx_bytes": 10}, dt_s=2.0
+    )["rx_bytes_per_s"] is None
+    assert hw_watch.net_rates(
+        None, {"net_rx_bytes": 10}, dt_s=2.0
+    )["rx_bytes_per_s"] is None
+
+
+def test_net_iface_meta_reads_link_speed_and_carrier(tmp_path):
+    base = tmp_path / "net"; base.mkdir()
+    eth = base / "eth0"; eth.mkdir()
+    (eth / "operstate").write_text("up\n")
+    (eth / "carrier").write_text("1\n")
+    (eth / "speed").write_text("1000\n")
+    (eth / "device").mkdir()                      # a real NIC has device/
+    assert hw_watch._net_iface_meta("eth0", base=str(base)) == {
+        "operstate": "up", "carrier": True, "speed_mbps": 1000, "physical": True,
+    }
+
+
+def test_net_iface_meta_virtual_iface_reports_no_real_speed(tmp_path):
+    base = tmp_path / "net"; base.mkdir()
+    d = base / "docker0"; d.mkdir()
+    (d / "operstate").write_text("down\n")
+    (d / "speed").write_text("-1\n")              # virtual/down → -1 → None
+    meta = hw_watch._net_iface_meta("docker0", base=str(base))
+    assert meta["speed_mbps"] is None and meta["physical"] is False
+    assert meta["carrier"] is None                # no carrier file → None
+
+
+def test_iface_virtual_classification():
+    # loopback, container/bridge plumbing, and VPN/tunnels (double-count the wire)
+    for v in ("lo", "docker0", "veth1a2b3c", "br-abc123", "virbr0", "cni0",
+              "tailscale0", "wg0", "zt5u4"):
+        assert hw_watch._iface_is_virtual(v), v
+    for real in ("eth0", "enp3s0", "wlan0", "bond0"):   # bond = REAL aggregate
+        assert not hw_watch._iface_is_virtual(real), real
+
+
+def test_iface_is_enslaved_detects_bond_slave(tmp_path):
+    base = tmp_path / "net"; base.mkdir()
+    slave = base / "eth0"; slave.mkdir()
+    (slave / "master").mkdir()                      # a bond slave has master/
+    plain = base / "eth1"; plain.mkdir()
+    assert hw_watch._iface_is_enslaved("eth0", base=str(base)) is True
+    assert hw_watch._iface_is_enslaved("eth1", base=str(base)) is False
+
+
+def _iface_counters(rx, tx):
+    return {"rx_bytes": rx, "tx_bytes": tx, "rx_packets": 0, "tx_packets": 0,
+            "rx_errs": 0, "tx_errs": 0, "rx_drop": 0, "tx_drop": 0}
+
+
+def test_net_stats_lists_physical_and_headline_excludes_down_and_slaves(monkeypatch):
+    monkeypatch.setattr(hw_watch, "_read_net_dev", lambda: {
+        "bond0": _iface_counters(100, 40),        # aggregate → counted
+        "eth0": _iface_counters(60, 25),          # bond slave → LISTED, not summed
+        "eth1": _iface_counters(40, 15),          # bond slave → LISTED, not summed
+        "wlan0": _iface_counters(7, 3),           # standalone up → counted
+        "docker0": _iface_counters(9999, 9999),   # virtual → dropped entirely
+        "eth2": _iface_counters(5, 5),            # down → LISTED, not summed
+    })
+    meta = {
+        "bond0": {"operstate": "up", "carrier": True, "speed_mbps": 2000, "physical": False},
+        "eth0": {"operstate": "up", "carrier": True, "speed_mbps": 1000, "physical": True},
+        "eth1": {"operstate": "up", "carrier": True, "speed_mbps": 1000, "physical": True},
+        "wlan0": {"operstate": "up", "carrier": True, "speed_mbps": 300, "physical": True},
+        "eth2": {"operstate": "down", "carrier": False, "speed_mbps": None, "physical": True},
+    }
+    monkeypatch.setattr(hw_watch, "_net_iface_meta", lambda name, **k: meta[name])
+    monkeypatch.setattr(hw_watch, "_iface_is_enslaved",
+                        lambda name, **k: name in ("eth0", "eth1"))
+    stats = hw_watch._net_stats()
+    # headline: bond0 + wlan0 only (slaves already in bond0; eth2 down; docker0 virtual)
+    assert stats["rx_bytes"] == 107 and stats["tx_bytes"] == 43
+    assert stats["speed_mbps"] == 2000            # fastest non-enslaved up link
+    # per-NIC view lists every PHYSICAL iface + bond (slaves + down included for
+    # visibility); only the container plumbing (docker0) is dropped.
+    listed = {i["iface"] for i in stats["ifaces"]}
+    assert listed == {"bond0", "eth0", "eth1", "wlan0", "eth2"}
+    assert "docker0" not in listed
+    assert next(i for i in stats["ifaces"] if i["iface"] == "eth0")["enslaved"] is True
+
+
+def test_deep_sample_includes_net_and_graph_fields(monkeypatch):
+    monkeypatch.setattr(hw_watch, "_net_stats", lambda: {
+        "ifaces": [{"iface": "eth0"}],
+        "rx_bytes": 12345, "tx_bytes": 678, "speed_mbps": 1000,
+    })
+    sample = hw_watch.deep_sample()
+    assert sample["net"]["rx_bytes"] == 12345
+    # box-level, graph-ready (panel plots bytes/s = Δ over the row gap)
+    assert sample["net_rx_bytes"] == 12345
+    assert sample["net_tx_bytes"] == 678
+    assert sample["net_speed_mbps"] == 1000
+
+
+def test_deep_sample_collects_real_net_probe():
+    sample = hw_watch.deep_sample()
+    assert isinstance(sample.get("net"), dict)
+    assert "net_rx_bytes" in sample and "net_speed_mbps" in sample
+
+
 # ── env knobs (envcompat: canonical + legacy twin) ───────────────────────
 
 
@@ -402,10 +559,10 @@ def test_interval_knobs_have_sane_defaults(monkeypatch):
     assert hw_watch.history_retention_s() == 86400
 
 
-# ── CPU/SoC temp: GB10 (ARM) acpitz fallback ────────────────────────────────
+# ── CPU/SoC temp: unified-memory GPU box (ARM) acpitz fallback ────────────────────────────────
 #
 # Regression fence for the blind spot that masked a CPU-thermal hard-power-off:
-# _read_cpu_temp_c() only knew x86/AMD CPU sensors, so on the ARM GB10 (whose SoC
+# _read_cpu_temp_c() only knew x86/AMD CPU sensors, so on the ARM unified-memory GPU box (whose SoC
 # temp is exposed only via generic acpitz zones) it returned None → "CPU TEMP: no
 # data" while the SoC was actually at ~95-98C.
 
@@ -432,7 +589,7 @@ def _fake_sysfs(monkeypatch, tmp_path, *, hwmon=None, zones=None):
 
 
 def test_cpu_temp_gb10_falls_back_to_hottest_acpitz(monkeypatch, tmp_path):
-    # ARM GB10: no CPU hwmon, only generic acpitz zones.
+    # ARM unified-memory GPU box: no CPU hwmon, only generic acpitz zones.
     _fake_sysfs(monkeypatch, tmp_path,
                 hwmon=[("acpi_fan", [])],
                 zones=[("acpitz", 72000), ("acpitz", 95000), ("acpitz", 88000)])

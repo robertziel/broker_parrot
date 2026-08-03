@@ -22,6 +22,22 @@ import pytest
 import queue_workflows
 from queue_workflows import db, dialect
 
+#: The sqlite chain's HEAD version, read from the migration files themselves.
+#: Hardcoding it made every new migration fail a test that has no opinion about
+#: the number — the contract being pinned is "bootstrap reaches the head and a
+#: full downgrade reverts exactly that many", not "the head is 23".
+#:
+#: NOTE this is derived from the SAME directory the test bootstraps, so it can no
+#: longer catch a pg migration shipped WITHOUT its sqlite twin — which the
+#: hardcoded constant caught by accident (and did catch, during 0024's first
+#: cut). :func:`test_the_two_dialect_chains_stay_in_lockstep` below restores that
+#: guard deliberately instead of relying on a number nobody meant as a tripwire.
+_SQLITE_CHAIN_HEAD = max(
+    int(p.name[:4])
+    for p in (db._engine_migrations_dir()).glob("[0-9][0-9][0-9][0-9]_*.sql")
+    if not p.name.endswith(".down.sql")
+)
+
 
 @pytest.fixture
 def sqlite_engine(tmp_path):
@@ -58,6 +74,22 @@ def test_translator_literal_awareness_unit():
     assert "now()" not in out                       # now() rewritten away
 
 
+def test_translator_apostrophe_in_a_comment_does_not_flip_literal_state():
+    # An SQL ``--`` comment containing an odd number of apostrophes ("don't")
+    # used to flip the splitter into in-literal for the REST of the statement,
+    # so every ::cast / %(name)s after it reached sqlite raw ("unrecognized
+    # token :"). Comments must be consumed whole as non-literal text.
+    from queue_workflows.db import _translate_sql_for_sqlite as T
+    out = T(
+        "SELECT a\n"
+        "-- don't let this comment eat the tail\n"
+        "FROM t WHERE id::text = %(x)s AND s = 'lit'"
+    )
+    assert "::" not in out                          # cast still stripped
+    assert ":x" in out and "%(x)s" not in out       # named param still converts
+    assert "'lit'" in out                           # real literal untouched
+
+
 def test_dialect_selected_for_sqlite(sqlite_engine):
     assert dialect.is_sqlite() is True
     assert dialect.get_dialect().name == "sqlite"
@@ -89,7 +121,7 @@ def test_paramstyle_json_array_timestamp_roundtrip(sqlite_engine):
         cur.execute(
             "INSERT INTO t (id, context, known_models, created_at) "
             "VALUES (%s, %s, %s, now())",
-            ("a", Jsonb({"k": 1, "nested": [1, 2]}), json.dumps(["sdxl", "qwen"])),
+            ("a", Jsonb({"k": 1, "nested": [1, 2]}), json.dumps(["sdxl", "an LLM"])),
         )
         assert cur.rowcount == 1
     # named %(id)s + RETURNING-style read
@@ -99,7 +131,7 @@ def test_paramstyle_json_array_timestamp_roundtrip(sqlite_engine):
 
     assert row["id"] == "a"
     assert row["context"] == {"k": 1, "nested": [1, 2]}     # JSON-obj → dict
-    assert row["known_models"] == ["sdxl", "qwen"]          # JSON-array → list
+    assert row["known_models"] == ["sdxl", "an LLM"]          # JSON-array → list
     assert isinstance(row["created_at"], datetime)          # TIMESTAMPTZ → datetime
     assert row["created_at"].tzinfo is not None             # aware (UTC), psycopg parity
 
@@ -147,11 +179,37 @@ def test_dialect_fragments_render_for_sqlite(sqlite_engine):
     assert d.array_param(["a", "b"]) == '["a", "b"]'   # list → JSON text for sqlite
 
 
+def test_the_two_dialect_chains_stay_in_lockstep():
+    """Every pg migration must ship its sqlite twin, and vice versa.
+
+    The engine keeps TWO chains — ``migrations/`` (Postgres) and
+    ``migrations_sqlite/`` — because SQLite supports neither ``IF NOT EXISTS`` on
+    ``ADD COLUMN`` nor ``ALTER TABLE ... ADD CONSTRAINT``. A pg-only migration is
+    therefore SILENT on sqlite: bootstrap succeeds, the column simply never
+    exists, and the first query that names it fails at runtime — inside a claim
+    loop that swallows the exception, so the worker just claims nothing.
+
+    Nothing enforced this. It was caught before only as a side effect of a
+    hardcoded head version (a test that had no such intent), and that constant is
+    now derived — so this asserts the parity directly. Filenames are identical
+    across the two directories by convention, which is what makes set-equality
+    the right check."""
+    pg = {p.name for p in db.ENGINE_MIGRATIONS_DIR.glob("[0-9][0-9][0-9][0-9]_*.sql")}
+    sqlite = {p.name for p in
+              db.ENGINE_MIGRATIONS_DIR_SQLITE.glob("[0-9][0-9][0-9][0-9]_*.sql")}
+    assert pg == sqlite, (
+        f"dialect chains diverged — pg-only: {sorted(pg - sqlite)}; "
+        f"sqlite-only: {sorted(sqlite - pg)}"
+    )
+
+
 def test_migration_chain_bootstraps_and_roundtrips(sqlite_engine):
-    # The SQLite migration chain (migrations_sqlite/) applies to v21, creates the
-    # full engine schema, and survives a full downgrade→0→re-bootstrap roundtrip.
+    # The SQLite migration chain (migrations_sqlite/) applies to the chain HEAD,
+    # creates the full engine schema, and survives a full downgrade→0→re-bootstrap
+    # roundtrip. The head is read from the chain rather than hardcoded so adding a
+    # migration doesn't fail a test that has no opinion about the number.
     db.bootstrap()
-    assert db.current_schema_version() == 21
+    assert db.current_schema_version() == _SQLITE_CHAIN_HEAD
 
     with db.connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -173,10 +231,10 @@ def test_migration_chain_bootstraps_and_roundtrips(sqlite_engine):
     assert wc_pk == ["host_label", "queue", "project"]   # migration 0019 PK rebuild
 
     reverted = db.downgrade(to_version=0)
-    assert len(reverted) == 21
+    assert len(reverted) == _SQLITE_CHAIN_HEAD
     assert db.current_schema_version() == 0
     db.bootstrap()
-    assert db.current_schema_version() == 21
+    assert db.current_schema_version() == _SQLITE_CHAIN_HEAD
 
 
 # ── Phase 3: real engine queue round-trips on SQLite ────────────────────────
@@ -241,13 +299,13 @@ def test_heartbeat_and_fleet_snapshot_array_parity(sqlite_ready):
     from queue_workflows import node_queue
     node_queue.upsert_worker_heartbeat(
         host_label="gpu1", queue="gpu", concurrency=2,
-        known_models=["sdxl", "qwen"], fits_models=["sdxl"],
+        known_models=["sdxl", "an LLM"], fits_models=["sdxl"],
         llm_servers_available=["ollama", "vllm"],
     )
     fleet = node_queue.fleet_snapshot()
     assert len(fleet) == 1
     row = fleet[0]
-    assert row["known_models"] == ["sdxl", "qwen"]            # text[]→list parity
+    assert row["known_models"] == ["sdxl", "an LLM"]            # text[]→list parity
     assert row["fits_models"] == ["sdxl"]
     assert row["llm_servers_available"] == ["ollama", "vllm"]
     assert row["fresh"] in (True, 1)                          # derived flag

@@ -117,7 +117,7 @@ def _install_node(name: str, run_fn):
 
 def _warm_real_cache() -> _model_cache.ModelCache:
     cache = _model_cache.ModelCache(idle_ttl_s=600.0)
-    cache._current_model = "qwen_edit"
+    cache._current_model = "img_edit"
     cache._current_handle = object()
     cache._last_used = time.monotonic() - 9999
     cache.require_model = lambda model_id: cache._current_handle  # type: ignore[assignment]
@@ -139,7 +139,7 @@ def test_run_node_holds_active_during_inference_so_reaper_keeps_model():
     _install_node("_idle_gpu_busy", run)
     _node_queue.enqueue_node_job(
         run_id=run_id, node_id="g", node_module="_idle_gpu_busy", queue="gpu",
-        required_model="qwen_edit",
+        required_model="img_edit",
     )
 
     worker = _claim_worker.ClaimWorker(queue="gpu", host="host-a", model_cache=cache)
@@ -161,7 +161,7 @@ def test_run_node_releases_active_after_job_so_reaper_can_unload():
     _install_node("_idle_gpu_done", run)
     _node_queue.enqueue_node_job(
         run_id=run_id, node_id="g", node_module="_idle_gpu_done", queue="gpu",
-        required_model="qwen_edit",
+        required_model="img_edit",
     )
 
     worker = _claim_worker.ClaimWorker(queue="gpu", host="host-a", model_cache=cache)
@@ -184,7 +184,7 @@ def test_run_node_releases_active_even_when_node_raises():
     _install_node("_idle_gpu_raise", run)
     job_id = _node_queue.enqueue_node_job(
         run_id=run_id, node_id="g", node_module="_idle_gpu_raise", queue="gpu",
-        required_model="qwen_edit",
+        required_model="img_edit",
     )
 
     worker = _claim_worker.ClaimWorker(queue="gpu", host="host-a", model_cache=cache)

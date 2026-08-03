@@ -16,7 +16,7 @@ real render hang because ollama keeps the box GPU > 0 %).
 
 GPU utilization — ``gpu_util_pct()``
 ------------------------------------
-NVIDIA (box-c/Blackwell): ``nvidia-smi pmon -c 1 -s u`` reports a per-PROCESS
+NVIDIA (ARM unified-memory): ``nvidia-smi pmon -c 1 -s u`` reports a per-PROCESS
 ``sm%`` column. The NVIDIA driver renders the PID column in the *caller's* PID
 namespace and lists ONLY the GPU processes visible in that namespace, so a call
 from inside the gpu worker container returns rows for this container's own
@@ -39,7 +39,7 @@ ROCm (host-c overflow worker) + any non-NVIDIA / no-pmon box: pmon isn't
 available, so ``gpu_util_pct()`` falls back to the box-level
 ``nvidia-smi``/``rocm-smi`` utilization (via ``hw_metrics._gpu_probe``). On
 host-c there is no ollama GPU sidecar, so the box-level signal is already
-per-host-clean there; and host-c runs the qwen pipeline fine (the stall is
+per-host-clean there; and host-c runs the LLM pipeline fine (the stall is
 box-c-specific), so the fallback's coarser attribution is acceptable for the
 overflow host.
 

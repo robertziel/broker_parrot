@@ -672,7 +672,7 @@ def test_pick_fence_source_wraps_scalar_abs_path_from_upstream_pick(tmp_path, pr
     """Regression pin for the masked-compose "No source image was attached
     to this step. Cancel and re-run." bug.
 
-    Workflow shape (qwen_fence_masked_compose_experiment):
+    Workflow shape (edit_masked_compose_experiment):
       pick_clean_car (choose_one, target=car_clean_path)
         ↓
       pick_fence (pick_fence, source={"$from": "pick_clean_car.car_clean_path"})

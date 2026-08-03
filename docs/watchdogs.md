@@ -2,7 +2,7 @@
 
 *How a wedged or dead worker gets recovered without a human paging in, from a live lease renewal up through an orchestrator-side dead-process detector.*
 
-A claim worker is **concurrency-1** by contract: one process, one job at a time (a GPU worker additionally holds one warm model slot). That structural fact cuts both ways — it's why the engine can run a warm-model cache at all, but it also means a single wedged job takes the *entire* worker offline until something frees it. This doc covers every layer that "something": lease + reclaim (the sole recovery path for an orphaned row), three in-process daemon watchdogs (each a distinct hard-exit code), the one policy point they all funnel through, two state-watcher threads that aren't about liveness but share the same hard-exit shape, and a last-resort orchestrator-side detector for the case where the process itself is too wedged to save itself.
+A claim worker is **concurrency-1** by default: one process, one job at a time (a GPU worker additionally holds one warm model slot; a cpu lane widened with `cpu_worker_threads` holds N — see §7). That structural fact cuts both ways — it's why the engine can run a warm-model cache at all, but it also means a single wedged job takes the *entire* worker offline until something frees it. This doc covers every layer that "something": lease + reclaim (the sole recovery path for an orphaned row), three in-process daemon watchdogs (each a distinct hard-exit code), the one policy point they all funnel through, two state-watcher threads that aren't about liveness but share the same hard-exit shape, and a last-resort orchestrator-side detector for the case where the process itself is too wedged to save itself.
 
 All watchdog and state-watcher classes live in `queue_workflows/claim_worker.py`; the physical GPU/RAM samplers live in `queue_workflows/gpu_health.py`; the reclaim sweeps and dead-worker detector live in `queue_workflows/node_queue.py`, driven from `NodePool._tick` in `queue_workflows/node_pool.py`.
 
@@ -60,7 +60,7 @@ It **arms at job start**, not on first beat — with a generous `GPU_HEALTH_LOAD
 
 **Why this replaced the old fixed GPU wall-clock cap.** The prior design bracketed GPU jobs with the same `Watchdog` used for CPU: a fixed budget (2.25 h generic / 30 min video). That failed in both directions on the hardware this engine targets:
 
-- **False negative** — a Blackwell qwen inference hang sits model-resident at 0% GPU indefinitely; the wall-clock cap let it camp the full 8100 s (2.25 hours) of dead GPU before tripping, because "elapsed time" told it nothing about whether the job was actually doing anything.
+- **False negative** — an LLM inference hang sits model-resident at 0% GPU indefinitely; the wall-clock cap let it camp the full 8100 s (2.25 hours) of dead GPU before tripping, because "elapsed time" told it nothing about whether the job was actually doing anything.
 - **False positive** — a long-but-healthy render (a big video job, a slow-but-legitimate diffusion run) could exceed the fixed budget purely by taking a while, and got killed for being slow rather than for being stuck.
 
 Policing *health* instead of *time* fixes both: a truly wedged job (idle GPU, static RAM) trips in one `interval_s` window regardless of how young the job is; a healthy job — however long — is never killed for elapsed time alone.
@@ -130,6 +130,16 @@ The orchestrator (`NodePool`) is a **separate process** — GIL-independent of a
 | **79** | `WorkerControlWatcher` | operator sets `worker_controls.desired_state = 'off'` for this `(host, queue)` | hard stop: resume-style re-queue (no `watchdog_retries` bump), then exit — see [`worker_control.md`](worker_control.md) |
 
 All five exits are `os._exit` (or an injected `on_exit` in tests) — a hard process kill, not a Python-level exception, because the only thing guaranteed to free a worker stuck deep in a CUDA kernel or a blocked driver call is terminating the process outright. systemd (or the container supervisor) restarts the process; on boot it re-reads any operator control state and either resumes claiming or parks, per [`worker_control.md`](worker_control.md).
+
+## 7. A trip in a widened cpu lane takes the siblings with it
+
+`cpu_worker_threads > 1` ([deployment](deployment.md) §2.5) puts N node-jobs in one process. Nothing above changes — a Python thread **cannot** be killed, so a wedged body is still only stopped by killing the process, and that kills the N−1 healthy siblings too.
+
+So before the hard exit, the trip **releases this process's other in-flight rows**: `running → queued`, lease cleared, front of the line, and **no `watchdog_retries` bump** — being on a box whose neighbour wedged is not a fault of theirs, and burning their retry cap for it would eventually fail perfectly healthy runs. They redistribute immediately instead of idling until their leases lapse. The tripped job itself is untouched by the sweep; `_watchdog_trip`'s own requeue-with-bump (or fail-at-cap) owns it, exactly as at concurrency-1.
+
+The sweep is scoped to **the claims this process actually holds** — by job id *and* by that claim's `started_at` — never host-wide. That distinction is load-bearing: the recommended lane runs N *processes* sharing one `host_label` ([deployment](deployment.md) §2), so a host-wide release — right for the operator OFF, which turns the whole lane off — would here yank a healthy sibling *process's* rows; each of those would then self-exit on its `JobStatusWatcher` (77) and one wedged job would cascade into killing the whole box's lane. The `started_at` term closes the same hole for a **stale** id: an id stays in the in-flight set until the body returns, but the row can leave this process meanwhile (lapsed lease, a corrective requeue) and be re-claimed by such a sibling — which would still match on id alone. A re-claim stamps a new `started_at`, so the sweep passes over it. `node_queue.requeue_running_job` (per-claim, scoped by `claimed_by`/`queue`/`project` too) is the sweep's primitive; `requeue_running_for_worker` (host-wide) stays the operator-OFF primitive.
+
+> The claim check runs in Python rather than as an `AND started_at = %s` term: on the sqlite backend the column is stored as TEXT with **millisecond** precision while a bound datetime renders to **whole seconds** (`db._adapt_dt`), so that equality never matches and the sweep would silently degrade to a no-op there. The surrounding `FOR UPDATE` makes read+write atomic against a concurrent re-claim on Postgres; sqlite strips the clause and relies on its connection lock + WAL, exactly as the rest of the claim path does. The guard's resolution is the column's — microseconds on pg, milliseconds on sqlite — so in principle a re-claim landing inside the same millisecond would defeat it there; measured 0 collisions in 30 tight requeue→re-claim cycles.
 
 ## Related docs
 

@@ -61,8 +61,8 @@ def test_acquire_evicts_every_rival_kind_then_starts_and_readies():
         fired["ollama"] = models
 
     residents = [
-        Resident(server=llm_probe.OLLAMA, model="qwen3:8b", mru=5.0),
-        Resident(server=llm_probe.INPROCESS, model="wan-s2v-14b"),
+        Resident(server=llm_probe.OLLAMA, model="chat-model-b", mru=5.0),
+        Resident(server=llm_probe.INPROCESS, model="video-model-a-14b"),
     ]
     evicted = comfyui.acquire_box_for_comfyui(
         residents,
@@ -74,13 +74,13 @@ def test_acquire_evicts_every_rival_kind_then_starts_and_readies():
         label="box-a",
     )
     # every foreign kind's lever fired; the ollama model name was passed through
-    assert fired["ollama"] == ["qwen3:8b"]
+    assert fired["ollama"] == ["chat-model-b"]
     assert fired["inproc"] == 1
     assert fired["start"] == 1
     # returns what it evicted (both rivals)
     assert {(r.server, r.model) for r in evicted} == {
-        (llm_probe.OLLAMA, "qwen3:8b"),
-        (llm_probe.INPROCESS, "wan-s2v-14b"),
+        (llm_probe.OLLAMA, "chat-model-b"),
+        (llm_probe.INPROCESS, "video-model-a-14b"),
     }
 
 
@@ -97,7 +97,7 @@ def test_acquire_on_a_box_already_only_comfyui_is_a_noop_but_still_starts():
 
 def test_acquire_raises_if_a_rival_survives_eviction():
     """A rival that won't die must fail the acquire (reuse clear_box_for's reprobe guard)."""
-    residents = [Resident(server=llm_probe.OLLAMA, model="qwen3:8b")]
+    residents = [Resident(server=llm_probe.OLLAMA, model="chat-model-b")]
     with pytest.raises(ModelAlreadyLoadedError):
         comfyui.acquire_box_for_comfyui(
             residents,
@@ -256,7 +256,7 @@ def test_ensure_comfyui_box_wires_config_start_and_probe(monkeypatch):
     it pulls the ComfyUI URL, start lever and residents from config/probe."""
     started = []
     queue_workflows.set_comfyui_lifecycle(start_fn=lambda: started.append(1), stop_fn=None)
-    residents = [Resident(server=llm_probe.OLLAMA, model="qwen3:8b", mru=1.0)]
+    residents = [Resident(server=llm_probe.OLLAMA, model="chat-model-b", mru=1.0)]
     unloaded = []
 
     evicted = comfyui.ensure_comfyui_box(
@@ -268,5 +268,5 @@ def test_ensure_comfyui_box_wires_config_start_and_probe(monkeypatch):
         label="box-a",
     )
     assert started == [1]                       # config start lever fired
-    assert unloaded == [["qwen3:8b"]]           # rival ollama evicted
-    assert {(r.server, r.model) for r in evicted} == {(llm_probe.OLLAMA, "qwen3:8b")}
+    assert unloaded == [["chat-model-b"]]           # rival ollama evicted
+    assert {(r.server, r.model) for r in evicted} == {(llm_probe.OLLAMA, "chat-model-b")}

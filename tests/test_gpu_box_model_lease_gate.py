@@ -258,7 +258,7 @@ def test_residency_llm_slot_checks_ollama_loaded_models(monkeypatch):
     from queue_workflows import llm_probe
     from queue_workflows.llm_backends import factory
     monkeypatch.setattr(factory, "resolve_base_url", lambda t="ollama": "http://b:11434")
-    monkeypatch.setattr(llm_probe, "loaded_models", lambda url: ["qwen"])
+    monkeypatch.setattr(llm_probe, "loaded_models", lambda url: ["an LLM"])
     assert _worker()._model_still_resident(LLM_SERVER_SLOT) is True
     monkeypatch.setattr(llm_probe, "loaded_models", lambda url: [])
     assert _worker()._model_still_resident(LLM_SERVER_SLOT) is False
@@ -283,3 +283,168 @@ def test_pool_node_spills_without_executing_when_box_is_full(monkeypatch, tmp_pa
     monkeypatch.setattr(w, "_run_pool_lane_body", lambda *a, **k: ran.append(1), raising=False)
     assert w._run_pool_node({"id": "j", "required_model": None}) is False
     assert ran == []                     # execution never started
+
+
+# ── SELF-MANAGING GPU work is its own occupant, not the LLM's ────────────────
+#
+# THE DEFECT: the lease's subject was "which MODEL is on the card", so a job that
+# is not a model had to borrow a key that is. A self-managing node (Blender/EEVEE
+# via `gpu_self_load_node_modules`) fell through to `__llm_server__` — so it
+# SHARED the lease with ollama dispatches instead of excluding them, and two
+# unrelated workloads ran on one card. The panel reported the LLM model "in use"
+# while a Blender render held the GPU.
+
+
+def _self_managing(monkeypatch, *modules):
+    from queue_workflows import config as _config
+
+    cfg = _config.get_config()
+    monkeypatch.setattr(cfg, "gpu_self_load_node_modules", frozenset(modules),
+                        raising=False)
+
+
+def test_a_self_managing_node_gets_its_OWN_slot(monkeypatch):
+    from queue_workflows.gpu_model_lease import self_managed_slot
+
+    _self_managing(monkeypatch, "render_blender_reel")
+    job = {"required_model": None, "node_module": "render_blender_reel"}
+    assert _worker()._effective_gpu_model(job) == self_managed_slot("render_blender_reel")
+
+
+def test_it_EXCLUDES_an_ollama_dispatch_on_the_same_box(monkeypatch, tmp_path):
+    """The consequence that matters. Sharing the LLM slot meant the lease GRANTED
+    both — the invariant it exists to enforce was off for exactly this class."""
+    _self_managing(monkeypatch, "render_blender_reel")
+    render = _worker(lease=_file_lease(tmp_path, "render"))
+    llm = _worker(lease=_file_lease(tmp_path, "llm"))
+
+    assert render._acquire_box_or_spill(
+        {"id": "j1", "required_model": None, "node_module": "render_blender_reel"})
+    # An ollama dispatch on the SAME physical box must now be refused and spill.
+    assert not llm._acquire_box_or_spill(
+        {"id": "j2", "required_model": None, "node_module": "llm_chat"})
+
+
+def test_two_renders_of_the_SAME_node_still_share_the_card(monkeypatch, tmp_path):
+    """Per-module, not one shared key: identical work co-tenants fine — it is
+    unrelated work that must not."""
+    _self_managing(monkeypatch, "render_blender_reel")
+    a = _worker(lease=_file_lease(tmp_path, "a"))
+    b = _worker(lease=_file_lease(tmp_path, "b"))
+    job = {"required_model": None, "node_module": "render_blender_reel"}
+
+    assert a._acquire_box_or_spill(dict(job, id="j1"))
+    assert b._acquire_box_or_spill(dict(job, id="j2"))
+
+
+def test_two_DIFFERENT_self_managing_nodes_exclude_each_other(monkeypatch, tmp_path):
+    _self_managing(monkeypatch, "render_blender_reel", "video_model_a_render")
+    a = _worker(lease=_file_lease(tmp_path, "a"))
+    b = _worker(lease=_file_lease(tmp_path, "b"))
+
+    assert a._acquire_box_or_spill(
+        {"id": "j1", "required_model": None, "node_module": "render_blender_reel"})
+    assert not b._acquire_box_or_spill(
+        {"id": "j2", "required_model": None, "node_module": "video_model_a_render"})
+
+
+def test_an_UNregistered_no_model_job_still_keys_to_the_llm_slot(monkeypatch):
+    """Registration is the declaration. A gpu node that never declared itself
+    self-managing keeps the old behaviour — this change adds a category, it does
+    not reinterpret the ones that exist."""
+    _self_managing(monkeypatch)
+    assert _worker()._effective_gpu_model(
+        {"required_model": None, "node_module": "llm_chat"}) == LLM_SERVER_SLOT
+
+
+# ── taking the card reclaims the LLM's RAM ───────────────────────────────────
+
+
+def test_a_non_llm_occupant_unloads_the_resident_ollama_weights(monkeypatch, tmp_path):
+    """A resident model is not the same thing as a held lease: ollama's
+    keep-alive holds ~29 GB AFTER its job finished and its lease was released, so
+    a render acquires the box legitimately and then runs alongside VRAM it was
+    just granted exclusive use of. Exclusivity that covers the bookkeeping and
+    not the card is not exclusivity."""
+    from queue_workflows import llm_probe
+
+    _self_managing(monkeypatch, "render_blender_reel")
+    unloaded: list[list[str]] = []
+    monkeypatch.setattr(llm_probe, "loaded_models_info",
+                        lambda *a, **k: [{"name": "chat-model-a:latest"}])
+    monkeypatch.setattr(llm_probe, "unload_ollama_models",
+                        lambda base, models: unloaded.append(list(models)))
+
+    w = _worker(lease=_file_lease(tmp_path, "render"))
+    assert w._acquire_box_or_spill(
+        {"id": "j1", "required_model": None, "node_module": "render_blender_reel"})
+    assert unloaded == [["chat-model-a:latest"]]
+
+
+def test_an_LLM_job_does_NOT_unload_the_model_it_is_about_to_use(monkeypatch, tmp_path):
+    """The obvious way to get this catastrophically wrong."""
+    from queue_workflows import llm_probe
+
+    _self_managing(monkeypatch, "render_blender_reel")
+    unloaded: list[list[str]] = []
+    monkeypatch.setattr(llm_probe, "loaded_models_info",
+                        lambda *a, **k: [{"name": "chat-model-a:latest"}])
+    monkeypatch.setattr(llm_probe, "unload_ollama_models",
+                        lambda base, models: unloaded.append(list(models)))
+
+    w = _worker(lease=_file_lease(tmp_path, "llm"))
+    assert w._acquire_box_or_spill(
+        {"id": "j1", "required_model": None, "node_module": "llm_chat"})
+    assert unloaded == []
+
+
+# ── slots are internal keys; humans get words ────────────────────────────────
+
+
+def test_slots_describe_themselves_for_a_panel():
+    from queue_workflows.gpu_model_lease import (
+        COMFYUI_SERVER_SLOT, describe_slot, self_managed_slot,
+    )
+
+    assert describe_slot(None) == "idle"
+    assert describe_slot(LLM_SERVER_SLOT) == "LLM server"
+    assert describe_slot(COMFYUI_SERVER_SLOT) == "ComfyUI render"
+    assert describe_slot(self_managed_slot("render_blender_reel")) == \
+        "GPU job: render_blender_reel"
+    assert describe_slot("sdxl") == "sdxl"
+
+
+# ── the heartbeat gauge names the occupant ───────────────────────────────────
+
+
+def _heartbeat(occupant=None, model=None):
+    class _MC:
+        current_model = model
+
+    return claim_worker.HeartbeatEmitter(
+        queue="gpu", host_label="box-a-gpu", model_cache=_MC(),
+        occupant_fn=(lambda: occupant))
+
+
+def test_the_gauge_names_a_self_managing_occupant():
+    """The panel used to show the LLM's model "in use" while a Blender render
+    held the card; with the slot fixed it would have shown NULL — an idle box
+    doing minutes of GPU work. The gauge now says what actually holds the card."""
+    from queue_workflows.gpu_model_lease import self_managed_slot
+
+    hb = _heartbeat(occupant=self_managed_slot("render_blender_reel"))
+    assert hb._current_model() == "GPU job: render_blender_reel"
+
+
+def test_a_real_in_process_model_still_wins_the_gauge():
+    from queue_workflows.gpu_model_lease import self_managed_slot
+
+    hb = _heartbeat(occupant=self_managed_slot("render_blender_reel"), model="sdxl")
+    assert hb._current_model() == "sdxl"
+
+
+def test_the_llm_slot_stays_null_so_the_server_is_not_double_reported():
+    from queue_workflows.gpu_model_lease import LLM_SERVER_SLOT
+
+    assert _heartbeat(occupant=LLM_SERVER_SLOT)._current_model() is None
+    assert _heartbeat(occupant=None)._current_model() is None

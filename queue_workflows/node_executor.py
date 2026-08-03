@@ -269,9 +269,17 @@ def execute_node(
     t0 = time.time()
 
     required_model = job.get("required_model")
+    # REMOTE-SERVED (migration 0022): a row naming ``server_types`` is executed by an
+    # EXTERNAL LLM server, so its ``required_model`` says "the box's server must be
+    # serving this" — NOT "load this into my process". It must therefore skip the
+    # in-process ModelCache entirely: the row is claimed by the PAR-wide pool lane,
+    # which supplies no cache, and demanding one there fails every such job with
+    # "no model_cache was supplied". The model id is still carried on the row on
+    # purpose — warm-model affinity, the VRAM gate and the box-lease key all read it.
+    remote_served = bool(job.get("server_types"))
     handle = None
     model_load_seconds: float | None = None
-    if required_model:
+    if required_model and not remote_served:
         # Cache-managed model load — only when the node declared one in
         # its schema. Legacy GPU nodes load their weights internally on
         # each call; they carry no ``required_model`` so they skip the

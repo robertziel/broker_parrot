@@ -6,7 +6,7 @@ finish — it must NOT be auto-failed. Earlier the hook capped at 5 resumes then
 marked the run ``failed`` ("[auto-resume cap reached]"); that conflated two
 unrelated things — a poison-pill run that crashes every worker, and a healthy
 run that simply rode through N fleet restarts or a host-specific hang (e.g. the
-Blackwell qwen stall, which the worker watchdog fails on a box-c but which would
+an LLM stall, which the worker watchdog fails on a box-c but which would
 complete on host-c). The cap killed the healthy case. Policy now: always
 re-queue; ``resume_count`` still climbs for observability, but never auto-fails.
 Genuine node failures still fail the run via the normal node-failure path.

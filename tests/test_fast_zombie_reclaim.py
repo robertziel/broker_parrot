@@ -10,16 +10,23 @@ is actually gone:
 
   1. **worker-boot self-reclaim** — a restarting worker re-queues its dead
      predecessor's rows immediately (seconds after the supervisor restart);
-  2. **orchestrator fast dead-reclaim** — ``_sweep_dead_workers`` now also re-queues a
-     flagged worker's jobs at flag time (~30 s), covering a worker that is gone and
-     NOT coming back (container stopped, box down).
+  2. **orchestrator dead-worker sweep** — ``_sweep_dead_workers`` FLAGS the worker
+     for a host-supervisor bounce but NEVER touches its job rows. It briefly also
+     re-queued them (~30 s) — reverted after a live incident: a heartbeat is a
+     PROCESS-level signal from one thread, and a wide-concurrency cpu worker under
+     load starved its beat thread past staleness while every per-job lease kept
+     renewing — 23 LIVE jobs were mass-re-queued mid-flight. The per-JOB lease
+     renewal is the only truthful liveness signal, so job recovery belongs to the
+     frozen-lease sweep below (~35 s — same speed, no false positives);
+  3. **frozen-lease sweep** — per-job recovery keyed on the lease renewal itself.
 
-SAFETY. Both paths ride one atomic predicate: rows are re-queued ONLY while the
-label's heartbeat is STALE (or absent). A multi-process lane (30 cpu procs share one
-label) is safe because any live sibling keeps the heartbeat fresh — and a claim can
-only happen AFTER the claimer's first beat, so "claimed row + stale heartbeat" can
-never describe a live job. Double-run is prevented by the same guarantee every reclaim
-relies on: clearing ``claimed_by`` trips a still-alive claimant's JobStatusWatcher.
+SAFETY. The boot self-reclaim rides one atomic predicate: rows are re-queued ONLY
+while the label's heartbeat is STALE (or absent). A multi-process lane (30 cpu procs
+share one label) is safe because any live sibling keeps the heartbeat fresh — and a
+claim can only happen AFTER the claimer's first beat, so "claimed row + stale
+heartbeat" can never describe a live job. Double-run is prevented by the same
+guarantee every reclaim relies on: clearing ``claimed_by`` trips a still-alive
+claimant's JobStatusWatcher.
 
 Requires Postgres (heartbeat staleness uses ``make_interval``): run with
 ``QUEUE_WORKFLOWS_TEST_DB_URL=postgresql://...:.../qw_test``.
@@ -138,17 +145,30 @@ def test_run_forever_wires_the_boot_reclaim():
     assert "_reclaim_predecessor_zombies" in src
 
 
-# ── orchestrator fast dead-reclaim (the flag now also frees the jobs) ─────────
+# ── orchestrator dead-worker sweep: flag-only, NEVER touches job rows ─────────
 
 
-def test_sweep_dead_workers_requeues_the_flagged_workers_jobs():
+def test_sweep_dead_workers_flags_but_never_touches_the_job():
+    """THE FALSE-POSITIVE INCIDENT. box-c's 30-wide cpu worker
+    starved its heartbeat thread >90 s under a 27-job batch while every job's
+    lease kept renewing — the then-requeueing sweep yanked 23 LIVE jobs
+    mid-flight. Contract since: heartbeat staleness flags the PROCESS for a
+    supervisor bounce; the job rows stay untouched (per-job recovery is the
+    frozen-lease sweep's, keyed on the lease renewal — the signal that was
+    provably fresh here)."""
     jid = _zombie("box-swept-gpu")
     pool = node_pool.NodePool.__new__(node_pool.NodePool)
     pool._dead_worker_last_run = 0.0
     pool._dead_worker_interval_s = 0.0
     pool._sweep_dead_workers()
     row = _status(jid)
-    assert row["status"] == "queued" and row["is_priority"] is True
+    assert row["status"] == "running" and row["claimed_by"] == "box-swept-gpu"
+    with connection() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT last_flagged_dead_at FROM worker_heartbeats "
+            "WHERE host_label = %s", ("box-swept-gpu",),
+        )
+        assert cur.fetchone()["last_flagged_dead_at"] is not None
 
 
 def test_sweep_dead_workers_leaves_fresh_workers_jobs_alone():

@@ -1,0 +1,26 @@
+-- 0022 — per-node-job LLM SERVER PREFERENCE.
+--
+-- An ORDERED preference of LLM server kinds for this job: ``{vllm,ollama}`` reads
+-- "serve me on vLLM, fall back to ollama". NULL (the default) ⇒ unconstrained, so
+-- every existing row and every consumer is byte-identical — the whole feature is
+-- opt-in per row, exactly like the 0020 placement arrays.
+--
+-- WHY an ARRAY and not a scalar. A scalar would be a SWITCH — the job would name
+-- one server and STALL when that server is down. Ordered preference degrades
+-- instead: the claim accepts any box whose served kinds INTERSECT the array, and
+-- the backend resolver then picks the FIRST listed kind that box can actually
+-- serve. That is what makes it safe to tag jobs for vLLM before a single vLLM
+-- server exists anywhere — they keep running on ollama until one does.
+--
+-- WHY it also decides the LANE. ``server_types IS NOT NULL`` means "an EXTERNAL
+-- server holds this model", which is precisely the distinction the GPU claim was
+-- missing: it split inline-vs-pool on ``required_model IS NULL``, so an LLM job
+-- naming a model was forced onto the concurrency-1 INLINE lane meant for models
+-- loaded INTO the worker process. Now such a job is POOL-eligible (PAR-wide)
+-- while KEEPING its ``required_model`` — so warm-model affinity, the VRAM gate and
+-- the box-lease key all still see the model id. One column, two jobs done.
+--
+-- text[] mirrors ``avoid_box``/``force_box``/``known_models`` so the sqlite
+-- dialect stores and reads it as JSON through the same seam. IF NOT EXISTS ⇒
+-- idempotent on re-run, like the rest of the chain.
+ALTER TABLE workflow_node_jobs ADD COLUMN IF NOT EXISTS server_types text[];

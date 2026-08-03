@@ -195,6 +195,7 @@ _JSON_OBJ_COLS = frozenset({
 _JSON_ARRAY_COLS = frozenset({
     "known_models", "fits_models", "llm_servers_available",
     "avoid_box", "force_box",   # per-node-job box placement (migration 0020)
+    "server_types",             # per-node-job LLM server preference (migration 0022)
 })
 _TS_COLS = frozenset({
     "created_at", "updated_at", "queued_at", "started_at", "finished_at",
@@ -311,7 +312,12 @@ def _close_sqlite_conn() -> None:
 def _split_sql_literals(sql: str) -> list[tuple[bool, str]]:
     """Split ``sql`` into ``(is_literal, chunk)`` segments, where a literal is a
     single-quoted string (with ``''`` escapes). Transforms apply only to
-    non-literal chunks so e.g. ``strftime('%s', …)`` is never rewritten."""
+    non-literal chunks so e.g. ``strftime('%s', …)`` is never rewritten.
+
+    ``--`` line comments are consumed whole as non-literal text: an apostrophe
+    in a comment (``-- don't …``) must not flip the literal state, or every
+    ``::cast`` / ``%(name)s`` after it reaches sqlite untranslated — which is
+    exactly what an odd number of comment apostrophes silently did."""
     segs: list[tuple[bool, str]] = []
     buf: list[str] = []
     in_str = False
@@ -319,6 +325,12 @@ def _split_sql_literals(sql: str) -> list[tuple[bool, str]]:
     while i < n:
         c = sql[i]
         if not in_str:
+            if c == "-" and i + 1 < n and sql[i + 1] == "-":
+                j = sql.find("\n", i)
+                j = n if j == -1 else j
+                buf.append(sql[i:j])
+                i = j
+                continue
             if c == "'":
                 if buf:
                     segs.append((False, "".join(buf))); buf = []

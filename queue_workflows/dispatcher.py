@@ -169,6 +169,9 @@ def _nodes_of(
                 # carrying it). Thread both fields through explicitly.
                 "avoid_box": sn.get("avoid_box"),
                 "force_box": sn.get("force_box"),
+                # Per-node LLM server preference (migration 0022) — same whitelist
+                # rule: not copied here means silently dropped.
+                "server_types": sn.get("server_types"),
             })
     return out
 
@@ -231,6 +234,31 @@ def _queue_of(node: dict[str, Any]) -> str:
     # ``model`` aren't cache-managed — the GPU claim worker skips
     # ``require_model`` for them and invokes the node directly.
     return "gpu" if node.get("gpu") else "cpu"
+
+
+def _node_cpu_slots(node: dict[str, Any]) -> int | None:
+    """The node spec's declared CPU width (migration 0024), or ``None``.
+
+    A workflow author writes ``"cpu_slots": 5`` on a node whose body runs its own
+    threads; the dispatcher stamps it on the fanned-out row so the CLAIM can hold
+    that much of a widened lane before the body starts. Absent / unparseable /
+    ``<= 1`` ⇒ ``None`` = an ordinary 1-slot job.
+
+    Tolerant on purpose: a malformed value in a host's DAG must not break run
+    expansion — the node simply runs at the default width, which is the
+    pre-0024 behaviour and always safe."""
+    raw = node.get("cpu_slots")
+    if raw is None:
+        return None
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        log.warning(
+            "[dispatcher] node %s: ignoring unparseable cpu_slots %r",
+            node.get("id"), raw,
+        )
+        return None
+    return val if val > 1 else None
 
 
 def _required_model(node: dict[str, Any]) -> str | None:
@@ -395,10 +423,17 @@ def _process_ready(
 
 
 def start_run(run_id: str) -> int:
-    """Expand the run's workflow into its initial set of queued node-jobs.
+    """Expand the run's workflow into its initial set of queued node-jobs, and
+    flip the run ``queued → running`` once jobs exist for it.
 
     Idempotent: re-calling doesn't duplicate rows (UNIQUE on (run_id, node_id)).
     Returns how many NEW rows it enqueued.
+
+    The status flip lives HERE — on every expansion path — and is keyed on
+    "node-jobs exist", not on this call's return value: a host that expands a
+    run itself at trigger time leaves nothing NEW for the orchestrator loop to
+    enqueue, and a flip gated on that (the loop's old ``n > 0``) left such runs
+    ``'queued'`` forever (see :func:`run_store.mark_run_running_if_expanded`).
     """
     run = run_store.get_run(run_id)
     if not run:
@@ -414,7 +449,9 @@ def start_run(run_id: str) -> int:
         )
         log.error("[dispatcher] start_run %s rejected: %s", run_id, exc)
         return 0
-    return _process_ready(run_id, wf, run)
+    n = _process_ready(run_id, wf, run)
+    run_store.mark_run_running_if_expanded(run_id)
+    return n
 
 
 # ---------------------------------------------------------------------------
@@ -1329,4 +1366,12 @@ def _enqueue(run_id: str, node: dict[str, Any], run: dict[str, Any]) -> str:
         # node onto / off a machine (e.g. keep renders off the control hub).
         avoid_box=node.get("avoid_box"),
         force_box=node.get("force_box"),
+        # Per-node LLM server preference (migration 0022): an ORDERED list of server
+        # kinds, e.g. ``['vllm', 'ollama']``. Absent ⇒ NULL ⇒ unconstrained (and the
+        # job stays on the classic inline/pool split).
+        server_types=node.get("server_types"),
+        # Per-node CPU WIDTH (migration 0024): how many slots of a widened cpu
+        # lane this node needs, for a body that runs its own threads. Absent ⇒
+        # NULL ⇒ an ordinary 1-slot job, and a serial worker ignores it entirely.
+        cpu_slots=_node_cpu_slots(node),
     )

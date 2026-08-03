@@ -51,6 +51,12 @@ log = logging.getLogger(__name__)
 # call without a restart, but a steady state costs one stat().
 _LOCK = threading.Lock()
 _CACHE: dict[str, tuple[float, dict[str, dict[str, Any]]]] = {}
+_DOC_CACHE: dict[str, tuple[float, dict]] = {}
+
+#: Per-kind URL keys an entry may carry (migration 0022 — co-resident servers).
+#: Kept as a literal rather than importing ``worker_control.VALID_SERVER_TYPES`` so
+#: this module stays a leaf with no engine imports (same discipline as config.py).
+_SERVER_KINDS = ("ollama", "vllm")
 
 
 def resolve(path: str, host_label: str) -> dict[str, Any] | None:
@@ -65,6 +71,54 @@ def resolve(path: str, host_label: str) -> dict[str, Any] | None:
     if not boxes:
         return None
     return boxes.get(host_label) or boxes.get("default")
+
+
+def resolve_for(path: str, host_label: str, server_type: str) -> str | None:
+    """The ROOT URL this box dispatches to **for one server KIND**.
+
+    Two servers can now be co-resident on a box (migration 0022), and they answer
+    on different ports — so a single per-box ``url`` is no longer enough. An entry
+    may name a URL per kind::
+
+        boxes:
+          box-a-gpu:
+            ollama: http://127.0.0.1:11434
+            vllm:   http://127.0.0.1:8000
+
+    BACK-COMPAT is the point of this function: a bare-string or ``{url: …}`` entry
+    (every topology written before 0022) still answers for **both** kinds, so an
+    existing deployment behaves exactly as before until it opts in per kind.
+    Resolution order is kind-specific key → the shared ``url`` → ``None`` (caller
+    falls back to the env / localhost default)."""
+    entry = resolve(path, host_label)
+    if not entry:
+        return None
+    specific = str(entry.get(server_type) or "").strip()
+    if specific:
+        return specific
+    return str(entry.get("url") or "").strip() or None
+
+
+def setting(path: str, key: str, default: Any = None) -> Any:
+    """Read one value from the topology file's ``settings:`` block.
+
+    The file already carries per-box deployment topology; operator POLICY that
+    varies the same way belongs beside it rather than in a second file or a redeploy.
+    Re-read on mtime change like everything else here, so an edit takes effect
+    without restarting a worker::
+
+        settings:
+          vllm_min_queue: 5      # jobs that justify a vLLM cold start
+
+    Never raises — a missing file, missing block or missing key returns ``default``."""
+    try:
+        doc = _load_doc(path)
+    except Exception:
+        return default
+    block = doc.get("settings") if isinstance(doc, dict) else None
+    if not isinstance(block, dict):
+        return default
+    return block.get(key, default)
 
 
 def _load(path: str) -> dict[str, dict[str, Any]]:
@@ -82,6 +136,30 @@ def _load(path: str) -> dict[str, dict[str, Any]]:
     with _LOCK:
         _CACHE[path] = (mtime, boxes)
     return boxes
+
+
+def _load_doc(path: str) -> dict:
+    """The whole parsed YAML document, mtime-cached (the boxes cache holds only the
+    boxes mapping, and ``settings`` lives outside it)."""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return {}
+    with _LOCK:
+        cached = _DOC_CACHE.get(path)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+    try:
+        import yaml
+        with open(path, "r", encoding="utf-8") as fh:
+            doc = yaml.safe_load(fh) or {}
+    except Exception:
+        doc = {}
+    if not isinstance(doc, dict):
+        doc = {}
+    with _LOCK:
+        _DOC_CACHE[path] = (mtime, doc)
+    return doc
 
 
 def _parse(path: str) -> dict[str, dict[str, Any]]:
@@ -115,11 +193,20 @@ def _parse(path: str) -> dict[str, dict[str, Any]]:
         return {}
     out: dict[str, dict[str, Any]] = {}
     for label, val in raw.items():
-        # A value is either a bare URL string or a {url: …} mapping.
+        # A value is either a bare URL string, a {url: …} mapping (both apply to
+        # EVERY server kind), or a per-kind mapping ({ollama: …, vllm: …}) added in
+        # 0022 for co-resident servers. A per-kind mapping needs no shared ``url``.
         if isinstance(val, str) and val.strip():
             out[str(label)] = {"url": val.strip()}
         elif isinstance(val, dict) and str(val.get("url") or "").strip():
             out[str(label)] = {**val, "url": str(val["url"]).strip()}
+        elif isinstance(val, dict) and any(
+            str(val.get(k) or "").strip() for k in _SERVER_KINDS
+        ):
+            out[str(label)] = {
+                **val,
+                **{k: str(val[k]).strip() for k in _SERVER_KINDS if val.get(k)},
+            }
     return out
 
 
@@ -128,6 +215,7 @@ def _reset_cache_for_tests() -> None:
     same path and observe the new content."""
     with _LOCK:
         _CACHE.clear()
+        _DOC_CACHE.clear()
 
 
-__all__ = ["resolve"]
+__all__ = ["resolve", "resolve_for", "setting"]

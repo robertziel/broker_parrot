@@ -17,6 +17,12 @@ the lease reclaim frees it, so a box can never stack live work on top of a corps
 On Postgres the claim serializes per box via an advisory xact lock so two
 concurrent claimants can't both pass the count; SQLite's single-writer already
 serializes. `max_running=None` keeps the old unbounded behavior (byte-compat).
+
+Since the one-kind law, a host-scoped claim ALSO passes the per-kind
+width gate by default (undeclared rows predict the box default, width 1). The
+tests here pin the BOX-SLOT arbiter alone, so their claims opt out of the kind
+law with the documented ``kind_caps={}`` — each gate is proved in isolation;
+their composition is test_per_kind_arbiter.py's job.
 """
 
 from __future__ import annotations
@@ -55,9 +61,11 @@ def test_slot_frees_on_terminal_and_claiming_resumes():
 def test_max_running_two_admits_two_then_blocks_third():
     run = make_run()
     _seed(run, 3)
-    assert node_queue.claim_next_gpu_job(0, host="box-a-gpu", max_running=2) is not None
-    assert node_queue.claim_next_gpu_job(0, host="box-a-gpu", max_running=2) is not None
-    assert node_queue.claim_next_gpu_job(0, host="box-a-gpu", max_running=2) is None
+    claim = lambda: node_queue.claim_next_gpu_job(
+        0, host="box-a-gpu", max_running=2, kind_caps={})
+    assert claim() is not None
+    assert claim() is not None
+    assert claim() is None
 
 
 def test_other_boxes_are_not_blocked_by_a_full_peer():
@@ -89,10 +97,12 @@ def test_zombie_row_holds_the_slot_until_reclaimed():
 
 
 def test_none_keeps_unbounded_legacy_behavior():
+    """max_running=None + the kind-law opt-out == the pre-arbiter engine. Without
+    the opt-out there is no unbounded path anymore — that is the law's point."""
     run = make_run()
     _seed(run, 2)
-    assert node_queue.claim_next_gpu_job(0, host="box-a-gpu") is not None
-    assert node_queue.claim_next_gpu_job(0, host="box-a-gpu") is not None
+    assert node_queue.claim_next_gpu_job(0, host="box-a-gpu", kind_caps={}) is not None
+    assert node_queue.claim_next_gpu_job(0, host="box-a-gpu", kind_caps={}) is not None
 
 
 def test_running_rows_of_other_queues_do_not_count():

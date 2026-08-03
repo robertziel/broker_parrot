@@ -34,7 +34,7 @@ from tests._helpers import make_run
 def _video_models_and_node_pkg():
     """Configure the video model set (so the video budget test asserts a real
     value) + a fake node package for the run_once tests."""
-    queue_workflows.configure(video_model_ids=frozenset({"wan_i2v", "ltx_flf"}))
+    queue_workflows.configure(video_model_ids=frozenset({"video-model-b", "video-model-c"}))
     queue_workflows.set_node_module_package("qwf_cw_nodes")
     yield
 
@@ -142,7 +142,7 @@ def test_watchdog_does_not_trip_when_stopped_before_budget():
 # ── stall (no-progress) watchdog ─────────────────────────────────────────────
 # The wall-clock Watchdog only catches a job that runs LONGER than its budget
 # (8100 s for a generic GPU job). A node that HANGS — model resident, GPU at
-# 0 %, no denoise step in minutes (the Blackwell qwen inference stall) — would
+# 0 %, no denoise step in minutes (the LLM inference stall) — would
 # camp the whole budget before the wall-clock watchdog frees it. The
 # StallWatchdog trips on NO PROGRESS: every ``beat()`` (one per diffusion step,
 # threaded via ``status_callback``, plus one from the executor right after the
@@ -178,7 +178,7 @@ def test_stall_watchdog_trips_after_first_beat_then_silence_requeues_under_cap()
     run_id = _make_run()
     job_id = node_queue.enqueue_node_job(
         run_id=run_id, node_id="n", node_module="x", queue="gpu",
-        required_model="qwen_edit", priority=100,
+        required_model="img_edit", priority=100,
     )
     node_queue.claim_next_gpu_job(0, host="h")
 
@@ -225,7 +225,7 @@ def test_stall_no_beat_but_gpu_busy_does_not_trip():
     run_id = _make_run()
     job_id = node_queue.enqueue_node_job(
         run_id=run_id, node_id="n", node_module="x", queue="gpu",
-        required_model="qwen_edit",
+        required_model="img_edit",
     )
     node_queue.claim_next_gpu_job(0, host="h")
 
@@ -266,7 +266,7 @@ def test_stall_no_beat_but_ram_moving_does_not_trip():
     run_id = _make_run()
     job_id = node_queue.enqueue_node_job(
         run_id=run_id, node_id="n", node_module="x", queue="gpu",
-        required_model="qwen_edit",
+        required_model="img_edit",
     )
     node_queue.claim_next_gpu_job(0, host="h")
 
@@ -306,7 +306,7 @@ def test_stall_no_beat_and_gpu_idle_and_ram_static_trips():
     run_id = _make_run()
     job_id = node_queue.enqueue_node_job(
         run_id=run_id, node_id="n", node_module="x", queue="gpu",
-        required_model="qwen_edit",
+        required_model="img_edit",
     )
     node_queue.claim_next_gpu_job(0, host="h")
 
@@ -334,7 +334,7 @@ def test_stall_recovers_to_running_when_gpu_resumes_after_a_suspected_stall():
     run_id = _make_run()
     job_id = node_queue.enqueue_node_job(
         run_id=run_id, node_id="n", node_module="x", queue="gpu",
-        required_model="qwen_edit",
+        required_model="img_edit",
     )
     node_queue.claim_next_gpu_job(0, host="h")
 
@@ -376,10 +376,10 @@ def test_stall_trip_clears_current_model_busy_ghost():
     run_id = _make_run()
     job_id = node_queue.enqueue_node_job(
         run_id=run_id, node_id="n", node_module="x", queue="gpu",
-        required_model="qwen_edit",
+        required_model="img_edit",
     )
     node_queue.claim_next_gpu_job(0, host="host-b")
-    _seed_busy_heartbeat("host-b", "gpu", "qwen_edit")
+    _seed_busy_heartbeat("host-b", "gpu", "img_edit")
 
     exits: list[int] = []
     wd = _wedged_stall_watchdog(
@@ -402,7 +402,7 @@ def test_gpu_health_trip_clears_current_model_busy_ghost():
     """A confirmed GpuHealthWatchdog trip clears current_model too (same Part-C
     fix, both re-queue and fail paths go through _clear_busy_ghost)."""
     run_id, job_id = _running_gpu_job_with_retries(3)  # == cap → fail path
-    _seed_busy_heartbeat("host-a", "gpu", "wan_i2v")
+    _seed_busy_heartbeat("host-a", "gpu", "video-model-b")
     exits: list[int] = []
     wd = claim_worker.GpuHealthWatchdog(
         job_id=job_id, interval_s=0.05, idle_pct=5, ram_delta_mb=5120, poll_s=0.01,
@@ -423,7 +423,7 @@ def test_gpu_health_trip_clears_current_model_busy_ghost():
 def test_busy_ghost_clear_marks_heartbeat_stale_so_gauge_drops_it():
     """Clearing the busy-ghost also ages last_seen past the 30 s gauge window so
     the dead worker drops out of the live-worker count at once (not after 30 s)."""
-    _seed_busy_heartbeat("host-b", "gpu", "qwen_edit")
+    _seed_busy_heartbeat("host-b", "gpu", "img_edit")
     # Fresh before.
     with connection() as c, c.cursor() as cur:
         cur.execute(
@@ -447,12 +447,12 @@ def test_busy_ghost_clear_is_noop_without_identity():
     """_clear_busy_ghost is a safe no-op when the worker identity wasn't threaded
     (a unit test constructing a watchdog with just a job_id) — it must never raise
     and never touch unrelated rows."""
-    _seed_busy_heartbeat("other", "gpu", "qwen_edit")
+    _seed_busy_heartbeat("other", "gpu", "img_edit")
     claim_worker._clear_busy_ghost(None, None)
     claim_worker._clear_busy_ghost("", "gpu")
     claim_worker._clear_busy_ghost("other", "")
     # The unrelated row is untouched.
-    assert _heartbeat_row("other", "gpu")["current_model"] == "qwen_edit"
+    assert _heartbeat_row("other", "gpu")["current_model"] == "img_edit"
 
 
 def test_stall_watchdog_inert_until_first_beat():
@@ -534,7 +534,7 @@ def _running_gpu_job_with_retries(retries: int, *, priority=100):
     run_id = _make_run()
     job_id = node_queue.enqueue_node_job(
         run_id=run_id, node_id="n", node_module="x", queue="gpu",
-        required_model="qwen_edit", priority=priority,
+        required_model="img_edit", priority=priority,
     )
     node_queue.claim_next_gpu_job(0, host="h")
     with connection() as conn, conn.cursor() as cur:
@@ -975,11 +975,11 @@ def test_stall_watchdog_not_armed_for_video_models(monkeypatch):
     _install_fake_node("_cw_video", run)
     job_id = node_queue.enqueue_node_job(
         run_id=run_id, node_id="v", node_module="_cw_video", queue="gpu",
-        required_model="wan_i2v",  # in the autouse fixture's video_model_ids
+        required_model="video-model-b",  # in the autouse fixture's video_model_ids
     )
 
     class _Cache:
-        current_model = "wan_i2v"
+        current_model = "video-model-b"
 
         def require_model(self, model_id):
             return object()
@@ -1163,7 +1163,7 @@ def _gpu_health_job():
     run_id = _make_run()
     job_id = node_queue.enqueue_node_job(
         run_id=run_id, node_id="g", node_module="x", queue="gpu",
-        required_model="qwen_edit",
+        required_model="img_edit",
     )
     node_queue.claim_next_gpu_job(0, host="h")
     return job_id
@@ -1749,9 +1749,9 @@ def test_heartbeat_emit_once_gpu_reports_current_model(_heartbeat_enabled):
     emitter.emit_once()
     assert _heartbeat_row("host-a", "gpu")["current_model"] is None
 
-    cache.current_model = "qwen_edit"
+    cache.current_model = "img_edit"
     emitter.emit_once()
-    assert _heartbeat_row("host-a", "gpu")["current_model"] == "qwen_edit"
+    assert _heartbeat_row("host-a", "gpu")["current_model"] == "img_edit"
 
     cache.current_model = None
     emitter.emit_once()
@@ -2072,8 +2072,14 @@ def test_pool_feeder_runs_up_to_par_concurrently_never_over(monkeypatch):
     """The feeder keeps up to PAR no-model jobs IN FLIGHT at once — and NEVER
     more than PAR submitted. A fake node blocks on an event; we assert exactly
     PAR are running concurrently while (PAR + extra) jobs are queued, then
-    release them and confirm all complete."""
+    release them and confirm all complete.
+
+    Since the law, PAR-wide admission exists only on a box whose
+    serving kind BATCHES: these undeclared rows stamp the box-default prediction,
+    and a width-1 default (ollama) would — correctly — serialise them. The box
+    modelled here serves vLLM, the shape a PAR pool is for."""
     from queue_workflows import worker_control
+    from queue_workflows.llm_backends import factory
 
     PAR = 3
     EXTRA = 2
@@ -2081,6 +2087,7 @@ def test_pool_feeder_runs_up_to_par_concurrently_never_over(monkeypatch):
         worker_control, "llm_config_for",
         lambda h, q: worker_control.LLMConfig(parallelism=PAR),
     )
+    monkeypatch.setattr(factory, "cached_default_kind", lambda h, q: "vllm")
 
     inflight = {"n": 0, "max": 0}
     inflight_lock = threading.Lock()
@@ -2236,7 +2243,7 @@ def test_watchdog_trip_records_forensic_and_requeued_node_events():
     run_id = _make_run()
     job_id = node_queue.enqueue_node_job(
         run_id=run_id, node_id="n", node_module="x", queue="gpu",
-        required_model="qwen_edit", priority=100,
+        required_model="img_edit", priority=100,
     )
     node_queue.claim_next_gpu_job(0, host="h")
 
@@ -2387,7 +2394,7 @@ def test_stall_confirm_wedged_true_when_gpu_idle_and_ram_probe_unreadable():
     run_id = _make_run()
     job_id = node_queue.enqueue_node_job(
         run_id=run_id, node_id="n", node_module="x", queue="gpu",
-        required_model="qwen_edit",
+        required_model="img_edit",
     )
     node_queue.claim_next_gpu_job(0, host="h")
 

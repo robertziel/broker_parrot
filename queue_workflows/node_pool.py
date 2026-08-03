@@ -515,9 +515,10 @@ class NodePool:
         ids = run_store.list_queued_node_run_ids(limit=50)
         for run_id in ids:
             try:
-                n = dispatcher.start_run(run_id)
-                if n > 0:
-                    run_store.update_run(run_id, status="running")
+                # start_run owns the queued→running flip (keyed on "jobs
+                # exist", so a trigger-expanded run flips here too even though
+                # this loop enqueues nothing new for it).
+                dispatcher.start_run(run_id)
             except Exception:
                 log.exception("[node-pool] start_run %s failed", run_id)
 
@@ -612,6 +613,19 @@ class NodePool:
             self._sweep_unassignable_jobs()
         except Exception:
             log.exception("[node-pool] unassignable-job sweep failed")
+        try:
+            # SERVER-KIND twin (analysis #3): rows whose server_types no live worker
+            # serves — e.g. a ['vllm']-only job on a fleet where no vLLM answers —
+            # used to sit queued forever with no error, no flag, no log.
+            for row in node_queue.flag_server_stranded_jobs():
+                node_queue.record_node_event(
+                    event_type="unassignable",
+                    detail={"reason": row.get("unassignable_reason")},
+                    run_id=row.get("run_id"), node_id=row.get("node_id"),
+                    job_id=row.get("id"), attempt=row.get("watchdog_retries") or 0,
+                )
+        except Exception:
+            log.exception("[node-pool] server-stranded sweep failed")
 
     def _sweep_unassignable_jobs(self) -> None:
         """Red-flag queued GPU model-jobs that NO live machine can hold (none has
@@ -737,13 +751,23 @@ class NodePool:
         frozen heartbeat and flag the dead worker.
 
         Recovery split:
-          * the JOB is already recovered by the lease-reclaim sweep (step 3);
+          * the JOB is recovered by the frozen-lease sweep (~35 s — the per-job
+            lease renewal is the truthful liveness signal) with the lease
+            reclaim as the backstop;
           * the dead PROCESS is flagged here — a clear ERROR log + a durable
             ``worker_heartbeats.last_flagged_dead_at`` marker an operator /
             host-supervisor polls. The orchestrator does NOT kill the worker: a
             cross-host container kill isn't safe/feasible from here (no docker
             socket, different host). See ``docs`` / module note for the
             host-supervisor hook that consumes the flag.
+
+        FLAG-ONLY — this sweep must never touch job rows. It briefly also
+        re-queued the flagged worker's jobs; reverted after a live
+        false-positive: a heartbeat is a PROCESS-level signal from
+        ONE thread, and a wide-concurrency cpu worker under a heavy batch
+        starved its beat thread past staleness while every job's lease kept
+        renewing — 23 LIVE jobs were yanked mid-flight. Stale heartbeat +
+        running jobs ⇒ "bounce the process", never "the jobs are free".
 
         Interval-gated (``_dead_worker_interval_s``, default 5 s) so the 0.5 s
         dispatch loop doesn't run the detector UPDATE every tick. The detector
@@ -758,32 +782,15 @@ class NodePool:
 
         flagged = node_queue.flag_stale_workers_holding_running_jobs()
         for row in flagged:
-            # FAST dead-reclaim: free the flagged worker's jobs NOW (~30 s after
-            # death) instead of letting them camp the box's slot until the 600 s
-            # lease lapses. Same staleness predicate as the flag, atomic in the
-            # UPDATE, JobStatusWatcher-safe (a wedged-but-alive claimant
-            # self-kills on seeing its row reassigned). Best-effort per worker —
-            # the lease-reclaim remains the backstop if this ever fails.
-            requeued = 0
-            try:
-                requeued = node_queue.requeue_running_if_worker_stale(
-                    row.get("host_label"), row.get("queue"),
-                    project=row.get("project"),
-                )
-            except Exception:
-                log.exception(
-                    "[node-pool] fast dead-reclaim failed for %s/%s "
-                    "(lease-reclaim remains the backstop)",
-                    row.get("host_label"), row.get("queue"),
-                )
             log.error(
                 "[node-pool] DEAD WORKER: %s/%s [project=%s] heartbeat stale "
-                "since %s but still owned %s running job(s) — %d re-queued NOW "
-                "(fast dead-reclaim; lease-reclaim backstops the rest); worker "
-                "PROCESS is wedged (GPU hang?) — the container must be bounced "
-                "(host-supervisor should restart it)",
+                "since %s but still owned %s running job(s) — flagged for a "
+                "host-supervisor bounce; job rows untouched (a starved beat "
+                "thread on a live worker looks identical from here — the "
+                "frozen-lease sweep re-queues the jobs iff their leases stop "
+                "renewing, with the lease reclaim as backstop)",
                 row.get("host_label"), row.get("queue"), row.get("project"),
-                row.get("last_seen"), row.get("running_jobs"), requeued,
+                row.get("last_seen"), row.get("running_jobs"),
             )
 
     def _sweep_frozen_leases(self) -> None:

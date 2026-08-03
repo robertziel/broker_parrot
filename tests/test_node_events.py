@@ -44,7 +44,7 @@ def test_record_in_txn_inserts_full_row():
         eid = node_queue.record_node_event_in_txn(
             cur, run_id=run_id, node_id="n", job_id=job_id, attempt=2,
             event_type="gpu_health_trip", host_label="host-b", queue="gpu",
-            model="qwen_image_edit_multi_angles", elapsed_s=12.5,
+            model="img_edit_multi_angles", elapsed_s=12.5,
             error="no GPU activity for 300s; RAM static",
             detail={"max_sm_pct": 0, "ram_anchor_mb": 81000, "ram_now_mb": 81002},
         )
@@ -55,7 +55,7 @@ def test_record_in_txn_inserts_full_row():
     assert r["event_type"] == "gpu_health_trip"
     assert r["attempt"] == 2
     assert r["host_label"] == "host-b"
-    assert r["model"].startswith("qwen")
+    assert r["model"].startswith("img_edit")
     assert r["elapsed_s"] == 12.5
     assert r["detail"]["max_sm_pct"] == 0
     assert "static" in r["error"]

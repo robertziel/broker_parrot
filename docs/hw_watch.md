@@ -3,8 +3,7 @@
 ## Why it exists
 
 `hw_metrics` is push-only: every sample is a `NOTIFY` and gone. When a GPU box
-hard-dies there is **no hardware trail to autopsy**. The motivating incident
-(2026-07-17): a GB10 box's firmware thermal protection killed the machine on
+hard-dies there is **no hardware trail to autopsy**. The motivating incident: a unified-memory GPU box's firmware thermal protection killed the machine on
 every `sdxl` render — **zero kernel trace** (no Xid, no thermal event,
 journal stops mid-write), because the trigger was a board-level sensor the OS
 exposes no trip points for. The GPU asserted a hardware slowdown (throttle
@@ -29,12 +28,21 @@ JSONB payload from `hw_watch.deep_sample()`:
   SM clock, utilisation, pstate, and the **throttle-reason mask** — the
   smoking-gun field (`0x20` SW-thermal, `0x40` HW-thermal, `0x08` HW-brake,
   `0x04` SW-power-cap).
-- **tz** — every `/sys/class/thermal` zone (`type` + milli-°C). On the GB10
+- **tz** — every `/sys/class/thermal` zone (`type` + milli-°C). On the unified-memory GPU box
   incident box the killer sensor was an `acpitz` zone reading ~94 °C while
   the GPU core showed a harmless 78–84 °C.
 - **hwmon** — every hwmon temp input (NVMe, NIC, SoC…).
 - **mem** — `/proc/meminfo` totals (unified-memory boxes live and die by
   host RAM); **load1**; **disk_root_used_mb**.
+- **net** — per-NIC network stats (`/proc/net/dev` cumulative rx/tx bytes,
+  packets, errs, drop + `/sys/class/net` link `speed_mbps`, `operstate`,
+  `carrier`, `enslaved`). `ifaces` lists only physical NICs + bonds
+  (container/bridge/tunnel plumbing — `veth*`, `docker0`, `tailscale0` — is
+  dropped as intra-host noise / a double-count of the wire). Box-level
+  **graph-ready** fields sit at the sample top level: **`net_rx_bytes`** /
+  **`net_tx_bytes`** (summed monotonic counters over the up, non-enslaved
+  interfaces — a bond slave's bytes are already in the master) and
+  **`net_speed_mbps`** (fastest up link = the capacity line).
 
 Every probe is individually guarded: a dead sensor records its empty shape,
 never an exception.
@@ -86,6 +94,27 @@ rows = hw_watch.recent_hw_samples(host_label="box-b", tier="detail",
 ```
 
 `data` comes back as a real dict on both backends (sqlite stores JSON text).
+
+## Reading network usage (the "usage + speed history" chart)
+
+The byte columns are **monotonic counters**, so throughput is a *derived* rate,
+not a stored value — the same shape as the GPU violation µs counters. Two ways:
+
+```python
+# Python readers — the blessed helper (handles counter reset / reboot → None):
+rows = hw_watch.recent_hw_samples(host_label="box-a", tier="detail", since_s=900)
+rows.reverse()                                   # oldest → newest
+for a, b in zip(rows, rows[1:]):
+    dt = (b["created_at"] - a["created_at"]).total_seconds()
+    r = hw_watch.net_rates(a["data"], b["data"], dt)   # {"rx_bytes_per_s", "tx_bytes_per_s"}
+```
+
+The **cluster-panel** (separate repo — reads the DB directly, no engine import)
+does the same two-line derivation in JS: sort a box's rows by `created_at`, then
+per adjacent pair plot `(row[i].data.net_rx_bytes - row[i-1].data.net_rx_bytes) /
+Δseconds` as the rx line (and `net_tx_bytes` for tx), drawing the
+`net_speed_mbps` capacity as a reference ceiling. A negative delta (a reboot or
+NIC reset zeroed the counter) is a **gap**, not a spike — skip that point.
 
 ## Reading a crash
 

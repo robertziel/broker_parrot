@@ -89,5 +89,5 @@ def test_llm_serving_box_still_defers_by_heuristic(monkeypatch):
     from queue_workflows import node_queue
     w = _worker()
     w._llm_gpu_ok = True                                      # a genuine LLM box
-    monkeypatch.setattr(node_queue, "vlm_pool_should_defer", lambda h, p: True)
+    monkeypatch.setattr(node_queue, "vlm_pool_should_defer", lambda h, p, **kw: True)
     assert w._pool_should_defer(par=1) is True                # heuristic still applies

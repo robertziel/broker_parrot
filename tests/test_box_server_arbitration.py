@@ -42,7 +42,7 @@ def _levers():
 
 def test_held_server_types_lists_distinct_kinds():
     residents = [
-        Resident(server="ollama", model="qwen"),
+        Resident(server="ollama", model="an LLM"),
         Resident(server="comfyui", model="comfyui"),
     ]
     assert held_server_types(residents) == ["comfyui", "ollama"]
@@ -54,8 +54,8 @@ def test_held_server_types_empty_box():
 
 def test_describe_box_residency_names_kind_and_model():
     d = describe_box_residency(
-        [Resident(server="ollama", model="qwen")], label="box-c")
-    assert "box-c" in d and "ollama" in d and "qwen" in d
+        [Resident(server="ollama", model="an LLM")], label="box-c")
+    assert "box-c" in d and "ollama" in d and "an LLM" in d
 
 
 def test_describe_box_residency_reports_idle():
@@ -64,7 +64,7 @@ def test_describe_box_residency_reports_idle():
 
 def test_describe_box_residency_flags_a_multi_kind_violation():
     d = describe_box_residency([
-        Resident(server="ollama", model="qwen"),
+        Resident(server="ollama", model="an LLM"),
         Resident(server="inprocess", model="sdxl"),
     ], label="box-c").lower()
     # Two kinds resident is the exact bug — the report must make it loud.
@@ -75,14 +75,14 @@ def test_describe_box_residency_flags_a_multi_kind_violation():
 
 
 def test_inprocess_load_evicts_the_resident_ollama_via_keepalive0():
-    # The scenario: one consumer wants sdxl in-process while ollama holds qwen.
+    # The scenario: one consumer wants sdxl in-process while ollama holds an LLM.
     rec, levers = _levers()
     evicted = clear_box_for(
         llm_probe.INPROCESS, "sdxl",
-        [Resident(server="ollama", model="qwen")],
+        [Resident(server="ollama", model="an LLM")],
         label="box-c", **levers)
-    assert rec["ollama"] == ["qwen"]           # unloaded ollama
-    assert [r.model for r in evicted] == ["qwen"]
+    assert rec["ollama"] == ["an LLM"]           # unloaded ollama
+    assert [r.model for r in evicted] == ["an LLM"]
 
 
 def test_inprocess_load_evicts_comfyui_and_vllm_too():
@@ -101,7 +101,7 @@ def test_ollama_slot_load_evicts_comfyui_but_keeps_ollama():
     rec, levers = _levers()
     evicted = clear_box_for(
         llm_probe.OLLAMA, None,
-        [Resident(server="ollama", model="qwen"),
+        [Resident(server="ollama", model="an LLM"),
          Resident(server="comfyui", model="comfyui")],
         label="box-c", **levers)
     assert rec["ollama"] == []                     # ollama kept
@@ -122,7 +122,7 @@ def test_same_kind_same_model_is_never_evicted():
 def test_same_kind_different_model_is_evicted_when_a_concrete_model_is_given():
     rec, levers = _levers()
     evicted = clear_box_for(
-        llm_probe.OLLAMA, "qwen",
+        llm_probe.OLLAMA, "an LLM",
         [Resident(server="ollama", model="llama-70b")],
         label="box-c", **levers)
     assert rec["ollama"] == ["llama-70b"]
@@ -142,21 +142,21 @@ def test_reprobe_still_dirty_raises_after_eviction():
     # ollama refuses to drop the model (stuck) — the re-probe still sees it, so the
     # load must be REFUSED, never proceed onto a second model.
     _, levers = _levers()
-    still_there = [Resident(server="ollama", model="qwen")]
+    still_there = [Resident(server="ollama", model="an LLM")]
     with pytest.raises(ModelAlreadyLoadedError) as e:
         clear_box_for(
             llm_probe.INPROCESS, "sdxl", still_there,
             reprobe=lambda: still_there, label="box-c", **levers)
-    assert "qwen" in str(e.value) and "box-c" in str(e.value)
+    assert "an LLM" in str(e.value) and "box-c" in str(e.value)
 
 
 def test_reprobe_clean_returns_the_evicted_and_does_not_raise():
     _, levers = _levers()
     evicted = clear_box_for(
         llm_probe.INPROCESS, "sdxl",
-        [Resident(server="ollama", model="qwen")],
+        [Resident(server="ollama", model="an LLM")],
         reprobe=lambda: [], label="box-c", **levers)  # box is clean after evict
-    assert [r.model for r in evicted] == ["qwen"]
+    assert [r.model for r in evicted] == ["an LLM"]
 
 
 def test_reprobe_of_the_same_model_is_clean():
@@ -165,10 +165,10 @@ def test_reprobe_of_the_same_model_is_clean():
     _, levers = _levers()
     evicted = clear_box_for(
         llm_probe.INPROCESS, "sdxl",
-        [Resident(server="ollama", model="qwen")],
+        [Resident(server="ollama", model="an LLM")],
         reprobe=lambda: [Resident(server="inprocess", model="sdxl")],
         label="box-c", **levers)
-    assert [r.model for r in evicted] == ["qwen"]
+    assert [r.model for r in evicted] == ["an LLM"]
 
 
 def test_a_broken_lever_does_not_stop_the_others():
@@ -178,7 +178,7 @@ def test_a_broken_lever_does_not_stop_the_others():
         raise OSError("ollama down")
     clear_box_for(
         llm_probe.INPROCESS, "sdxl",
-        [Resident(server="ollama", model="qwen"),
+        [Resident(server="ollama", model="an LLM"),
          Resident(server="comfyui", model="comfyui"),
          Resident(server="vllm", model="x")],
         unload_ollama=boom,
@@ -206,20 +206,20 @@ def test_gate_unloads_a_resident_ollama_then_permits_the_load(monkeypatch, _no_g
     unloaded: list[list[str]] = []
     monkeypatch.setattr(llm_probe, "unload_ollama_models",
                         lambda url, models, **k: unloaded.append(list(models)))
-    # First probe: ollama holds qwen; after eviction the re-probe is clean.
-    probes = iter([[Resident(server="ollama", model="qwen")],   # initial residents
+    # First probe: ollama holds an LLM; after eviction the re-probe is clean.
+    probes = iter([[Resident(server="ollama", model="an LLM")],   # initial residents
                    []])                                            # settle re-probe: clean
     monkeypatch.setattr(model_residency, "probe_box_residents",
                         lambda **k: next(probes), raising=False)
     # Should NOT raise — the box was cleared.
     gpu_model_cache._box_load_gate("sdxl")
-    assert unloaded == [["qwen"]]
+    assert unloaded == [["an LLM"]]
 
 
 def test_gate_refuses_when_the_box_cannot_be_cleared(monkeypatch, _no_gate_sleep):
     monkeypatch.setattr(factory, "resolve_base_url", lambda t="ollama": "http://b:11434")
     monkeypatch.setattr(llm_probe, "unload_ollama_models", lambda url, models, **k: None)
-    stuck = [Resident(server="ollama", model="qwen")]
+    stuck = [Resident(server="ollama", model="an LLM")]
     monkeypatch.setattr(model_residency, "probe_box_residents",
                         lambda **k: list(stuck))  # never clears
     with pytest.raises(ModelAlreadyLoadedError):
@@ -257,7 +257,7 @@ def test_enforcer_evicts_comfyui_when_it_loses_to_the_desired_llm():
     # desired server and frees ComfyUI through its own lever.
     freed = []
     enf = model_residency.ModelResidencyEnforcer(
-        collect_fn=lambda: [Resident(server="ollama", model="qwen", mru=9.0),
+        collect_fn=lambda: [Resident(server="ollama", model="an LLM", mru=9.0),
                             Resident(server="comfyui", model="comfyui", mru=0.0)],
         unload_ollama_fn=lambda models: None,
         stop_vllm_fn=lambda: None,
@@ -272,8 +272,8 @@ def test_enforcer_evicts_comfyui_when_it_loses_to_the_desired_llm():
 def test_enforcer_reports_held_server_type_only_on_change(caplog):
     import logging
     seq = iter([
-        [Resident(server="ollama", model="qwen")],   # report: held by ollama:qwen
-        [Resident(server="ollama", model="qwen")],   # same ⇒ NO new report
+        [Resident(server="ollama", model="an LLM")],   # report: held by ollama:an LLM
+        [Resident(server="ollama", model="an LLM")],   # same ⇒ NO new report
         [],                                             # change ⇒ report: idle
     ])
     enf = model_residency.ModelResidencyEnforcer(
@@ -284,5 +284,5 @@ def test_enforcer_reports_held_server_type_only_on_change(caplog):
         enf.enforce_once(); enf.enforce_once(); enf.enforce_once()
     reports = [r.getMessage() for r in caplog.records
                if "held by" in r.getMessage() or "idle" in r.getMessage()]
-    assert sum("ollama:qwen" in m for m in reports) == 1   # logged once, not twice
+    assert sum("ollama:an LLM" in m for m in reports) == 1   # logged once, not twice
     assert any("idle" in m for m in reports)

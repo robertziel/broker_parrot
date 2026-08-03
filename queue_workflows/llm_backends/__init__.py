@@ -15,7 +15,12 @@ injected config + a virtual clock.
 from __future__ import annotations
 
 from queue_workflows.llm_backends.base import LLMBackend
-from queue_workflows.llm_backends.factory import BackendFactory, get_backend
+from queue_workflows.llm_backends.factory import (
+    BackendFactory,
+    choose_server_type,
+    get_backend,
+    resolve_for_job,
+)
 from queue_workflows.llm_backends.ollama import OllamaBackend
 from queue_workflows.llm_backends.supervisor import LLMSupervisor, vllm_should_stop
 from queue_workflows.llm_backends.vllm import VLLMBackend, VLLMState
@@ -29,4 +34,6 @@ __all__ = [
     "vllm_should_stop",
     "BackendFactory",
     "get_backend",
+    "choose_server_type",
+    "resolve_for_job",
 ]

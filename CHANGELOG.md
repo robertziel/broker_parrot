@@ -5,8 +5,85 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.6] — 2026-07-19
+## [1.1.0] — 2026-08-04
 
+A feature release, 110 commits on from 1.0.6. Everything here is **additive with
+safe defaults** — migrations 0022–0024 add nullable columns, the two new cpu
+knobs default to the historical behaviour, and an existing deployment upgrades
+without a config change.
+
+### Added — one LLM server at a time, provably
+
+- **Drain-based server switch** (`queue_workflows/server_switch.py`): a box that
+  changes serving kind (ollama ↔ vLLM) goes OUT OF SERVICE for the switch, waits
+  until the outgoing server is *observed gone*, and only then starts the
+  incoming one. Starting vLLM is a **handover**, not an addition — two resident
+  copies of a 34 GB model is how a unified-memory box reaches OOM.
+- **Per-kind slot caps** — concurrency follows the SERVING KIND, not one global
+  PAR: an ollama-resolved job caps at 1 (ollama answers one request at a time),
+  vLLM at PAR (it batches). Every GPU row now stamps a serving kind
+  (**migration 0023**, `workflow_node_jobs.resolved_server`).
+- **Per-node LLM server preference** (**migration 0022**,
+  `workflow_node_jobs.server_types`) — an ordered list, e.g.
+  `["vllm", "ollama"]`. The row is claimable only by a worker whose served kinds
+  intersect it, and a row *with* a preference is pool-eligible even when it
+  names a `required_model` (an external server holds the weights).
+- **vLLM lifecycle**: start a stopped vLLM when queue depth justifies it, stop
+  it after an idle TTL observed **at the server**, and an amortisation gate so a
+  single job never pays a multi-minute cold start.
+
+### Added — the parked box releases the card
+
+- A parked GPU worker now frees the box's LLM memory, and the **park watchdog**
+  kills any broker-managed LLM server on sight while parked — a serving vLLM is
+  stopped mid-request included, since remote traffic must not keep a parked box
+  alive. Silenced by `QUEUE_WORKFLOWS_DISABLE_GPU_IDLE_REAPER`.
+- A **self-managing GPU node** (one that loads its own weights) occupies a slot
+  of its own instead of borrowing the LLM server's, so it genuinely excludes an
+  LLM dispatch from the same card — and reclaims that card's resident LLM
+  memory, because a keep-alive is not a lease.
+
+### Added — a wider cpu lane, and jobs that need more of it
+
+- **`cpu_worker_threads`** — one cpu claim-worker process may run N node-jobs
+  concurrently, on a pool of N long-lived worker threads (`--threads N`, env
+  `QUEUE_WORKFLOWS_CPU_WORKER_THREADS`, or `configure(cpu_worker_threads=N)`).
+  **Default `1` creates no pool and is byte-identical to the historical serial
+  worker.** Deliberately NOT a `ThreadPoolExecutor`: that starts its threads
+  lazily *inside* `submit`, after enqueuing the work, so a refused thread raises
+  while the body still runs — and a slot freed on that signal breaks the
+  ceiling. For CPU-bound pure-Python nodes the GIL serialises threads, so N
+  processes remain the recommendation; the knob is for IO-bound cpu nodes.
+- **`cpu_slots`** (**migration 0024**) — how many slots of a widened lane ONE
+  job occupies, for a node whose body runs its own threads. Enforced in the
+  CLAIM (`LEAST(COALESCE(cpu_slots,1), lane_width) <= free_slots`), so the
+  reservation binds before the body starts. A job wider than the lane runs
+  alone rather than being excluded forever; a serial worker ignores the column
+  entirely. `NULL` = 1 = an ordinary job.
+- A watchdog trip in a widened lane releases the sibling jobs **resume-style**
+  (front of queue, no `watchdog_retries` bump) before the process exits, scoped
+  to the claims that process actually holds — never host-wide, which would yank
+  a sibling *process's* rows and cascade.
+
+### Fixed
+
+- The VLM pool's defer view now defines "pool work" exactly as the claim does,
+  so a box can no longer defer work no peer will take.
+- The double-load watchdog counts VRAM **copies**, not model ids.
+- A remote-served node no longer demands an in-process model cache.
+- The GPU heartbeat advertises the **enforced** slot budget, not the raw PAR.
+- Warm-model affinity is scoped to opted-in rows; the lane split no longer leaks.
+- `resolve_for_job` probes availability instead of assuming it.
+
+### Notes
+
+- Docs: `deployment.md` gains §2.5 (threads vs processes, the GIL trade-off,
+  connection budget, the heartbeat-starvation hazard, and `cpu_slots`);
+  `watchdogs.md` gains §7 (trip blast radius in a widened lane); `schema.md`'s
+  migration table is current through 0024.
+- `__version__` was stale at `0.5.0` and now tracks the packaged version.
+
+## [1.0.6] — 2026-07-19
 ### Added — ComfyUI as a first-class queue citizen
 - **Built-in `comfyui` render node** (`queue_workflows/builtin_nodes/comfyui.py`)
   — one node_job = one whole ComfyUI render: stage inputs, POST the API-format
@@ -73,7 +150,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a URL is configured, else releases at job end via the active-jobs guard.
 
 ## [1.0.5] — 2026-07-18
-
 ### Added
 - **CPU hardware stats in the `hw_watch` flight recorder** — `deep_sample()`
   gains a `cpu` block (stdlib `/proc` + `/sys`, no `psutil`): utilisation %,
@@ -96,7 +172,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   + `worker_controls`) — per-box GPU/CPU temperature, power, clock, and throttle.
 
 ## [1.0.4] — 2026-07-17
-
 ### Added — one model per physical GPU box (cross-project arbitration)
 - **Run-path box lease** (`gpu_model_lease`) — every GPU worker acquires the
   physical box for its effective model before executing; a live peer holding a
@@ -149,7 +224,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against a transient residency blip.
 
 ## [1.0.3] — 2026-07-15
-
 ### License
 - **Relicensed to the GNU Affero General Public License v3.0 or later**
   (`AGPL-3.0-or-later`) — was PolyForm Noncommercial 1.0.0 in 1.0.2, MIT before
@@ -195,7 +269,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   topology YAML; psycopg remains the sole hard runtime dependency.
 
 ## [1.0.2] — 2026-07-13
-
 ### License
 - **Relicensed to PolyForm Noncommercial 1.0.0** (was MIT). Free for any
   noncommercial purpose; commercial use requires a license from the author.
@@ -222,7 +295,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behavior); not yet wired into the runtime load path.
 
 ## [1.0.1] — 2026-07-12
-
 ### Changed
 - **Runtime env knobs are canonically `QUEUE_WORKFLOWS_*`.** Every knob
   (`QUEUE_WORKFLOWS_DB_URL`, `QUEUE_WORKFLOWS_HOST_LABEL`,
@@ -259,7 +331,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AI_LEADS_*` origin story reframed as the legacy-fallback contract).
 
 ## [1.0.0] — 2026-07-11
-
 Initial public release: **broker_parrot** (import package `queue_workflows`) —
 a standalone Postgres/SQLite-as-queue workflow engine. `SELECT … FOR UPDATE
 SKIP LOCKED` claim loop woken by `LISTEN`, lease reclaim, DAG dispatcher with a

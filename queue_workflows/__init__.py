@@ -14,7 +14,7 @@ scheduler / orchestrator::
 
     queue_workflows.configure(
         db_url_env="AI_LEADS_DB_URL",
-        video_model_ids=frozenset({"wan_i2v", "ltx_flf"}),
+        video_model_ids=frozenset({"video-model-b", "video-model-c"}),
         node_module_package="workflows.nodes",
         container_prefix="ai_leads-",
     )
@@ -37,7 +37,7 @@ from typing import Any, Callable
 
 from queue_workflows.config import EngineConfig, get_config
 
-__version__ = "0.5.0"
+__version__ = "1.1.0"
 
 __all__ = [
     "configure",
@@ -88,6 +88,8 @@ def configure(
     gpu_pool_backend: str | None = None,
     gpu_pool_url_env: str | None = None,
     gpu_pool_namespace: str | None = None,
+    llm_server_idle_ttl_s: float | None = None,
+    cpu_worker_threads: int | None = None,
 ) -> EngineConfig:
     """Set engine configuration values. Only the passed keyword args are
     mutated; the rest keep their (ai_leads-byte-compatible) defaults. Returns
@@ -162,6 +164,12 @@ def configure(
             cfg.gpu_pool_url_env = str(gpu_pool_url_env)
         if gpu_pool_namespace is not None:
             cfg.gpu_pool_namespace = str(gpu_pool_namespace)
+        if llm_server_idle_ttl_s is not None:
+            cfg.llm_server_idle_ttl_s = float(llm_server_idle_ttl_s)
+        if cpu_worker_threads is not None:
+            # Floored here as well as at the read site: a host that configures 0
+            # gets the serial worker, never a lane that claims nothing.
+            cfg.cpu_worker_threads = max(1, int(cpu_worker_threads))
     return cfg
 
 

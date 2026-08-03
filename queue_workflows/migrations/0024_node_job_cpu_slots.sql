@@ -1,0 +1,27 @@
+-- 0024 — per-node-job CPU WIDTH: how many slots of a widened cpu lane one job takes.
+--
+-- ``cpu_worker_threads`` (the lane width) says how many jobs one worker process
+-- runs at once; it said nothing about how much of that worker a single job
+-- needs, because every job counted as exactly 1. A node whose body legitimately
+-- spawns its own threads (an ffmpeg fan-out, a thread-pooled HTTP sweep) then
+-- landed N-to-a-process on an N-wide lane and oversubscribed the box, with no
+-- way for the author to say otherwise.
+--
+-- ``cpu_slots`` is that weight, and it lives on the ROW rather than in host
+-- config so the CLAIM can enforce it — the reservation has to exist before the
+-- body starts, not as an afterthought once the work is already running.
+--
+-- NULL = 1 = "an ordinary job", so every pre-0024 row and every unweighted
+-- enqueue keeps its exact current meaning; nothing backfills. A serial worker
+-- (threads=1, the default) ignores the column entirely: it runs one job at a
+-- time, so the job already owns the whole process.
+--
+-- The ">= 1" invariant is enforced HOST-SIDE in ``node_queue.enqueue_node_job``
+-- (raises ValueError before the write), not as a DB CHECK — the same direction
+-- migration 0008 took when it moved the queue allow-list out of the schema, and
+-- required here anyway because SQLite (a first-class backend since v1.0.0)
+-- cannot ``ALTER TABLE ... ADD CONSTRAINT``.
+--
+-- Additive + idempotent, like 0020's box placement.
+ALTER TABLE workflow_node_jobs
+    ADD COLUMN IF NOT EXISTS cpu_slots smallint;

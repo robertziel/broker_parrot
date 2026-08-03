@@ -30,11 +30,25 @@ import os
 from queue_workflows.envcompat import env_get
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from queue_workflows.db import connection
 
 log = logging.getLogger(__name__)
+
+#: The serving KIND stamped on an in-process model row (required_model, no
+#: server_types): the job loads weights into the claiming process itself — a
+#: serving kind of its own, width 1 like any non-batching kind. Same literal the
+#: residency layer probes (``llm_probe.INPROCESS``); kept as a literal because
+#: importing llm_probe here would weigh down every consumer of this leaf-ish
+#: module — a drift-guard test asserts the two stay equal.
+INPROCESS_SERVER_KIND = "inprocess"
+
+#: Prediction fallback for an undeclared row when the caller supplies no
+#: ``default_server`` (old client code on a new wheel). Mirrors
+#: ``worker_control.DEFAULT_LLM_SERVER_TYPE`` — a literal because worker_control
+#: imports THIS module (cycle); its own drift-guard test pins the pair.
+_DEFAULT_SERVER_KIND = "ollama"
 
 
 # ── Types ────────────────────────────────────────────────────────────────
@@ -87,8 +101,24 @@ def enqueue_node_job(
     project: str | None = None,
     avoid_box: Iterable[str] | None = None,
     force_box: Iterable[str] | None = None,
+    server_types: Iterable[str] | None = None,
+    cpu_slots: int | None = None,
 ) -> str:
     """Insert a fresh ``queued`` node-job row. Returns the row id.
+
+    ``cpu_slots`` (migration 0024) is how many slots of a WIDENED cpu lane this
+    one job occupies — the weight for a node whose body runs its own threads.
+    ``None``/``1`` ⇒ stored NULL = an ordinary 1-slot job, byte-identical to
+    pre-0024. A serial worker (``cpu_worker_threads=1``, the default) ignores it
+    entirely: one job at a time already owns the whole process. See
+    :func:`claim_next_cpu_job` for the fit test.
+
+    ``server_types`` (migration 0022) is an ORDERED LLM-server preference —
+    ``['vllm', 'ollama']`` reads "serve me on vLLM, fall back to ollama". Empty /
+    ``None`` ⇒ stored NULL = unconstrained. Two effects, both in the claim: the row
+    is only claimable by a worker whose served kinds INTERSECT the list, and a row
+    with a preference is POOL-eligible (an EXTERNAL server holds the model) even
+    when it names a ``required_model``. See :func:`claim_next_gpu_job`.
 
     ``avoid_box`` / ``force_box`` (migration 0020) are optional PHYSICAL-BOX
     placement constraints, by BOX NAME (``gpu_model_lease.default_box_id()`` —
@@ -114,12 +144,22 @@ def enqueue_node_job(
         raise ValueError(f"queue must be 'cpu' or 'gpu', got {queue!r}")
     if queue == "cpu" and required_model:
         raise ValueError("cpu node-job must not set required_model")
+    # Reject a 0/negative width at the API edge: the fit test would be
+    # meaningless and a 0-weight row would let a lane admit unboundedly many.
+    if cpu_slots is not None and int(cpu_slots) < 1:
+        raise ValueError(f"cpu_slots must be >= 1, got {cpu_slots!r}")
+    # 1 IS the default — store it as NULL so the two spellings can never drift.
+    _slots = int(cpu_slots) if cpu_slots is not None and int(cpu_slots) > 1 else None
 
     from queue_workflows.dialect import get_dialect
     _d = get_dialect()
     # Empty ⇒ NULL (unconstrained); a stray empty force_box must never strand the row.
     _avoid = [b for b in (avoid_box or []) if b] or None
     _force = [b for b in (force_box or []) if b] or None
+    # Same rule for the server preference — an empty list must mean "any server",
+    # never "no server", which would make the row permanently unclaimable. ORDER IS
+    # SIGNIFICANT (it IS the preference), so this filters without sorting.
+    _servers = [s for s in (server_types or []) if s] or None
 
     row_id = str(uuid.uuid4())
     with connection() as conn, conn.cursor() as cur:
@@ -129,13 +169,13 @@ def enqueue_node_job(
                 (id, run_id, pipeline_name, node_id, node_module,
                  queue, required_model, project,
                  status, priority, inputs, context_delta,
-                 avoid_box, force_box,
+                 avoid_box, force_box, server_types, cpu_slots,
                  created_at)
             VALUES
                 (%s, %s, %s, %s, %s,
                  %s, %s, %s,
                  'queued', %s, %s, '{}'::jsonb,
-                 %s, %s,
+                 %s, %s, %s, %s,
                  now())
             """,
             (
@@ -144,6 +184,8 @@ def enqueue_node_job(
                 priority, _as_json(inputs or {}),
                 _d.array_literal(_avoid) if _avoid else None,
                 _d.array_literal(_force) if _force else None,
+                _d.array_literal(_servers) if _servers else None,
+                _slots,
             ),
         )
     return row_id
@@ -291,12 +333,23 @@ def _host_dir(host_priority: int) -> int:
 # Run-cancel guard: the subselect additionally requires the parent run is
 # NOT terminal-cancelled/failed, so a worker can't even claim a job whose
 # run was cancelled out from under it.
+#
+# _RUN_CLAIMABLE_GUARD is THE single definition of "this job's parent run may
+# still execute" — shared by the claim below and by every "is there claimable
+# work?" view (``vlm_pool_should_defer``'s anti-starvation check). The two must
+# never disagree: when the starvation view briefly required ``status =
+# 'running'`` while the claim accepted anything not cancelled/failed,
+# trigger-expanded runs stuck at ``'queued'`` aged invisibly and the whole
+# fleet deferred a claimable queue into a standstill.
+_RUN_CLAIMABLE_GUARD = "status NOT IN ('cancelled', 'failed')"
+
 _CLAIM_SQL = """
 UPDATE workflow_node_jobs AS j
 SET status = 'running',
     started_at = now(),
     worker_lane = %(worker_lane)s,
     claimed_by = %(host)s,
+    resolved_server = {stamp},
     lease_expires_at = {lease_expr}
 WHERE j.id = (
     SELECT c.id FROM workflow_node_jobs c
@@ -306,7 +359,7 @@ WHERE j.id = (
       AND EXISTS (
           SELECT 1 FROM workflow_runs r
           WHERE r.id = c.run_id
-            AND r.status NOT IN ('cancelled', 'failed')
+            AND r.{run_guard}
       )
       {placement}
       {capability}
@@ -318,10 +371,12 @@ RETURNING *
 """
 
 
-def _placement_terms() -> str:
+def _placement_terms(alias: str = "c") -> str:
     """The box-placement WHERE fragment (migration 0020) — shared by the cpu + gpu
-    claims so a worker only ever grabs a row its PHYSICAL box is eligible for. Reads
-    the ``%(box)s`` param (the claiming worker's ``default_box_id()``):
+    claims (alias ``c``) AND by every "is there claimable work for this box?" view
+    (the VLM-pool anti-starvation check, alias ``sj``), so eligibility can never be
+    judged two different ways. Reads the ``%(box)s`` param (the claiming worker's
+    ``default_box_id()``):
 
       * ``avoid_box`` — excluded when this box is listed;
       * ``force_box`` — required to be listed when the array is set.
@@ -333,11 +388,11 @@ def _placement_terms() -> str:
     (pg ``= ANY``, sqlite ``json_each``)."""
     from queue_workflows.dialect import get_dialect
     _d = get_dialect()
-    in_avoid = _d.array_contains_value("c.avoid_box", "%(box)s")
-    in_force = _d.array_contains_value("c.force_box", "%(box)s")
+    in_avoid = _d.array_contains_value(f"{alias}.avoid_box", "%(box)s")
+    in_force = _d.array_contains_value(f"{alias}.force_box", "%(box)s")
     return (
-        f"AND (c.avoid_box IS NULL OR NOT ({in_avoid})) "
-        f"AND (c.force_box IS NULL OR ({in_force}))"
+        f"AND ({alias}.avoid_box IS NULL OR NOT ({in_avoid})) "
+        f"AND ({alias}.force_box IS NULL OR ({in_force}))"
     )
 
 
@@ -350,6 +405,116 @@ def _affinity_term() -> str:
     return (
         f"({get_dialect().not_distinct_from('c.required_model', '%(current_model)s')})"
         " DESC"
+    )
+
+
+def count_pending_for_server(
+    required_model: str | None, server_type: str, *, project: str | None = None,
+    any_model: bool = False,
+) -> int:
+    """How many QUEUED node-jobs are waiting for ``server_type`` to serve
+    ``required_model`` — the amortisation input for a cold start (migration 0022).
+
+    Starting a vLLM costs minutes of weight loading, so it is only worth paying when
+    enough work is queued behind it to spread the cost. This is that count: rows
+    still ``queued``, naming this model, whose ``server_types`` preference includes
+    this kind, in this tenant. Rows whose parent run is already terminal are excluded
+    by the same guard the claim uses — a queue full of ghosts must not justify a
+    cold start.
+
+    Best-effort: any failure returns 0, which is the CONSERVATIVE direction (do not
+    pay the cold start), so a DB blip can never trigger an expensive server start."""
+    from queue_workflows.dialect import get_dialect
+    _d = get_dialect()
+    # ``any_model`` answers the BOX-level question ("is any vLLM work waiting?"),
+    # which is what the lifecycle manager needs; the default answers the per-job one.
+    model_term = (
+        "" if any_model
+        else "AND " + _d.not_distinct_from("c.required_model", "%(model)s")
+    )
+    sql = f"""
+        SELECT COUNT(*) AS n FROM workflow_node_jobs c
+         WHERE c.status = 'queued'
+           AND c.project = %(project)s
+           {model_term}
+           AND c.server_types IS NOT NULL
+           AND {_d.arrays_overlap('c.server_types', '%(kinds)s')}
+           AND EXISTS (SELECT 1 FROM workflow_runs r
+                        WHERE r.id = c.run_id AND r.{_RUN_CLAIMABLE_GUARD})
+    """
+    params = {
+        "project": _project(project),
+        "model": required_model,
+        "kinds": _d.array_param([server_type]),
+    }
+    try:
+        with connection() as conn, conn.cursor() as cur:
+            cur.execute(sql, params)
+            row = cur.fetchone()
+        return int((row or {}).get("n") or 0)
+    except Exception:
+        log.debug("[node-queue] pending-for-server count failed; assuming 0",
+                  exc_info=True)
+        return 0
+
+
+def _pool_row_term(alias: str = "c") -> str:
+    """"This row is POOL-lane work" — the ONE definition, shared by the claim SQL and
+    by every view that reasons about pool capacity or starvation.
+
+    A row is pool work when it loads no in-process model: it names none, OR it is
+    remote-served (``server_types`` set, migration 0022 — an external server holds
+    the model). Before this was shared, the defer view still tested only
+    ``required_model IS NULL``, so every remote-served job was invisible to it: peers
+    looked idle (capacity count missed their running jobs) AND the anti-starvation
+    break never armed (aging jobs weren't counted), so a box deferred forever while a
+    2579-deep queue sat unclaimed. That is the defer-standstill class,
+    and the cure is the same one: define claimability ONCE."""
+    return f"({alias}.required_model IS NULL OR {alias}.server_types IS NOT NULL)"
+
+
+def _warm_affinity_term() -> str:
+    """Warm **(server, model)** affinity tiebreak (GPU, migration 0022) — the
+    "switch servers and weights as rarely as possible" sort.
+
+    Scores each candidate row against what is ALREADY loaded on this box and sorts
+    the score DESC, so the claim prefers work that costs nothing to start:
+
+    ======  ======================================  ==========================
+    score   condition                               cost avoided
+    ======  ======================================  ==========================
+    3       server kind up **and** model resident   nothing to do
+    2       server kind up, different model         a server start
+    1       model resident, different server kind   a weight load
+    0       neither                                 start **and** load
+    ======  ======================================  ==========================
+
+    The server term is weighted ×2 because starting a server (a vLLM cold start is
+    minutes) dominates a weight load (ollama swaps a model in seconds).
+
+    Complements — does not replace — :func:`_affinity_term`, which matches the
+    worker's own IN-PROCESS ``current_model``. This one reads EXTERNAL servers, so
+    a thin HTTP client with no in-process model still gets affinity.
+
+    Both params degrade to empty lists, in which case every row scores 0 and the
+    term is a no-op tiebreak — never a filter, so a cold box still claims."""
+    from queue_workflows.dialect import get_dialect
+    _d = get_dialect()
+    server_hit = _d.arrays_overlap("c.server_types", "%(warm_servers)s")
+    model_hit = _d.value_in_param_array("c.required_model", "%(warm_models)s")
+    # SCOPED TO REMOTE-SERVED ROWS ONLY. The whole score is gated on
+    # ``server_types IS NOT NULL`` — including the MODEL half — so a row that
+    # predates 0022 always scores 0 and this term cannot reorder it. Without that
+    # gate the model half fired on every legacy row and, because the term sorts
+    # ABOVE ``priority ASC``, warm-model affinity silently outranked the operator's
+    # priority bands for work that never opted in. In-process warm-model affinity is
+    # already owned by :func:`_affinity_term` (which matches the worker's own
+    # ``current_model``), so nothing is lost by scoping this one.
+    return (
+        "(CASE WHEN c.server_types IS NULL THEN 0 ELSE "
+        f"((CASE WHEN {server_hit} THEN 2 ELSE 0 END)"
+        f" + (CASE WHEN c.required_model IS NOT NULL AND {model_hit} THEN 1 ELSE 0 END))"
+        " END) DESC"
     )
 
 
@@ -369,9 +534,29 @@ def claim_next_cpu_job(
     host_priority: int = 0,
     project: str | None = None,
     box: str | None = None,
+    lane_width: int | None = None,
+    free_slots: int | None = None,
 ) -> dict[str, Any] | None:
     """Atomically grab the next queued CPU job (the CPU claim worker's
     claim).
+
+    ``lane_width`` / ``free_slots`` (migration 0024) are the CPU-WIDTH fit test,
+    used only by a WIDENED lane (``cpu_worker_threads > 1``). ``lane_width`` is
+    the worker's total slots, ``free_slots`` how many are free right now; a row is
+    claimable when ``LEAST(cpu_slots, lane_width) <= free_slots``. Both ``None``
+    (a serial worker, and every pre-0024 caller) ⇒ **no width term at all**: one
+    job at a time already owns the process, so every weight is claimable there.
+
+    The ``LEAST`` clamp is what stops a job wider than any worker in the fleet
+    from being excluded forever — a ``cpu_slots=9`` row on a 3-wide lane can
+    never "fit" arithmetically, so it is measured as 3 and simply runs alone. The
+    alternative (excluding it) strands work no operator can see a reason for.
+
+    STARVATION, NAMED: this is a FILTER, not a reservation. It has no aging and
+    no priority override, so it silently outranks the ``ORDER BY`` — while the
+    lane stays busier than ``threads - cpu_slots`` a wide row waits behind
+    narrower ones no matter how high its ``is_priority``/``priority``. Give a
+    latency-sensitive wide node its own lane rather than relying on priority.
 
     Stamps the lease (``claimed_by=host``,
     ``lease_expires_at=now()+lease_s``) and applies the run-cancel guard.
@@ -386,10 +571,25 @@ def claim_next_cpu_job(
     from queue_workflows.dialect import get_dialect
     _d = get_dialect()
     order = f"c.is_priority DESC, c.priority ASC, {_host_dir_term()}"
+    # CPU WIDTH fit (migration 0024) — only for a widened lane. Absent params ⇒
+    # empty fragment ⇒ the statement is byte-identical to pre-0024, which is what
+    # keeps every serial worker (the whole fleet today) unaffected.
+    width = ""
+    if lane_width is not None and free_slots is not None:
+        # GREATEST(..., 1) floors the weight the same way the worker does: a
+        # negative ``cpu_slots`` (only reachable out-of-band — the API raises on
+        # < 1) would otherwise satisfy this test unconditionally AND drag the
+        # worker's running total down, so the lane would admit more claims than
+        # it has threads. Both clamps live on both sides so the SQL and the
+        # in-process accounting can never disagree about a row's weight.
+        width = ("AND LEAST(GREATEST(COALESCE(c.cpu_slots, 1), 1), "
+                 "%(lane_width)s) <= %(free_slots)s ")
     # CPU jobs carry no required_model, so no capability gate applies.
     sql = _CLAIM_SQL.format(
-        order=order, capability="", placement=_placement_terms(),
+        order=order, capability=width, placement=_placement_terms(),
+        run_guard=_RUN_CLAIMABLE_GUARD,
         lease_expr=_d.future_seconds("%(lease_s)s"), skip_locked=_d.skip_locked,
+        stamp="NULL",   # cpu rows have no LLM serving kind (migration 0023)
     )
     params = {
         "worker_lane": worker_lane,
@@ -400,6 +600,9 @@ def claim_next_cpu_job(
         "host_dir": _host_dir(host_priority),
         "box": box or None,
     }
+    if width:
+        params["lane_width"] = int(lane_width)
+        params["free_slots"] = int(free_slots)
     with connection() as conn, conn.cursor() as cur:
         cur.execute(sql, params)
         return cur.fetchone()
@@ -418,9 +621,49 @@ def claim_next_gpu_job(
     project: str | None = None,
     max_running: int | None = None,
     box: str | None = None,
+    served_types: Iterable[str] | None = None,
+    warm_servers: Iterable[str] | None = None,
+    warm_models: Iterable[str] | None = None,
+    kind_caps: Mapping[str, int] | None = None,
+    default_server: str | None = None,
 ) -> dict[str, Any] | None:
     """Atomically grab the next queued GPU job (the GPU claim worker's
     claim).
+
+    ``kind_caps`` (migration 0023; LAW since) — PER-KIND slot
+    arbitration. The claim computes each candidate row's RESOLVED serving kind
+    (first ``server_types`` element this box serves → first preference →
+    ``'inprocess'`` for an undeclared model row → ``default_server``), STAMPS it
+    on the row — NEVER NULL — and refuses the claim while this host already runs
+    ``kind_caps[kind]`` jobs of that kind. ollama SERIALISES per model, so its
+    cap is 1 however many total slots the box advertises; vLLM batches, so it
+    gets PAR; every OTHER kind — comfyui, inprocess, custom, undeclared — falls
+    to the width-1 default (operator rule: "it's not vllm — ollama, comfyui and
+    any custom should allow 1 only"). A running row stamped NULL (a pre-law
+    wheel's claim) counts against EVERY candidate's kind: unknown is not free.
+    ``kind_caps=None`` applies the engine defaults ({'vllm': max_running-or-1});
+    the explicit empty dict ``{}`` is the documented opt-out, restoring the
+    legacy single-number arbiter AND the legacy NULL stamp byte-for-byte.
+
+    ``default_server`` — the caller's prediction of the kind an UNDECLARED
+    no-model row will be served on: pass what dispatch's active-server-wins
+    default will actually do (a warm vLLM ⇒ ``'vllm'``, else the box's cached
+    configured default). ``None`` falls back to the engine default (ollama) —
+    the conservative width-1 kind, never NULL.
+
+    ``served_types`` (migration 0022) — the LLM server kinds THIS worker's box can
+    actually serve (its probed ``llm_servers_available``). A row is claimable iff
+    its ``server_types`` is NULL (unconstrained) or INTERSECTS this list, so an
+    ollama-only box never grabs a vllm-only job. ``None`` / empty ⇒ the gate is
+    off (claim-any), the same cold-worker escape hatch ``known_models`` uses: a
+    worker that has not advertised yet must never wedge the queue.
+
+    ``warm_servers`` / ``warm_models`` — what is ALREADY loaded on this box right
+    now (from ``model_residency.probe_box_residents``). They drive the warm
+    (server, model) affinity sort: a job whose server kind is already up scores
+    above one that would need a server start, and within that a job whose model is
+    already resident scores above one that would need a weight load. Purely an
+    ORDER BY — never a filter, so nothing becomes unclaimable because a box is cold.
 
     ``box`` (migration 0020) is the claiming worker's PHYSICAL box name; the claim
     skips rows this box is ineligible for (``avoid_box`` / ``force_box``). ``None``
@@ -463,44 +706,84 @@ def claim_next_gpu_job(
       unset ⇒ legacy split (every no-model GPU job is pool-eligible)."""
     from queue_workflows.dialect import get_dialect
     _d = get_dialect()
+    served = [s for s in (served_types or []) if s]
     order = (
         # The operator "run next" flag jumps the whole queue — ahead of the
         # warm-model affinity tiebreak too (a flagged cold-model node preempts a
         # warm one; the reload is the accepted cost of "run this next").
         f"c.is_priority DESC, "
         f"{_affinity_term()}, "
+        f"{_warm_affinity_term()}, "
         f"c.priority ASC, "
         f"{_host_dir_term()}"
     )
     known = [m for m in (known_models or []) if m]
     pool = [m for m in (pool_modules or []) if m]
     capability_terms = []
+    if served:
+        # SERVER-PREFERENCE gate (0022): unconstrained rows always pass; a row that
+        # names a preference needs this box to serve at least one of those kinds.
+        capability_terms.append(
+            "AND (c.server_types IS NULL OR "
+            + _d.arrays_overlap("c.server_types", "%(served_types)s") + ")"
+        )
     if known:
         capability_terms.append(
             "AND (c.required_model IS NULL "
             "OR " + _d.value_in_param_array("c.required_model", "%(known_models)s") + ")"
         )
+    # REMOTE-SERVED (0022): a row naming ``server_types`` is executed by an EXTERNAL
+    # server, so it loads NO model into this process — it belongs in the PAR-wide
+    # pool even though it names a ``required_model``. Before 0022 the two lanes were
+    # split purely on ``required_model IS NULL``, which forced every model-naming LLM
+    # job onto the concurrency-1 inline lane meant for in-process weights. NULL
+    # ``server_types`` reduces to the old predicate exactly, so existing rows are
+    # byte-identical.
+    _remote = "c.server_types IS NOT NULL"
     if require_model is True:
         if pool:
-            # Inline lane: model-backed jobs PLUS no-model jobs whose module is
+            # Inline lane: in-process model jobs PLUS no-model jobs whose module is
             # NOT VLM-pool-eligible — heavy in-process GPU work (erasers,
             # detectors, builders) runs conc-1 here, never concurrently in the
-            # pool.
+            # pool. A remote-served row is excluded on both counts.
             capability_terms.append(
+                f"AND NOT ({_remote}) "
                 "AND (c.required_model IS NOT NULL "
                 "OR NOT (" + _d.value_in_param_array("c.node_module", "%(pool_modules)s") + "))"
             )
         else:
-            capability_terms.append("AND c.required_model IS NOT NULL")
+            capability_terms.append(
+                f"AND NOT ({_remote}) AND c.required_model IS NOT NULL"
+            )
     elif require_model is False:
         if pool:
-            # Pool lane: no-model jobs whose module IS VLM-pool-eligible only.
+            # Pool lane: a no-model job whose module is VLM-pool-eligible, OR any
+            # remote-served row.
+            #
+            # The ``OR remote`` sits OUTSIDE the pool_modules test on purpose. The
+            # inline lane refuses every remote-served row, so if the pool lane also
+            # required pool membership, a remote-served row whose module is not
+            # listed would be claimable by NEITHER lane — queued forever, with no
+            # error and no unassignable stamp. ``pool_modules`` exists to identify
+            # work that loads nothing in-process; ``server_types IS NOT NULL`` states
+            # that directly, so it needs no second opinion.
             capability_terms.append(
-                "AND c.required_model IS NULL "
-                "AND " + _d.value_in_param_array("c.node_module", "%(pool_modules)s")
+                "AND ((c.required_model IS NULL AND "
+                + _d.value_in_param_array("c.node_module", "%(pool_modules)s")
+                + f") OR {_remote})"
             )
         else:
-            capability_terms.append("AND c.required_model IS NULL")
+            capability_terms.append(f"AND (c.required_model IS NULL OR {_remote})")
+    def _running_here(alias: str) -> str:
+        """The this-host running-rows scope EVERY arbiter counts over. The box-slot
+        gate and the per-kind width gate must mean the same population, or two
+        arbiters can disagree their way past each other."""
+        return (
+            f"FROM workflow_node_jobs {alias} "
+            f"WHERE {alias}.status = 'running' AND {alias}.queue = %(queue)s "
+            f"AND {alias}.claimed_by = %(host)s AND {alias}.project = %(project)s"
+        )
+
     if max_running is not None and host:
         # THE BOX-SLOT ARBITER — the one centralized per-box concurrency gate.
         # Refuse the claim inside the claim statement itself when this box already
@@ -510,15 +793,67 @@ def claim_next_gpu_job(
         # zombie row (a thread that died without finalizing) keeps its slot
         # occupied until the lease reclaim frees it instead of being stacked on.
         capability_terms.append(
-            "AND (SELECT COUNT(*) FROM workflow_node_jobs r "
-            "     WHERE r.status = 'running' AND r.queue = %(queue)s "
-            "       AND r.claimed_by = %(host)s AND r.project = %(project)s) "
-            "< %(max_running)s"
+            f"AND (SELECT COUNT(*) {_running_here('r')}) < %(max_running)s"
+        )
+    # The row's RESOLVED serving kind, computable inside SQL for both dialects and
+    # NEVER NULL under the law: declared preference this box serves →
+    # declared first preference (cold worker) → 'inprocess' for a model row with no
+    # preference (it loads weights in this process — a serving kind of its own) →
+    # the caller's box-default prediction. Rendered per-ALIAS because it appears in
+    # two scopes: the outer UPDATE's SET (alias j — the stamp) and the inner
+    # candidate guard (alias c — the per-kind count).
+    #
+    # The previous build stamped NULL for any undeclared row and EXEMPTED it from
+    # the caps ("not LLM-served work"). That premise was false — the dispatch
+    # layer's own docs (llm_backends/factory.py) name compose_region_report as an
+    # LLM user whose rows never carry server_types — and the
+    # exemption admitted a ComfyUI render beside an ollama LLM job on one
+    # unified-memory unified-memory GPU box. Undeclared work IS served by something; predict it,
+    # stamp it, and let the D4 re-stamp correct the label if dispatch lands
+    # elsewhere.
+    def _stamp(alias: str) -> str:
+        return (
+            "COALESCE("
+            + (_d.first_overlap(f"{alias}.server_types", "%(served_types)s")
+               if served else "NULL")
+            + f", {_d.array_first(alias + '.server_types')}"
+            + f", CASE WHEN {alias}.required_model IS NOT NULL "
+              "THEN %(inprocess_kind)s ELSE %(default_server)s END)"
+        )
+    if kind_caps is None:
+        # ON BY DEFAULT: a host-scoped claim gets the law without
+        # asking — off-by-default is how the NULL hole shipped. The one batching
+        # kind gets the box budget as its PAR; everything else falls to the
+        # width-1 default below. ``kind_caps={}`` (explicitly empty) is the
+        # documented opt-out back to the legacy single-number arbiter.
+        caps = {"vllm": max(1, int(max_running)) if max_running is not None else 1}
+    else:
+        caps = {k: int(v) for k, v in kind_caps.items() if v}
+    law_on = bool(caps) and bool(host)
+    if law_on:
+        stamp_expr = _stamp("c")
+        cap_case = "CASE " + " ".join(
+            f"WHEN {stamp_expr} = %(cap_kind_{i})s THEN %(cap_val_{i})s"
+            for i in range(len(caps))
+        ) + " ELSE %(cap_default)s END"
+        # A legacy NULL running row (stamped by a pre-law wheel) counts against
+        # EVERY candidate's kind: the engine cannot know what that job put on the
+        # card, and (a 07-19 wheel beside a 07-28 arbiter) is what
+        # trusting the unknown looks like. Against a width-1 kind it blocks;
+        # against a batching kind it occupies one slot, not the whole box.
+        capability_terms.append(
+            f"AND (SELECT COUNT(*) {_running_here('rk')} "
+            f"AND (rk.resolved_server = {stamp_expr} "
+            "OR rk.resolved_server IS NULL)) "
+            f"< {cap_case}"
         )
     capability = " ".join(capability_terms)
     sql = _CLAIM_SQL.format(
         order=order, capability=capability, placement=_placement_terms(),
+        run_guard=_RUN_CLAIMABLE_GUARD,
         lease_expr=_d.future_seconds("%(lease_s)s"), skip_locked=_d.skip_locked,
+        # The opt-out opts out of stamping too — byte-compat with the legacy claim.
+        stamp=_stamp("j") if law_on else "NULL",
     )
     params = {
         "worker_lane": worker_lane,
@@ -529,15 +864,43 @@ def claim_next_gpu_job(
         "current_model": current_model,
         "host_dir": _host_dir(host_priority),
         "box": box or None,
+        # Warm (server, model) affinity inputs — ALWAYS bound (the ORDER BY term is
+        # unconditional), empty ⇒ every row scores 0 and the tiebreak is inert.
+        "warm_servers": _d.array_param([s for s in (warm_servers or []) if s]),
+        "warm_models": _d.array_param([m for m in (warm_models or []) if m]),
     }
+    if served:
+        params["served_types"] = _d.array_param(served)
+    if law_on:
+        for i, (k, v) in enumerate(caps.items()):
+            params[f"cap_kind_{i}"] = k
+            params[f"cap_val_{i}"] = int(v)
+        # AUDIT DELTA D3, made literal by the law — the TIGHTEST cap. This is the
+        # budget for a row whose resolved kind is not in ``caps`` at all: ollama,
+        # comfyui, 'inprocess', any custom server, any typo, a kind this build has
+        # never heard of. The operator rule: only a kind EXPLICITLY
+        # capped wider (vLLM = PAR) batches; everything else serialises at 1.
+        # (Was ``min(caps.values())`` — correct while ollama:1 was always present,
+        # but the engine-default caps are now {'vllm': PAR}, whose min would hand
+        # the least-known kind the loosest budget again.)
+        params["cap_default"] = 1
+        params["inprocess_kind"] = INPROCESS_SERVER_KIND
+        params["default_server"] = default_server or _DEFAULT_SERVER_KIND
     if known:
         params["known_models"] = _d.array_param(known)
     if pool:
         params["pool_modules"] = _d.array_param(pool)
     if max_running is not None and host:
         params["max_running"] = int(max_running)
+    # AUDIT DELTA D1 — EITHER arbiter needs the lock. Both the box-slot gate
+    # (max_running) and the per-kind gate (kind_caps) decide by COUNTING running
+    # rows, so both lose the same race: two claimants read "cap-1 running" and both
+    # take the last slot. The per-kind gate shipped without the serialisation the
+    # box gate has always had, which made ollama's cap of 1 breakable by exactly
+    # the concurrency it exists to prevent.
+    arbitrated = bool(host) and (max_running is not None or law_on)
     with connection() as conn, conn.cursor() as cur:
-        if max_running is not None and host:
+        if arbitrated:
             # Serialize claims per box (pg advisory xact lock; sqlite's single
             # writer needs none) so two concurrent claimants can't both read
             # "N-1 running" and both take the last slot.
@@ -548,9 +911,39 @@ def claim_next_gpu_job(
         return cur.fetchone()
 
 
+def restamp_resolved_server(job_id: str, server_type: str) -> None:
+    """Correct a running row's ``resolved_server`` to the kind ACTUALLY serving it.
+
+    The claim stamps the kind it counted the job against, and the per-kind arbiter
+    counts running rows BY that stamp (:func:`claim_next_gpu_job`). When the stamped
+    server is dead at dispatch time the job is served on a live kind instead — the
+    right call, a job should not die because a sidecar went down — but the stale
+    stamp then makes every LATER claim count this job against a server that is not
+    running it. Both directions are wrong: the dead kind looks busy (its cap is
+    consumed by nothing) and the serving kind looks free (it can be over-claimed).
+
+    The arbiter re-reads the DB on every claim rather than caching, so correcting
+    the row is sufficient — no coordination, no invalidation. Best-effort by
+    design: this rides a dispatch path that must not fail for a bookkeeping write,
+    and a missed correction degrades to exactly the pre-fix behaviour.
+    """
+    if not job_id or not server_type:
+        return
+    try:
+        with connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE workflow_node_jobs SET resolved_server = %(kind)s "
+                "WHERE id = %(id)s AND status = 'running'",
+                {"kind": str(server_type), "id": str(job_id)},
+            )
+    except Exception:
+        log.debug("[node-queue] re-stamp of job %s to %s failed", job_id,
+                  server_type, exc_info=True)
+
+
 def vlm_pool_should_defer(
     host_label: str, par: int, *, stale_s: int = STALE_WORKER_AFTER_S,
-    project: str | None = None,
+    project: str | None = None, box: str | None = None,
 ) -> bool:
     """FILL-BEFORE-SPILL gate for the no-model GPU (VLM) pool lane.
 
@@ -579,15 +972,27 @@ def vlm_pool_should_defer(
         single-box fleets and other library consumers.
       * **Stale peers don't count.** ``R`` must be fresh
         (``last_seen > now() - stale_s``); a dead top box can't block everyone.
-      * **Pool lane only.** Capacity counts ``queue='gpu' AND status='running'
-        AND required_model IS NULL`` — the inline diffusion lane (a warm-model
-        job) is neither counted nor affected.
+      * **Pool lane only.** Capacity counts running gpu rows that are POOL work by
+        :func:`_pool_row_term` — no model, OR remote-served (``server_types`` set,
+        migration 0022). The inline diffusion lane (an in-process warm-model job) is
+        neither counted nor affected. Using the claim's own definition is
+        load-bearing: when this view tested only ``required_model IS NULL`` it could
+        not see remote-served work at all, so peers read as idle and the
+        anti-starvation break never armed.
 
     A single cheap query: ``worker_heartbeats`` (fresh gpu rows ranked above M)
     LEFT JOINed to a per-``claimed_by`` COUNT of its running no-model gpu jobs,
     short-circuited by ``EXISTS``. ``stale_s`` mirrors the heartbeat freshness
-    window (default :data:`STALE_WORKER_AFTER_S` = 30 s)."""
-    sql = """
+    window (default :data:`STALE_WORKER_AFTER_S` = 30 s).
+
+    ``box`` is this machine's PHYSICAL box id (``default_box_id()``), threaded
+    into the anti-starvation view so "claimable" means claimable BY THIS BOX —
+    see below."""
+    # ONE definition of pool-lane membership, shared with the claim SQL — see
+    # _pool_row_term. Bound here so the f-string below interpolates them.
+    pool_running = _pool_row_term("workflow_node_jobs")
+    pool_aging = _pool_row_term("sj")
+    sql = f"""
         SELECT (
           EXISTS (
             SELECT 1
@@ -597,7 +1002,7 @@ def vlm_pool_should_defer(
                     FROM workflow_node_jobs
                    WHERE queue = 'gpu'
                      AND status = 'running'
-                     AND required_model IS NULL
+                     AND {pool_running}
                      AND project = %(project)s
                    GROUP BY claimed_by
               ) j ON j.claimed_by = r.host_label
@@ -612,21 +1017,26 @@ def vlm_pool_should_defer(
                -- R still has free VLM capacity
                AND COALESCE(j.running_no_model, 0) < r.concurrency
           )
-          -- ANTI-STARVATION: never defer while a claimable no-model job is AGING. If the
-          -- top box were draining, nothing would age past the window; a job older than it
-          -- means the higher peer ISN'T taking the work (e.g. its card is held for another
-          -- project's model, so it can only spill) — so claim NOW instead of deferring
-          -- forever. Guarantees liveness the DB-only capacity view can't (it's blind to
-          -- the box lease). "Claimable" = parent run still running (not a ghost).
+          -- ANTI-STARVATION: never defer while a no-model job THIS BOX COULD CLAIM is
+          -- AGING. If the top box were draining, nothing would age past the window; a
+          -- job older than it means the higher peer ISN'T taking the work (its card is
+          -- held for another project's model, or the job's box placement excludes it
+          -- outright) — so claim NOW instead of deferring forever. Liveness the DB-only
+          -- capacity view can't give (it's blind to the box lease AND to placement).
+          -- "Claimable" is defined ONCE, by the claim SQL's own fragments: the same
+          -- parent-run guard (a stuck-'queued' run is claimable —) and the
+          -- same placement terms keyed on MY box (a job that avoids me isn't starving
+          -- for me; a job that avoids the TOP box must still break MY deferral).
           AND NOT EXISTS (
             SELECT 1
               FROM workflow_node_jobs sj
               JOIN workflow_runs sr ON sr.id::text = sj.run_id
              WHERE sj.queue = 'gpu'
                AND sj.status = 'queued'
-               AND sj.required_model IS NULL
+               AND {pool_aging}
                AND sj.project = %(project)s
-               AND sr.status = 'running'
+               AND sr.{_RUN_CLAIMABLE_GUARD}
+               {_placement_terms("sj")}
                AND sj.created_at < now() - make_interval(secs => %(starve_s)s)
           )
         ) AS should_defer
@@ -637,6 +1047,7 @@ def vlm_pool_should_defer(
         "stale_s": max(1, int(stale_s)),
         "starve_s": max(1, int(VLM_POOL_MAX_DEFER_AGE_S)),
         "project": _project(project),
+        "box": box or None,
     }
     with connection() as conn, conn.cursor() as cur:
         cur.execute(sql, params)
@@ -1032,7 +1443,7 @@ def flag_stale_workers_holding_running_jobs(
     can't reach.
 
     THE GAP. A GPU hardware-hang (e.g. a ROCr "GPU Hang" HW exception on a
-    wan_i2v render) can leave the claim-worker PROCESS wedged: a torch/HIP call
+    video-model-b render) can leave the claim-worker PROCESS wedged: a torch/HIP call
     blocked in the dead GPU context, with the worker's in-process
     :class:`~queue_workflows.claim_worker.GpuHealthWatchdog` unable to make its
     trip — either because the trip signal is unobservable from inside (on a ROCm
@@ -1257,6 +1668,93 @@ def requeue_running_for_worker(
         return cur.rowcount or 0
 
 
+def requeue_running_job(
+    job_id: str, *, host_label: str, queue: str, project: str | None = None,
+    started_at: Any = None,
+) -> int:
+    """Re-queue ONE specific ``running`` row this worker owns — the per-job twin
+    of :func:`requeue_running_for_worker`, with the identical resume-style
+    semantics (``running`` → ``queued``, lease cleared, front of the line, and NO
+    ``watchdog_retries`` bump).
+
+    WHY A PER-ID VARIANT EXISTS. ``requeue_running_for_worker`` releases every
+    row for a ``(host_label, queue, project)``, which is exactly right for its
+    caller — an operator turning that whole lane OFF. It is exactly WRONG for a
+    threaded cpu worker's watchdog trip: the recommended deployment runs N
+    claim-worker PROCESSES that share ONE ``host_label``
+    (``deploy/run_claim_lane.sh``), so a host-wide release would yank a healthy
+    sibling PROCESS's rows out from under it. That process would then self-exit
+    the moment its :class:`~queue_workflows.claim_worker.JobStatusWatcher` saw
+    the row reassigned — turning one wedged job into a whole box's lane going
+    down. A tripping worker may only release the ids it actually holds.
+
+    ``started_at`` PINS THE CLAIM, not just the row, and is what makes the
+    scoping actually hold. ``claimed_by``/``queue``/``project`` are not enough:
+    under the shared-``host_label`` deployment above, a row that left the caller
+    (lease lapse, a host-wide corrective requeue, the over-claim reaper) and was
+    then re-claimed by a SIBLING PROCESS still matches every one of those terms,
+    so an id-only release would steal a live row — and that sibling could not
+    even notice, since its ``JobStatusWatcher`` compares against the same shared
+    label. A re-claim stamps a fresh ``started_at``, so passing the value seen at
+    claim time turns a stale id into a genuine no-op. ``None`` (the default)
+    keeps the looser id-only match for callers that have no claim timestamp.
+
+    The claim check is done in PYTHON, not as an ``AND started_at = %s`` term,
+    and that is deliberate: on the sqlite backend the column is stored as TEXT
+    with MILLISECOND precision while ``db._adapt_dt`` renders a bound datetime to
+    WHOLE SECONDS, so that equality can never match — it would silently turn
+    every sweep into a no-op there. Comparing the two Python values sidesteps the
+    dialect entirely (a value read back compares equal to the one the claim
+    returned).
+
+    The ``FOR UPDATE`` makes the read+write atomic against a concurrent re-claim
+    **on Postgres**; the sqlite dialect strips the clause (``db._FORUPDATE_RE``)
+    and relies on its process-wide connection lock plus WAL conflict detection
+    instead. That is the same guarantee the rest of the engine's claim path runs
+    on, not a weaker one invented here.
+
+    Returns rows affected (0 or 1)."""
+    table = "ingest_jobs" if queue in _ingest_queues() else "workflow_node_jobs"
+    front = "" if table == "ingest_jobs" else ", is_priority = TRUE"
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT started_at FROM {table}
+            WHERE id = %s
+              AND status = 'running'
+              AND claimed_by = %s
+              AND queue = %s
+              AND project = %s
+            FOR UPDATE
+            """,
+            (job_id, host_label, queue, _project(project)),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return 0
+        if started_at is not None and row["started_at"] != started_at:
+            # Same id, DIFFERENT claim — the row left this caller and someone
+            # else (a sibling process under the shared host_label) owns it now.
+            return 0
+        cur.execute(
+            f"""
+            UPDATE {table}
+            SET status = 'queued',
+                started_at = NULL,
+                claimed_by = NULL,
+                lease_expires_at = NULL,
+                priority = LEAST(priority, 10){front}
+            WHERE id = %s
+              AND status = 'running'
+              AND claimed_by = %s
+              AND queue = %s
+              AND project = %s
+            """,
+            (job_id, host_label, queue, _project(project)),
+        )
+        return cur.rowcount or 0
+
+
 def requeue_running_if_worker_stale(
     host_label: str, queue: str, *,
     project: str | None = None, stale_after_s: int | None = None,
@@ -1412,16 +1910,49 @@ def running_lease_snapshot(*, queue: str | None = None) -> list[tuple[str, Any]]
 # visible from one DB.
 
 
-def pick_over_claim_victims(rows: list[tuple[str, Any]], capacity: int) -> list[str]:
-    """PURE: given a box's running ``(job_id, started_at)`` rows and its
-    ``capacity``, return the ids to re-queue — the NEWEST ``len - capacity``,
-    keeping the oldest ``capacity`` running. A ``None`` ``started_at`` sorts
-    oldest (kept — an anomalous row isn't aggressively reaped). Deterministic
-    id tie-break; the ``r[1] is not None`` guard means ``None`` is never
-    compared to a timestamp."""
+def pick_over_claim_victims(
+    rows: list[tuple[str, Any, Any]], capacity: int, *,
+    lease_tie_s: float = 30.0,
+) -> list[str]:
+    """PURE: given a box's running ``(job_id, started_at, lease_epoch_s)``
+    rows and its ``capacity``, return the ids to re-queue.
+
+    Victim choice is by LEASE freshness first, job age second: the lease
+    renewal is the only signal that separates a live claimant (renews every
+    ~10 s, lease tracking ``now + lease_s``) from a zombie row (a dead
+    predecessor's claim whose lease FROZE). The old keep-oldest-``started_at``
+    rule reaped a LIVE render while keeping the zombie whenever a worker
+    restart left its predecessor's older row on the slot — and the reaper's
+    10 s cadence always beats the ~35 s frozen-lease sweep that would have
+    cleaned that zombie first (observed live).
+
+    Raw freshness alone would be wrong the other way: two genuinely LIVE
+    claimants renew on offset cadences, so their leases differ by jitter and
+    the victim would be arbitrary. Rows whose lease is within ``lease_tie_s``
+    (~3× the renewal cadence) of the freshest lease are therefore one LIVE
+    bucket — kept oldest-``started_at``-first, the most-progress heuristic —
+    while rows lagging further (frozen ⇒ decaying) sort behind it, stalest
+    last. A ``None`` lease on a running row is broken state a live claimant
+    can't have: reaped first (the requeue is the safe repair). ``None``
+    ``started_at`` sorts oldest (kept); id breaks remaining ties."""
     cap = max(int(capacity), 0)
-    ordered = sorted(rows, key=lambda r: (r[1] is not None, r[1], r[0]))
-    return [job_id for job_id, _ in ordered[cap:]]
+    fresh = [r[2] for r in rows if r[2] is not None]
+    live_floor = (max(fresh) - float(lease_tie_s)) if fresh else None
+
+    def _key(r: tuple[str, Any, Any]) -> tuple:
+        lease, started = r[2], r[1]
+        in_live = lease is not None and live_floor is not None and lease >= live_floor
+        return (
+            0 if in_live else 1,
+            # live bucket: oldest started_at first (None oldest)
+            # stale bucket: freshest lease first, so the stalest fill the tail
+            (started is not None, started if started is not None else 0)
+            if in_live else (lease is None, -(lease or 0)),
+            r[0],
+        )
+
+    ordered = sorted(rows, key=_key)
+    return [r[0] for r in ordered[cap:]]
 
 
 def requeue_over_claimed_running(job_id: str) -> int:
@@ -1456,14 +1987,17 @@ def requeue_over_claimed_running(job_id: str) -> int:
 def reap_over_claimed_boxes(*, queue: str = "gpu") -> list[dict[str, Any]]:
     """Runtime over-claim backstop: for every ``(claimed_by, project)`` on
     ``queue`` running MORE jobs than that box advertises
-    (``worker_heartbeats.concurrency``), re-queue the newest over-capacity
-    job(s). Skips a box with no heartbeat (capacity unknown — the lease /
+    (``worker_heartbeats.concurrency``), re-queue the stalest-leased
+    over-capacity job(s) (see :func:`pick_over_claim_victims` — a frozen lease
+    marks the zombie; the freshest-renewing rows are the live ones to keep).
+    Skips a box with no heartbeat (capacity unknown — the lease /
     dead-worker sweeps own the vanished-worker case). Returns one dict per
     re-queued victim for the caller to log; a requeue that races a terminal
     loses the CAS and is simply not counted."""
     with connection() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT id, claimed_by, project, started_at FROM workflow_node_jobs "
+            "SELECT id, claimed_by, project, started_at, lease_expires_at "
+            "FROM workflow_node_jobs "
             "WHERE status = 'running' AND queue = %s AND claimed_by IS NOT NULL",
             (queue,),
         )
@@ -1475,10 +2009,22 @@ def reap_over_claimed_boxes(*, queue: str = "gpu") -> list[dict[str, Any]]:
         )
         caps = {(r["host_label"], r["project"]): r["concurrency"] for r in cur.fetchall()}
 
-    groups: dict[tuple[str, str], list[tuple[str, Any]]] = {}
+    def _lease_epoch(v: Any) -> float | None:
+        # pg hands back a datetime, sqlite an ISO text — the picker buckets by
+        # SECONDS relative to the freshest lease, so normalize to epoch floats.
+        if v is None:
+            return None
+        if hasattr(v, "timestamp"):
+            return v.timestamp()
+        try:
+            return datetime.fromisoformat(str(v)).timestamp()
+        except ValueError:
+            return None
+
+    groups: dict[tuple[str, str], list[tuple[str, Any, Any]]] = {}
     for r in running:
         groups.setdefault((r["claimed_by"], r["project"]), []).append(
-            (r["id"], r["started_at"]))
+            (r["id"], r["started_at"], _lease_epoch(r["lease_expires_at"])))
 
     reaped: list[dict[str, Any]] = []
     for (host, project), rows in groups.items():
@@ -1954,6 +2500,85 @@ def prune_node_events(older_than_days: int = 30) -> int:
         return cur.rowcount or 0
 
 
+def flag_server_stranded_jobs(
+    *, stale_s: int | None = None, project: str | None = None,
+) -> list[dict[str, Any]]:
+    """SERVER-KIND twin of :func:`flag_unassignable_gpu_jobs` (analysis #3).
+
+    A queued gpu job whose ``server_types`` (migration 0022) intersects NO fresh gpu
+    worker's ``llm_servers_available`` can be claimed by nobody — a ``['vllm']``-only
+    row on a fleet where no vLLM answers sits queued FOREVER, with no error, no flag
+    and no log. That silence is the same failure mode the 0015 capacity sweep exists
+    to name, so it gets the same treatment: stamp ``unassignable_at`` /
+    ``unassignable_reason``, clear the stamp the moment a matching server appears or
+    the row leaves ``queued``, and return only the NEWLY flagged rows so the caller
+    emits one ``unassignable`` event each.
+
+    Same liveness guard as the capacity sweep: with ZERO fresh gpu heartbeats this is
+    a fleet-down condition, not a routing verdict — no-op. A worker advertising an
+    EMPTY server list still counts as fresh (it is alive, just serverless), because
+    the claim-side gate treats an empty advertisement as claim-any."""
+    window = int(stale_s) if stale_s is not None else _stale_worker_after_s()
+    proj = _project(project)
+    from queue_workflows.dialect import get_dialect
+    _d = get_dialect()
+    overlap = _d.arrays_overlap("j.server_types", "lg.llm_servers_available")
+    # A worker with an EMPTY advertisement claims ANY row (the claim gate is off for
+    # it), so its presence means the row is NOT stranded.
+    lg_empty = _d.array_is_empty("lg.llm_servers_available")
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            f"""
+            WITH live_gpu AS (
+                SELECT llm_servers_available FROM worker_heartbeats
+                WHERE queue = 'gpu'
+                  AND project = %(project)s
+                  AND last_seen > now() - make_interval(secs => %(window)s)
+            )
+            UPDATE workflow_node_jobs AS j
+            SET unassignable_at = NULL, unassignable_reason = NULL
+            WHERE j.unassignable_at IS NOT NULL
+              AND j.unassignable_reason LIKE 'no live worker serves%%'
+              AND j.project = %(project)s
+              AND j.server_types IS NOT NULL
+              AND (
+                    j.status <> 'queued'
+                 OR EXISTS (SELECT 1 FROM live_gpu lg WHERE {overlap})
+                 OR EXISTS (SELECT 1 FROM live_gpu lg
+                            WHERE {lg_empty})
+              )
+            """,
+            {"window": window, "project": proj},
+        )
+        cur.execute(
+            f"""
+            UPDATE workflow_node_jobs AS j
+            SET unassignable_at = now(),
+                unassignable_reason = 'no live worker serves any of: ' ||
+                    {_d.array_to_text('j.server_types')}
+            WHERE j.status = 'queued'
+              AND j.queue = 'gpu'
+              AND j.project = %(project)s
+              AND j.server_types IS NOT NULL
+              AND j.unassignable_at IS NULL
+              AND EXISTS (
+                    SELECT 1 FROM worker_heartbeats h
+                    WHERE h.queue = 'gpu' AND h.project = %(project)s
+                      AND h.last_seen > now() - make_interval(secs => %(window)s)
+              )
+              AND NOT EXISTS (
+                    SELECT 1 FROM worker_heartbeats lg
+                    WHERE lg.queue = 'gpu' AND lg.project = %(project)s
+                      AND lg.last_seen > now() - make_interval(secs => %(window)s)
+                      AND ({overlap} OR {lg_empty})
+              )
+            RETURNING *
+            """,
+            {"window": window, "project": proj},
+        )
+        return list(cur.fetchall())
+
+
 def flag_unassignable_gpu_jobs(
     *, stale_s: int | None = None, project: str | None = None,
 ) -> list[dict[str, Any]]:
@@ -2009,6 +2634,8 @@ def flag_unassignable_gpu_jobs(
             UPDATE workflow_node_jobs AS j
             SET unassignable_at = NULL, unassignable_reason = NULL
             WHERE j.unassignable_at IS NOT NULL
+              AND (j.unassignable_reason IS NULL
+                   OR j.unassignable_reason NOT LIKE 'no live worker serves%%')
               AND j.project = %(project)s
               AND (
                     j.status <> 'queued'

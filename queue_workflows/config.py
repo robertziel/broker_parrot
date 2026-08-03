@@ -336,6 +336,15 @@ class EngineConfig:
     #: holder's lease lapses so it can't hold VRAM hostage. Env
     #: ``QUEUE_WORKFLOWS_GPU_MODEL_LEASE_TTL_S``.
     gpu_model_lease_ttl_s: float = 120.0
+    #: THE idle-model rule, in seconds: an EXTERNAL LLM server's model (ollama)
+    #: may stay loaded this long while UNUSED before the gpu worker's idle
+    #: reaper unloads it (``llm_idle_unload``); ``<= 0`` disables. "Unused" is
+    #: measured at the SERVER (``/api/ps`` ``expires_at`` advances on every
+    #: client's use), so host-internal LLM calls count too. Deploy config should
+    #: derive the server-side ``OLLAMA_KEEP_ALIVE`` from this same constant so
+    #: ollama enforces the identical rule natively. Env twin
+    #: ``QUEUE_WORKFLOWS_LLM_SERVER_IDLE_TTL_S`` overrides (envcompat).
+    llm_server_idle_ttl_s: float = 300.0
     #: A host-provided lease store (overrides ``gpu_model_lease_dir``) — anything
     #: with ``read(box_id)`` + ``update(box_id, fn)``, e.g. a redis/pg-backed store
     #: shared across boxes. ``None`` ⇒ the file store (if a dir is set) else no-op.
@@ -361,14 +370,14 @@ class EngineConfig:
     #: ``llm_server=None`` and keep self-resolving from local env (unchanged).
     llm_server_resolver: Callable[[dict], Any] | None = None
 
-    # ── orphan-cancel sweep (ON by default since the 2026-07-16 ghost audit) ──
+    # ── orphan-cancel sweep (ON by default since the ghost audit) ──
     #: When True, the :class:`NodePool` periodically flips ``queued`` jobs whose
     #: parent run is already ``cancelled`` / ``failed`` to ``cancelled``. The
     #: host's cancel handler is usually a single ``UPDATE workflow_runs SET
     #: status='cancelled'`` and does not cascade into ``workflow_node_jobs``; the
     #: claim SQL refuses such jobs (run-cancel guard), but they linger in
     #: ``queued`` forever — polluting queue gauges AND (worse) feeding every
-    #: queue-depth-driven policy a lie (the 2026-07-16 audit found a "full" gpu
+    #: queue-depth-driven policy a lie (the audit found a "full" gpu
     #: queue that was 82 % ghosts). Default ``True``: ghosts now cannot
     #: accumulate. The flip is semantically safe — a job of a terminal run can
     #: never be claimed anyway — and hosts that want the old bookkeeping keep it
@@ -389,6 +398,27 @@ class EngineConfig:
     #: ``hw_metrics`` with two shapes. Default ``False`` keeps the engine sampler.
     #: Set via ``configure(disable_gpu_worker_hw_sampler=True)``.
     disable_gpu_worker_hw_sampler: bool = False
+
+    # ── cpu lane width (opt-in in-process concurrency) ────────────────────────
+    #: How many node-jobs ONE cpu claim-worker process may run at a time. ``1``
+    #: (the default) is the historical concurrency-1 worker: claim, run the body
+    #: inline, loop — no executor is created at all. ``N > 1`` gives the cpu lane
+    #: an in-process pool of N long-lived worker
+    #: threads (``claim_worker._CpuLanePool``) fed by a reserve-slot-then-claim
+    #: loop. It deliberately does NOT use a ``ThreadPoolExecutor``: that starts
+    #: its threads lazily inside ``submit``, *after* enqueuing the work, so a
+    #: refused thread raises while the body still runs — and a slot freed on
+    #: that signal breaks the ceiling.
+    #:
+    #: WHICH TO USE: for a CPU-BOUND pure-Python node the GIL serialises threads,
+    #: so N PROCESSES (``deploy/run_claim_lane.sh``) remain the only real
+    #: parallelism and stay the recommended default. Raise this instead when the
+    #: cpu nodes are IO-BOUND (HTTP, DB waits, an ffmpeg/subprocess that releases
+    #: the GIL) or when one container running one process is simply the deploy
+    #: you want. Env twin ``QUEUE_WORKFLOWS_CPU_WORKER_THREADS`` overrides
+    #: (envcompat); gpu/ingest queues are unaffected — gpu owns its own two-lane
+    #: PAR budget.
+    cpu_worker_threads: int = 1
 
     # ── ingest queue names + budget (host-configurable; G1) ────────────────────
     #: Ingest-family queue names. Migration 0008 dropped the fetch/load DB CHECK;

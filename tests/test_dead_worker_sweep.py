@@ -106,10 +106,10 @@ def _flagged_at(host: str, queue: str):
 
 
 def test_flags_stale_worker_holding_running_job():
-    """The incident shape: a wan_i2v render wedged the GPU, the worker stopped
+    """The incident shape: a video-model-b render wedged the GPU, the worker stopped
     heartbeating (stale ~29 min) but still owned its running job. It must be
     flagged + returned with the running-job count."""
-    _running_job_owned_by("host-a", model="wan_i2v")
+    _running_job_owned_by("host-a", model="video-model-b")
     _put_heartbeat("host-a", "gpu", last_seen_age_s=120)  # 29-min-style staleness
 
     flagged = node_queue.flag_stale_workers_holding_running_jobs(stale_after_s=30)
@@ -127,7 +127,7 @@ def test_fresh_heartbeat_holding_running_job_is_not_flagged():
     """A worker that is BEATING normally (last_seen recent) is healthy even
     while it owns a running job — that's the steady state of a long render. Must
     NOT be flagged."""
-    _running_job_owned_by("host-a", model="wan_i2v")
+    _running_job_owned_by("host-a", model="video-model-b")
     _put_heartbeat("host-a", "gpu", last_seen_age_s=2)  # fresh
 
     flagged = node_queue.flag_stale_workers_holding_running_jobs(stale_after_s=30)
@@ -154,7 +154,7 @@ def test_join_is_scoped_to_the_owning_host():
     job claimed by a DIFFERENT (healthy) host must not make a stale idle worker
     look like it's holding work."""
     # healthy host owns the only running job; the stale host owns nothing.
-    _running_job_owned_by("healthy-host", model="wan_i2v")
+    _running_job_owned_by("healthy-host", model="video-model-b")
     _put_heartbeat("healthy-host", "gpu", last_seen_age_s=2)   # fresh
     _put_heartbeat("stale-idle", "gpu", last_seen_age_s=300)   # stale but jobless
 
@@ -169,7 +169,7 @@ def test_attribution_is_scoped_to_the_jobs_queue_family():
     attributed to the host-c/gpu heartbeat, NOT the host-c/cpu one — so a
     wedged gpu worker flags only its own row, and the healthy cpu worker (fresh
     heartbeat) is left alone even though it shares the host_label."""
-    _running_job_owned_by("host-c", queue="gpu", model="wan_i2v")
+    _running_job_owned_by("host-c", queue="gpu", model="video-model-b")
     _put_heartbeat("host-c", "gpu", last_seen_age_s=120)  # gpu worker wedged
     _put_heartbeat("host-c", "cpu", last_seen_age_s=2)    # cpu worker healthy
 
@@ -184,7 +184,7 @@ def test_stale_sibling_without_its_own_queues_job_is_not_flagged():
     """The inverse: if only the CPU worker on a shared host is stale but the
     running job belongs to the GPU queue, the stale cpu row is NOT flagged — the
     gpu job is not the cpu worker's work."""
-    _running_job_owned_by("host-c", queue="gpu", model="wan_i2v")
+    _running_job_owned_by("host-c", queue="gpu", model="video-model-b")
     _put_heartbeat("host-c", "gpu", last_seen_age_s=2)    # gpu worker healthy
     _put_heartbeat("host-c", "cpu", last_seen_age_s=300)  # cpu worker stale but idle
 
@@ -213,7 +213,7 @@ def test_counts_all_running_jobs_the_worker_owns():
 def test_flag_is_idempotent_within_window():
     """A second sweep inside the staleness window does NOT re-flag (so the 0.5 s
     orchestrator tick doesn't relog every pass)."""
-    _running_job_owned_by("host-a", model="wan_i2v")
+    _running_job_owned_by("host-a", model="video-model-b")
     _put_heartbeat("host-a", "gpu", last_seen_age_s=120)
 
     first = node_queue.flag_stale_workers_holding_running_jobs(stale_after_s=30)
@@ -227,7 +227,7 @@ def test_heartbeat_refresh_clears_the_flag():
     """After the worker (or its replacement post-bounce) beats again, the flag
     is cleared by ``upsert_worker_heartbeat`` so a FUTURE hang re-flags cleanly
     instead of staying latched from the previous incident."""
-    _running_job_owned_by("host-a", model="wan_i2v")
+    _running_job_owned_by("host-a", model="video-model-b")
     _put_heartbeat("host-a", "gpu", last_seen_age_s=120)
     node_queue.flag_stale_workers_holding_running_jobs(stale_after_s=30)
     assert _flagged_at("host-a", "gpu") is not None
@@ -242,7 +242,7 @@ def test_heartbeat_refresh_clears_the_flag():
 def test_re_flags_after_recovery_then_stale_again():
     """End-to-end of the latch lifecycle: flag → recover (refresh clears it) →
     go stale again ⇒ re-flagged. Proves the detector isn't a one-shot."""
-    job = _running_job_owned_by("host-a", model="wan_i2v")
+    job = _running_job_owned_by("host-a", model="video-model-b")
     _put_heartbeat("host-a", "gpu", last_seen_age_s=120)
     assert len(node_queue.flag_stale_workers_holding_running_jobs(stale_after_s=30)) == 1
 
@@ -285,7 +285,7 @@ def test_default_threshold_used_when_arg_omitted(monkeypatch):
     """With the default 30 s threshold, a 40 s-stale worker holding work is
     flagged (no explicit arg) — the live call path the sweep uses."""
     monkeypatch.delenv("AI_LEADS_STALE_WORKER_AFTER_S", raising=False)
-    _running_job_owned_by("host-a", model="wan_i2v")
+    _running_job_owned_by("host-a", model="video-model-b")
     _put_heartbeat("host-a", "gpu", last_seen_age_s=40)
     assert len(node_queue.flag_stale_workers_holding_running_jobs()) == 1
 
@@ -333,7 +333,7 @@ def test_tick_runs_the_dead_worker_sweep(monkeypatch):
 
 
 def test_sweep_logs_actionable_dead_worker_line(caplog):
-    _running_job_owned_by("host-a", model="wan_i2v")
+    _running_job_owned_by("host-a", model="video-model-b")
     _put_heartbeat("host-a", "gpu", last_seen_age_s=120)
 
     pool = _dead_worker_pool()
@@ -341,27 +341,28 @@ def test_sweep_logs_actionable_dead_worker_line(caplog):
         pool._sweep_dead_workers()
 
     msgs = [r.getMessage() for r in caplog.records]
-    assert any("DEAD WORKER" in m and "host-a" in m and "wedged" in m for m in msgs), msgs
+    assert any("DEAD WORKER" in m and "host-a" in m and "bounce" in m for m in msgs), msgs
 
 
-def test_sweep_fast_reclaims_the_dead_workers_job_row():
-    """CONTRACT CHANGE (2026-07-16 zombie audit): the sweep no longer leaves the
-    JOB to the slow 600 s lease-reclaim — a flagged (heartbeat-stale) worker's
-    running row is re-queued NOW, front-of-queue, resume-style, so the box's slot
-    frees in ~30 s instead of lease-length. The lease-reclaim remains the
-    backstop; a still-alive claimant is covered by the JobStatusWatcher
-    reassignment self-kill."""
-    job_id = _running_job_owned_by("host-a", model="wan_i2v")
+def test_sweep_flags_but_never_touches_the_job_row():
+    """CONTRACT REVERTED to flag-only. The zombie audit
+    made this sweep also re-queue the flagged worker's rows — and a live
+    incident proved the premise wrong: a heartbeat is a PROCESS-level signal
+    from one thread, and a 30-wide cpu worker under a heavy batch starved its
+    beat past staleness while every job's lease kept renewing — 23 LIVE jobs
+    were yanked mid-flight. Job recovery belongs to the frozen-lease sweep
+    (per-job lease renewal, ~35 s — same speed for a true death, immune to a
+    starved beat thread); this sweep only flags the process for a supervisor
+    bounce."""
+    job_id = _running_job_owned_by("host-a", model="video-model-b")
     _put_heartbeat("host-a", "gpu", last_seen_age_s=120)
 
     pool = _dead_worker_pool()
     pool._sweep_dead_workers()
 
     row = node_queue.get_node_job(job_id)
-    assert row["status"] == "queued"          # fast-reclaimed
-    assert row["claimed_by"] is None          # freed for a healthy claimer
-    assert row["is_priority"] is True         # recovered work runs next
-    assert row["watchdog_retries"] == 0       # a dead process is not a node fault
+    assert row["status"] == "running"         # untouched — flag-only
+    assert row["claimed_by"] == "host-a"      # still owned by the flagged label
 
 
 def test_sweep_noop_with_no_workers():

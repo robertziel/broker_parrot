@@ -87,7 +87,7 @@ def test_check_once_falls_back_to_hard_for_unknown_policy():
     """An OFF row whose stop_policy isn't (yet) implemented must still stop the
     worker — fall back to hard rather than ignore the operator. The bad policy is
     written directly, bypassing set_worker_control's guard. ('drain' became a real
-    policy 2026-07-19, so the unknown example is now 'pause' — still reserved.)"""
+    policy, so the unknown example is now 'pause' — still reserved.)"""
     worker = _worker("fb")
     _running_node_job("fb", queue="cpu")
     with connection() as c, c.cursor() as cur:
@@ -204,6 +204,33 @@ def test_park_gate_resumes_when_enabled(monkeypatch):
     assert done.wait(timeout=5.0), "park gate did not resume after enable"
 
 
+def test_parked_worker_ticks_the_card_quiesce(monkeypatch):
+    """PARK RELEASES THE CARD: while parked, the gate must tick
+    the LLM quiesce so the box's servers are stopped and STAY stopped (a
+    `restart: unless-stopped` sidecar resurrects itself; found live on box-a —
+    65 GB re-loaded 53 min into a park with nothing able to stop it). The
+    builder decides WHAT to tick (gpu-only, kill-switch); the gate's contract
+    is that it ticks whatever the builder returns, every wait iteration."""
+    monkeypatch.setenv("AI_LEADS_WORKER_CONTROL_POLL_S", "0.2")
+    worker = _worker("parkhost4")
+    ticks: list[int] = []
+    monkeypatch.setattr(worker, "_build_park_quiesce",
+                        lambda: (lambda: ticks.append(1)))
+    worker_control.disable_worker("parkhost4", "cpu")   # OFF ⇒ parks
+
+    done = threading.Event()
+    th = threading.Thread(
+        target=lambda: (worker._park_until_enabled(), done.set()), daemon=True,
+    )
+    th.start()
+    deadline = time.time() + 5.0
+    while len(ticks) < 2 and time.time() < deadline:
+        time.sleep(0.05)
+    assert len(ticks) >= 2, "the park gate must tick the quiesce while parked"
+    worker_control.enable_worker("parkhost4", "cpu")
+    assert done.wait(timeout=5.0), "park gate did not resume after enable"
+
+
 # ── robustness: the two swallow-and-survive branches ───────────────────────────
 
 
@@ -252,7 +279,7 @@ def test_check_once_swallows_db_error_returns_false(monkeypatch):
 
 # ── stop_policy="drain": park after the in-flight job, never kill it ──────────
 #
-# The operator ask (2026-07-19): parking a box must stop NEW claims but KEEP the
+# The operator ask: parking a box must stop NEW claims but KEEP the
 # running job ("if already running and changed, keep last job"). hard remains the
 # escalation (the panel's force-kill). Drain: the watcher FLAGS the worker and
 # stays alive (escalation to hard still works); the claim loop parks at its next

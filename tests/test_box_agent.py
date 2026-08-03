@@ -1,6 +1,6 @@
 """Per-box fleet supervisor — ONE source of truth for what runs on a box.
 
-The fleet's bug (2026-07-18): a box's lanes could be parked THREE independent ways —
+The fleet's bug: a box's lanes could be parked THREE independent ways —
 commented-out in the box's compose (host-level, invisible to everything), an OFF row
 in ``worker_controls`` (the DB desired-state the panel reads), or simply not beating
 (``worker_heartbeats``). Nothing reconciled them, so a render worker sat compose-

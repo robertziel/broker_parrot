@@ -107,7 +107,7 @@ def held_server_types(residents: list["Resident"]) -> list[str]:
 
 def describe_box_residency(residents: list["Resident"], *, label: str = "?") -> str:
     """One operator-readable line naming the server kind(s) + model(s) a box holds — so
-    "box-c is running ollama:qwen" (or the two-kind violation) is a visible fact,
+    "box-c is running ollama:an LLM" (or the two-kind violation) is a visible fact,
     logged at claim/heartbeat, not something a human infers from a VRAM dashboard."""
     if not residents:
         return f"[box] {label}: idle — no model resident"
@@ -211,8 +211,14 @@ def probe_box_residents(*, inprocess_model: str | None = None) -> list["Resident
     vllm_url = _llm_factory.resolve_base_url("vllm")
     if vllm_url and vllm_url != ollama_url \
             and llm_probe.probe_llm_servers(vllm_url) == [llm_probe.VLLM]:
+        act = llm_probe.vllm_activity(vllm_url)
+        busy = int(act.get("running") or 0) > 0
         for mid in llm_probe.vllm_served_models(vllm_url):
-            residents.append(Resident(server=llm_probe.VLLM, model=mid, mru=0.0))
+            # A vLLM has no ``ps`` and no idle countdown, so it has no natural recency
+            # key — it held mru=0.0 and therefore ALWAYS lost the keeper vote to an
+            # ollama that had one. Its real signal is in-flight requests.
+            residents.append(Resident(
+                server=llm_probe.VLLM, model=mid, mru=0.0, busy=busy))
     comfyui_url = (env_get("QUEUE_WORKFLOWS_COMFYUI_URL") or get_config().comfyui_url or "").strip()
     if comfyui_url and llm_probe.comfyui_loaded(comfyui_url):
         # ComfyUI exposes no current-checkpoint API, so the model is a kind-sentinel;
@@ -232,6 +238,10 @@ class Resident:
     server: str          # "ollama" | "vllm"
     model: str
     mru: float = 0.0
+    #: Requests IN FLIGHT on this server right now. A busy server is never the
+    #: eviction victim — see :func:`decide_evictions`. Only observable for servers
+    #: that report it (vLLM's /metrics); False elsewhere means "unknown", not "idle".
+    busy: bool = False
 
 
 def decide_evictions(
@@ -239,26 +249,68 @@ def decide_evictions(
     *,
     cap: int = 1,
     desired_server: str | None = None,
+    protected_server: str | None = None,
 ) -> list[Resident]:
-    """The pure decision: which residents must die so distinct models ≤ ``cap``.
+    """The pure decision: which residents must die so resident COPIES ≤ ``cap``.
 
-    Keeper ranking: the desired server type's residents first (operator-set,
-    worker_controls 0013), then most-recently-used. The top ``cap`` MODELS survive;
-    every resident of any other model is evicted. Deterministic and
-    order-independent, so multiple enforcers on one box pick the same keeper."""
-    models: dict[str, list[Resident]] = {}
+    A "copy" is a ``(server, model)`` pair, NOT a model id. This distinction is the
+    whole point of the cap: each server loads its OWN weights, so ollama and vLLM
+    both holding ``chat-model-a:latest`` is TWO copies — ~68 GB, not 34. Grouping by model
+    id made that read as one, so the enforcer waved through a genuine double-load and
+    box-a reached 117.7/121 GB with both servers holding the same model. On a box
+    that has died of OOM before, that is the failure this guard exists to prevent.
+
+    Keeper ranking, best first: the desired server type (operator-set,
+    ``worker_controls`` 0013), then most-recently-used. The top ``cap`` COPIES
+    survive; every other resident is evicted. Deterministic and order-independent, so
+    multiple enforcers on one box pick the same keeper."""
+    # A server that is still LOADING has no traffic, so every "evict the idle one"
+    # vote picks it — which is exactly how the incoming vLLM was killed on every
+    # switch attempt. While a switch is warming, its target is untouchable.
+    copies: dict[tuple[str, str], list[Resident]] = {}
     for r in residents:
-        models.setdefault(r.model, []).append(r)
-    if len(models) <= cap:
+        copies.setdefault((r.server, r.model), []).append(r)
+    if len(copies) <= cap:
         return []
 
-    def rank(item: tuple[str, list[Resident]]):
-        _, rows = item
-        on_desired = any(r.server == desired_server for r in rows) if desired_server else False
-        return (1 if on_desired else 0, max(r.mru for r in rows))
+    # EVICTION COST RULE (found live, the ollama↔vLLM eviction loop): when the SAME
+    # model is resident on ollama AND vLLM, the victim is ALWAYS the ollama copy.
+    # Restoring it is a per-request reload measured in seconds; restoring the vLLM
+    # is a full server start measured in minutes (~15 over NFS). The old ranking
+    # picked by (busy, desired, mru) — ollama residents never read busy, and the
+    # desired default IS ollama — so one stray ollama-resolved job made the enforcer
+    # kill the expensive server to save the cheap copy, every time, forever.
+    dup_models = {m for (srv, m) in copies if srv == "ollama"} & {
+        m for (srv, m) in copies if srv == "vllm"}
+    if dup_models and protected_server != "ollama":
+        # AUDIT DELTA: the switch shield outranks the cost rule. A warming switch
+        # TARGET has no traffic and must not be evicted — even when it is the
+        # cheap-to-restore kind (an ollama-bound switch mid-warm while vLLM still
+        # holds the same model). Cost picks among the UNPROTECTED only.
+        evicted = [r for r in residents
+                   if r.server == "ollama" and r.model in dup_models]
+        survivors = [r for r in residents
+                     if not (r.server == "ollama" and r.model in dup_models)]
+        rest = decide_evictions(
+            survivors, cap=cap, desired_server=desired_server,
+            protected_server=protected_server)
+        return evicted + rest
 
-    keep = {m for m, _ in sorted(models.items(), key=rank, reverse=True)[:cap]}
-    return [r for r in residents if r.model not in keep]
+    def rank(item: tuple[tuple[str, str], list[Resident]]):
+        (server, _model), rows = item
+        # BUSY OUTRANKS EVERYTHING. Evicting a server with requests in flight kills
+        # live work to satisfy a bookkeeping cap — and the nominal desired_server is
+        # only the box DEFAULT now that routing is per node-job, so it must not
+        # outvote observed reality. A vLLM serving three requests beats an idle
+        # ollama that merely happens to be the configured default.
+        protected = server == protected_server if protected_server else False
+        busy = any(getattr(r, "busy", False) for r in rows)
+        on_desired = server == desired_server if desired_server else False
+        return (1 if protected else 0, 1 if busy else 0,
+                1 if on_desired else 0, max(r.mru for r in rows))
+
+    keep = {k for k, _ in sorted(copies.items(), key=rank, reverse=True)[:cap]}
+    return [r for r in residents if (r.server, r.model) not in keep]
 
 
 class ModelResidencyEnforcer:
@@ -282,6 +334,7 @@ class ModelResidencyEnforcer:
         poll_s: float | None = None,
         sleep_fn: Callable[[float], None] = time.sleep,
         label: str = "?",
+        protected_server_fn: Callable[[], str | None] | None = None,
     ) -> None:
         self._collect = collect_fn
         self._unload_ollama = unload_ollama_fn
@@ -289,6 +342,11 @@ class ModelResidencyEnforcer:
         self._free_comfyui = free_comfyui_fn
         self._desired_server = desired_server_fn
         self._cap = DEFAULT_BOX_MODEL_CAP if cap is None else int(cap)
+        #: Optional ``() -> str | None`` naming a server that must not be evicted
+        #: right now — the target of an in-flight switch, which has no traffic yet
+        #: and would otherwise lose every keeper vote. Injected, so this module keeps
+        #: knowing nothing about the switch machine.
+        self._protected_server_fn = protected_server_fn
         self._poll_s = DEFAULT_POLL_S if poll_s is None else float(poll_s)
         self._sleep = sleep_fn
         self._label = label
@@ -298,7 +356,7 @@ class ModelResidencyEnforcer:
     def _report_residency(self, residents: list[Resident]) -> None:
         """INFORM what server kind + model holds this box, but only when it CHANGES —
         so the daemon log carries an operator-readable, up-to-date 'box-c held by
-        ollama:qwen' (or a two-kind violation) without per-poll spam. This is the
+        ollama:an LLM' (or a two-kind violation) without per-poll spam. This is the
         engine answering "what server type is loaded here" out loud."""
         key = tuple(sorted({(r.server, r.model) for r in residents}))
         if key == self._last_reported:
@@ -322,7 +380,16 @@ class ModelResidencyEnforcer:
             desired = self._desired_server()
         except Exception:
             desired = None
-        evict = decide_evictions(residents, cap=self._cap, desired_server=desired)
+        # A switch in flight makes its target untouchable — see decide_evictions.
+        protected = None
+        try:
+            if self._protected_server_fn is not None:
+                protected = self._protected_server_fn()
+        except Exception:
+            log.debug("[model-residency] protected-server probe failed", exc_info=True)
+        evict = decide_evictions(
+            residents, cap=self._cap, desired_server=desired,
+            protected_server=protected)
         if not evict:
             return []
         # Hard-kill FIRST — per-path best-effort so one dead lever doesn't spare the rest.

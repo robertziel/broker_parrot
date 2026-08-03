@@ -127,10 +127,10 @@ def test_reads_vllm_config_from_db_and_builds_vllm_backend():
     assert backend.parallelism == 128
     assert backend.idle_ttl_s == 30                 # vllm gets the configured TTL
     assert len(built) == 1
-    # vllm ⇒ a supervisor was constructed + armed.
-    assert len(supervisors) == 1
-    assert supervisors[0].backend is backend
-    assert supervisors[0].start_calls == 1
+    # SINGLE OWNER (found live): the factory arms NO in-process supervisor — its
+    # blind bracket-clock killed the sidecar mid-request every TTL. The
+    # server-observed VLLMIdleStopper owns vllm idle lifecycle.
+    assert supervisors == []
 
 
 def test_defaults_to_ollama_with_zero_ttl_and_no_supervisor_when_no_row():
@@ -197,10 +197,8 @@ def test_rebuild_after_ttl_when_config_changed_shuts_down_old():
     assert new is not old, "changed snapshot ⇒ rebuild"
     assert new.parallelism == 256
     assert old.shutdown_calls == 1, "the replaced backend was shut down"
-    # vllv→vllv rebuild: old supervisor stopped, a fresh one started.
-    assert len(supervisors) == 2
-    assert supervisors[0].stop_calls == 1
-    assert supervisors[1].start_calls == 1
+    # No supervisors exist on either side of the rebuild (single-owner rule).
+    assert supervisors == []
 
 
 def test_invalidate_forces_rebuild_even_within_ttl():
@@ -223,7 +221,7 @@ def test_invalidate_forces_rebuild_even_within_ttl():
 # ── server-type switch ↔ supervisor lifecycle ────────────────────────────────
 
 
-def test_switch_ollama_to_vllm_builds_a_supervisor():
+def test_switch_to_vllm_builds_NO_supervisor():
     cell, now = _clock()
     worker_control.set_llm_config("h", "gpu", server_type="ollama")
     f, built, supervisors = _make_factory(ttl_s=10.0, now_fn=now)
@@ -237,26 +235,60 @@ def test_switch_ollama_to_vllm_builds_a_supervisor():
     vllm = f.get_backend("h", "gpu")
     assert vllm.server_type == "vllm"
     assert vllm is not ollama
-    assert len(supervisors) == 1, "the switch to vllm built + armed a supervisor"
-    assert supervisors[0].start_calls == 1
+    # CONTRACT FLIP (found live): the factory no longer arms the in-process
+    # LLMSupervisor. Its idle clock is the backend's request bracket, which this
+    # fleet's nodes never touch (they POST the URL directly) — so it read
+    # "idle >= TTL" while the server was flat out and killed the sidecar
+    # MID-REQUEST every few minutes, all night. vLLM idle lifecycle has ONE owner:
+    # the server-observed VLLMIdleStopper (llm_idle_unload).
+    assert supervisors == [], "the factory must not arm the blind in-process reaper"
 
 
-def test_switch_vllm_to_ollama_stops_old_supervisor_and_starts_none():
+def test_switch_vllm_to_ollama_keeps_the_vllm_backend_alive():
+    """CONTRACT CHANGE at migration 0022 (co-resident servers).
+
+    Before 0022 ``llm_server_type`` was a SWITCH: one backend per ``(host, queue)``,
+    so flipping the box to ollama tore the vllm backend down (and freed its VRAM).
+    Under co-residency the column is only the box's DEFAULT — a per-job
+    ``server_types`` preference can still route work to vllm on this same box — so
+    tearing it down on a default change would kill a server that is still in use and
+    reset its request counters mid-flight.
+
+    Reclaim did not disappear, it MOVED: the vllm sidecar's VRAM is now freed by the
+    idle :class:`LLMSupervisor` (``vllm_idle_ttl_s``), which is the correct owner
+    because it reacts to actual idleness rather than to an unrelated config edit.
+    ``BackendFactory.stop()`` still tears down every kind on worker teardown.
+    """
     cell, now = _clock()
     worker_control.set_llm_config("h", "gpu", server_type="vllm", parallelism=8)
     f, built, supervisors = _make_factory(ttl_s=10.0, now_fn=now)
 
     vllm = f.get_backend("h", "gpu")
-    assert len(supervisors) == 1
 
     worker_control.set_llm_config("h", "gpu", server_type="ollama")
     cell[0] += 999.0
     ollama = f.get_backend("h", "gpu")
     assert ollama.server_type == "ollama"
     assert ollama is not vllm
-    assert vllm.shutdown_calls == 1
-    assert supervisors[0].stop_calls == 1, "the old vllm supervisor was stopped"
-    assert len(supervisors) == 1, "ollama gets NO new supervisor"
+    assert vllm.shutdown_calls == 0, "the vllm backend survives a default change"
+    assert supervisors == [], "no in-process supervisors exist at all (single owner)"
+
+    # The same box still hands back the SAME live vllm instance when a job asks for
+    # it explicitly — the identity the request counters and state machine live on.
+    assert f.get_backend("h", "gpu", "vllm") is vllm
+
+
+def test_stop_tears_down_every_co_resident_kind():
+    """Teardown is still total — co-residency must not leak a sidecar on exit."""
+    cell, now = _clock()
+    worker_control.set_llm_config("h", "gpu", server_type="ollama")
+    f, built, supervisors = _make_factory(ttl_s=10.0, now_fn=now)
+
+    ollama = f.get_backend("h", "gpu", "ollama")
+    vllm = f.get_backend("h", "gpu", "vllm")
+    f.stop()
+    assert ollama.shutdown_calls == 1 and vllm.shutdown_calls == 1
+    assert supervisors == []
 
 
 # ── URL normalization ─────────────────────────────────────────────────────────
@@ -304,14 +336,13 @@ def test_stop_shuts_down_all_cached_backends_and_supervisors():
     worker_control.set_llm_config("h1", "gpu", server_type="vllm", parallelism=8)
     worker_control.set_llm_config("h2", "gpu", server_type="ollama")
     f, built, supervisors = _make_factory()
-    b1 = f.get_backend("h1", "gpu")                  # vllm + supervisor
-    b2 = f.get_backend("h2", "gpu")                  # ollama, no supervisor
-    assert len(built) == 2 and len(supervisors) == 1
+    b1 = f.get_backend("h1", "gpu")                  # vllm
+    b2 = f.get_backend("h2", "gpu")                  # ollama
+    assert len(built) == 2 and supervisors == []
 
     f.stop()
     assert b1.shutdown_calls == 1
     assert b2.shutdown_calls == 1
-    assert supervisors[0].stop_calls == 1
     # The cache is cleared — a get after stop rebuilds.
     b1b = f.get_backend("h1", "gpu")
     assert b1b is not b1
@@ -358,7 +389,8 @@ def test_real_listener_invalidates_on_notify(monkeypatch):
     f, built, _ = _make_factory(ttl_s=999.0)          # huge TTL: only NOTIFY can refresh
     assert f._listener_enabled is True
 
-    entry_key = ("smoke", "gpu")
+    # Cache keys carry the resolved server KIND since 0022 (co-resident backends).
+    entry_key = ("smoke", "gpu", "ollama")
     f.get_backend("smoke", "gpu")                     # build + cache the entry
     f.start()
     try:
@@ -417,8 +449,8 @@ def test_default_build_threads_vllm_lifecycle_hooks():
     assert backend._kill_fn() is True
     assert stopped == [True]
     # ensure_up (the cold-start LOADING transition) must route to start_fn.
-    backend._ensure_up_fn("Qwen/Qwen2.5-VL")
-    assert started == ["Qwen/Qwen2.5-VL"]
+    backend._ensure_up_fn("an LLM/a vision-language model")
+    assert started == ["an LLM/a vision-language model"]
 
 
 def test_default_build_vllm_without_hooks_uses_builtin_defaults():

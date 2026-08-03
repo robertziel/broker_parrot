@@ -229,6 +229,70 @@ def loaded_models_info(
         return []
 
 
+def vllm_activity(
+    base_url: str | None, *, timeout_s: float = DEFAULT_TIMEOUT_S, get_text_fn=None,
+) -> dict:
+    """vLLM's SERVER-SIDE use signals, from its Prometheus endpoint.
+
+    Returns ``{"served": bool, "running": int, "finished": int}``:
+
+      * ``running``  — ``vllm:num_requests_running``, in flight RIGHT NOW;
+      * ``finished`` — ``vllm:request_success_total``, monotonic completions.
+
+    Together they answer "has anyone used this server since I last looked?" for ANY
+    client, which is the property an in-process request counter cannot have (the
+    node POSTs the URL directly, as do host-internal callers and other projects on
+    the box). This is vLLM's analog of ollama's ``/api/ps`` ``expires_at``; see
+    :mod:`queue_workflows.llm_idle_unload`.
+
+    Metric names are matched by PREFIX because vLLM labels them per model
+    (``vllm:num_requests_running{model_name="..."}``) and a box may serve several —
+    the values are summed. Never raises: an unreachable or unparseable endpoint
+    returns ``served=False``, which the idle stopper treats as "do not act"."""
+    out = {"served": False, "running": 0, "finished": 0}
+    if not base_url:
+        return out
+    root = str(base_url).rstrip("/")
+    try:
+        text = (get_text_fn or _default_get_text)(f"{root}/metrics", timeout_s)
+    except Exception:
+        log.debug("[llm-probe] %s/metrics did not answer", root)
+        return out
+    if not text:
+        return out
+    running = 0.0
+    finished = 0.0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            value = float(line.rsplit(" ", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        if line.startswith("vllm:num_requests_running"):
+            running += value
+        elif line.startswith("vllm:request_success_total"):
+            finished += value
+    out["served"] = True
+    out["running"] = int(running)
+    out["finished"] = int(finished)
+    return out
+
+
+def _default_get_text(url: str, timeout_s: float) -> str:
+    """GET a URL and return its body, or "" on any failure. stdlib-only (urllib) —
+    :mod:`llm_probe` must never grow an HTTP dependency."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_s) as resp:
+            if getattr(resp, "status", 200) != 200:
+                return ""
+            return resp.read().decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
 def vllm_served_models(
     base_url: str | None,
     *,
@@ -434,6 +498,7 @@ def endpoint_is_healthy(base_url: str | None, servers: list[str]) -> bool:
 __all__ = [
     "OLLAMA",
     "VLLM",
+    "vllm_activity",
     "COMFYUI",
     "INPROCESS",
     "COMFYUI_MODEL_VRAM_FLOOR",

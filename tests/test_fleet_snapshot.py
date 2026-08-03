@@ -29,11 +29,11 @@ def test_snapshot_returns_seeded_capacity_rows() -> None:
         host_label="box-a",
         queue="gpu",
         concurrency=1,
-        current_model="qwen",
-        known_models=["qwen", "sdxl"],
+        current_model="an LLM",
+        known_models=["an LLM", "sdxl"],
         llm_servers_available=["ollama", "vllm"],
         vram_total_mb=24000,
-        fits_models=["qwen"],
+        fits_models=["an LLM"],
     )
     node_queue.upsert_worker_heartbeat(
         host_label="box-b", queue="cpu", concurrency=4,
@@ -46,10 +46,10 @@ def test_snapshot_returns_seeded_capacity_rows() -> None:
     }
 
     gpu = _by_host(rows, "box-a", "gpu")
-    assert gpu["current_model"] == "qwen"
+    assert gpu["current_model"] == "an LLM"
     assert "vllm" in gpu["llm_servers_available"]
     assert gpu["vram_total_mb"] == 24000
-    assert gpu["fits_models"] == ["qwen"]
+    assert gpu["fits_models"] == ["an LLM"]
     assert gpu["fresh"] is True
     assert gpu["flagged_dead"] is False
 

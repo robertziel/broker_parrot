@@ -23,29 +23,48 @@ from queue_workflows.db import connection
 from tests._helpers import make_run
 
 
-# ── the pure victim picker (keep oldest, reap newest) ─────────────────────
+# ── the pure victim picker (keep freshest lease, reap stalest) ────────────
 
 
-def test_pick_victims_keeps_oldest_reaps_newest():
-    rows = [("j1", 100), ("j2", 300), ("j3", 200)]      # (id, started ordinal)
-    assert set(node_queue.pick_over_claim_victims(rows, 1)) == {"j2", "j3"}
-    assert node_queue.pick_over_claim_victims(rows, 2) == ["j2"]   # only the newest
+def test_pick_victims_keeps_freshest_lease_reaps_stalest():
+    rows = [("j1", 100, 500), ("j2", 300, 900), ("j3", 200, 700)]
+    # (id, started ordinal, lease ordinal) — j2 renews most recently → kept
+    assert set(node_queue.pick_over_claim_victims(rows, 1)) == {"j1", "j3"}
+    assert node_queue.pick_over_claim_victims(rows, 2) == ["j1"]  # stalest only
+
+
+def test_pick_victims_zombie_regression_live_render_is_kept():
+    """a worker recreate left the DEAD predecessor's OLDER row on
+    the slot next to the fresh worker's LIVE render. Keep-oldest-``started_at``
+    reaped the live render and kept the zombie — and the reaper's 10 s cadence
+    always beats the ~35 s frozen-lease sweep that would have cleaned the
+    zombie first. Lease freshness is the one signal that tells them apart (the
+    zombie's lease froze at claim time; the live job renews every ~10 s)."""
+    zombie = ("old-zombie", 100, 610)    # older started_at, lease frozen
+    live = ("fresh-live", 160, 1200)     # newer job, lease renewing
+    assert node_queue.pick_over_claim_victims([zombie, live], 1) == ["old-zombie"]
 
 
 def test_pick_victims_none_when_within_capacity():
-    assert node_queue.pick_over_claim_victims([("a", 1), ("b", 2)], 2) == []
-    assert node_queue.pick_over_claim_victims([("a", 1)], 5) == []
+    assert node_queue.pick_over_claim_victims([("a", 1, 9), ("b", 2, 9)], 2) == []
+    assert node_queue.pick_over_claim_victims([("a", 1, 9)], 5) == []
 
 
-def test_pick_victims_tie_break_by_id_is_deterministic():
-    rows = [("b", 5), ("a", 5), ("c", 5)]               # equal start → id order
-    assert node_queue.pick_over_claim_victims(rows, 1) == ["b", "c"]  # keep "a"
+def test_pick_victims_equal_lease_keeps_oldest_started_then_id():
+    rows = [("b", 5, 100), ("a", 5, 100), ("c", 4, 100)]
+    # equal lease → the old keep-oldest-started rule, then id order
+    assert node_queue.pick_over_claim_victims(rows, 1) == ["a", "b"]  # keep "c"
 
 
-def test_pick_victims_none_started_at_is_kept_not_reaped():
-    # a running row that somehow lacks started_at is anomalous — keep it, don't
-    # aggressively reap (the lease/dead-worker sweeps own that case)
-    rows = [("late", 100), ("nostart", None)]
+def test_pick_victims_none_lease_is_reaped_first():
+    # a running row with NO lease is broken state — a live claimant always
+    # carries one — so it is the safest victim (requeue = clean repair)
+    rows = [("broken", 100, None), ("live", 200, 900)]
+    assert node_queue.pick_over_claim_victims(rows, 1) == ["broken"]
+
+
+def test_pick_victims_none_started_at_still_kept_on_equal_lease():
+    rows = [("late", 100, 900), ("nostart", None, 900)]
     assert node_queue.pick_over_claim_victims(rows, 1) == ["late"]
 
 
@@ -68,15 +87,18 @@ def _set_started(ids_oldest_first):
 
 
 def _over_claim(host="box-a-gpu", n=3):
-    """Force an over-claim: claim n gpu jobs on one box with the arbiter OFF
-    (max_running=None) — simulating a prevention layer that failed."""
+    """Force an over-claim: claim n gpu jobs on one box with BOTH arbiters OFF
+    (max_running=None + the kind-law opt-out) — simulating a prevention layer
+    that failed, which since is exactly what an old wheel or an
+    opted-out caller looks like. The reaper is the RECOVERY for that state."""
     run = make_run()
     for i in range(n):
         node_queue.enqueue_node_job(run_id=run, node_id=f"n{i}", node_module="x",
                                     queue="gpu", priority=100)
     claimed = []
     for _ in range(n):
-        j = node_queue.claim_next_gpu_job(0, host=host, max_running=None)
+        j = node_queue.claim_next_gpu_job(0, host=host, max_running=None,
+                                          kind_caps={})
         assert j is not None
         claimed.append(j["id"])
     return run, claimed

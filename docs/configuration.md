@@ -42,6 +42,7 @@ without resetting the rest.
 | `project` | `""` (or `QUEUE_WORKFLOWS_PROJECT`) | Tenant tag on every queue row (migration 0017) so a shared broker Postgres can pool multiple projects — see [The `project` tenant tag vs `db_namespace`](#the-project-tenant-tag-vs-db_namespace) below. |
 | `ingest_queues` | `{"fetch", "load"}` | The valid ingest-family queue names (host-side validation since migration 0008 dropped the DB `CHECK`). **Rejects reuse of the reserved DAG queue names `cpu`/`gpu`** — raises `ValueError` naming the offending set. |
 | `ingest_default_budget_s` | `3600` | Wall-clock budget (seconds) `claim_worker.budget_for` applies to ingest queues other than the built-in `fetch`/`load`. |
+| `cpu_worker_threads` | `1` | *(lane width — see also the per-job `cpu_slots` column, migration 0024, for how much of a lane ONE job takes.)* Node-jobs ONE **cpu** claim-worker process runs at a time. `1` = the serial worker (no pool is created). `N > 1` gives the cpu lane an in-process pool of N long-lived worker threads. Env twin `QUEUE_WORKFLOWS_CPU_WORKER_THREADS` (wins), CLI `--threads N`. gpu/ingest are unaffected. **For CPU-bound pure-Python nodes the GIL serialises threads — prefer N processes** (`deploy/run_claim_lane.sh`); raise this for IO-bound cpu nodes. Budget ≈ 4–5 DB connections per thread. See [deployment](deployment.md) §2.5. |
 | `db_backend` | `"sqlite"` (or `QUEUE_WORKFLOWS_DB_BACKEND`) | Which storage engine the store resolves to: `"sqlite"` / `"pg"` (relational, via the dialect seam) or `"redis"` / `"mongodb"` (the `StorageBackend` SPI). See [env-var names](#env-var-names--canonical-queue_workflows-legacy-ai_leads-fallback) below for the one breaking exception. |
 | `db_namespace` | `""` | Logical namespace isolating this tenant's jobs on a **shared** redis/mongodb server (every key/collection is scoped by it); `""` means the literal namespace `"default"`. For `pg`/`sqlite` it scopes SPI rows via a `namespace` column. Inverse of `project` — see below. |
 | `cancel_orphan_queued_jobs` | `False` | When `True`, `NodePool` periodically flips `queued` node-jobs whose parent run is already `cancelled`/`failed` to `cancelled`, cleaning up queue gauges. Default preserves pre-0.4 behaviour byte-for-byte. |
@@ -210,7 +211,7 @@ from queue_workflows.model_registry import ModelSpec
 queue_workflows.configure(
     db_url_env="MYAPP_DB_URL",
     db_backend="pg",                                   # opt in — v1.0.0 default is sqlite
-    video_model_ids=frozenset({"wan_i2v", "ltx_flf"}),
+    video_model_ids=frozenset({"video-model-b", "video-model-c"}),
     node_module_package="myapp.nodes",
     container_prefix="myapp-",
 )
