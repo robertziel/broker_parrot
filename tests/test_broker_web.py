@@ -12,6 +12,7 @@ via HTTP responses / separate reads instead.
 from __future__ import annotations
 
 import json
+import re
 import threading
 import urllib.request
 from http.server import ThreadingHTTPServer
@@ -305,3 +306,138 @@ def test_bounded_server_pool_is_capped_and_shuts_down():
     finally:
         httpd.server_close()
     assert httpd._pool._shutdown  # server_close() tears the pool down
+
+
+# ── panel UX pass: chips, filters, responsive,
+#    refresh control, contrast, semantics, scannability ──────────────────────
+
+
+def test_panel_project_chips_survive_high_volume(base_url):
+    """Filter chips must come from a DISTINCT-project view, not the newest-500 jobs:
+    a project whose only job is old still gets a chip (its jobs still count in the
+    KPIs, so a missing chip is an unreachable filter) — and the capped jobs table
+    says how much it is hiding instead of silently truncating."""
+    from queue_workflows.broker_service import orchestrator as _orch
+
+    _orch.submit_job(project="zz-ancient", resource="cpu")
+    for _ in range(501):
+        _orch.submit_job(project="alpha", resource="cpu")
+    _, html_body = _get(base_url, "/")
+    assert 'href="/?project=zz-ancient"' in html_body  # chip survives 501 newer jobs
+    assert "newest 50 of 502" in html_body  # the cap is visible, not silent
+
+
+def test_panel_workers_respect_project_filter(base_url):
+    """``?project=`` scopes the whole panel. The workers table (and /api/workers)
+    used to ignore it — a filtered view silently showed every tenant's fleet."""
+    _post(base_url, "/api/ask", {"worker_id": "w-alpha", "project": "Alpha", "resource": "cpu"})
+    _post(base_url, "/api/ask", {"worker_id": "w-beta", "project": "Beta", "resource": "cpu"})
+    _, filtered = _get(base_url, "/?project=Alpha")
+    assert "w-alpha" in filtered and "w-beta" not in filtered
+    _, unfiltered = _get(base_url, "/")
+    assert "w-beta" in unfiltered
+    _, jw = _get(base_url, "/api/workers?project=Alpha")
+    workers = json.loads(jw)["workers"]
+    assert workers and all(w["project"] == "Alpha" for w in workers)
+
+
+def test_panel_tables_scroll_inside_wrapper(base_url):
+    """Wide tables scroll inside their own container, never the page — at 390px the
+    document was side-scrolling (scrollWidth 664 vs clientWidth 390), pushing the
+    status/worker columns off-screen."""
+    _post(base_url, "/api/submit", {"project": "A", "resource": "cpu"})
+    _post(base_url, "/api/ask", {"worker_id": "w1", "project": "A", "resource": "cpu"})
+    _, html_body = _get(base_url, "/")
+    assert html_body.count('<div class="tablewrap">') == 2  # jobs + workers
+    assert "overflow-x:auto" in html_body
+
+
+def test_panel_refresh_interval_control(base_url):
+    """WCAG 2.2.1/2.2.4: a self-refreshing page must let the operator slow or stop
+    it. ``?refresh=`` is the no-JS control — clamped int, malformed falls back to
+    the default, 0 pauses (no meta tag at all)."""
+    _, default = _get(base_url, "/")
+    assert '<meta http-equiv="refresh" content="5">' in default
+    _, slow = _get(base_url, "/?refresh=30")
+    assert '<meta http-equiv="refresh" content="30">' in slow
+    _, paused = _get(base_url, "/?refresh=0")
+    assert 'http-equiv="refresh"' not in paused and "paused" in paused
+    _, junk = _get(base_url, "/?refresh=abc")
+    assert '<meta http-equiv="refresh" content="5">' in junk  # malformed -> default, never a 500
+    _, huge = _get(base_url, "/?refresh=999999")
+    assert '<meta http-equiv="refresh" content="3600">' in huge  # clamped ceiling
+    # the two knobs propagate through each other's links
+    _post(base_url, "/api/submit", {"project": "Alpha", "resource": "cpu"})
+    _, both = _get(base_url, "/?project=Alpha&refresh=30")
+    assert 'href="/?refresh=30"' in both  # the "all" chip keeps the cadence
+    assert 'href="/?project=Alpha&amp;refresh=30"' in both  # the project chip keeps both
+
+
+def test_panel_contrast_meets_aa():
+    """Every chip text colour must hit WCAG AA 4.5:1 on its own background — parsed
+    from the REAL ``_CSS`` (tokens resolved through ``var()``), so a future palette
+    tweak that regresses readability fails here instead of in an operator's squint.
+    Baseline audit: all six job chips + all three worker chips sat at 2.88–3.77:1."""
+    css = _web._CSS
+    tokens = dict(re.findall(r"--([a-z-]+):(#[0-9a-fA-F]{3,6})", css))
+
+    def resolve(v: str) -> str:
+        m = re.fullmatch(r"var\(--([a-z-]+)\)", v.strip())
+        return tokens[m.group(1)] if m else v.strip()
+
+    def lum(h: str) -> float:
+        h = h.lstrip("#")
+        h = "".join(c * 2 for c in h) if len(h) == 3 else h
+        r, g, b = (int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+        lin = lambda c: c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4  # noqa: E731
+        return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+
+    def ratio(fg: str, bg: str) -> float:
+        hi, lo = sorted((lum(fg), lum(bg)), reverse=True)
+        return (hi + 0.05) / (lo + 0.05)
+
+    failures = []
+    for cls in ("s-queued", "s-granted", "s-running", "s-done", "s-failed", "s-killed",
+                "w-waiting", "w-running", "w-dead"):
+        body = re.search(r"\." + cls + r"\{([^}]*)\}", css).group(1)
+        bg = resolve(re.search(r"background:([^;}]+)", body).group(1))
+        fg = resolve(re.search(r"(?<!-)color:([^;}]+)", body).group(1))
+        if ratio(fg, bg) < 4.5:
+            failures.append(f"{cls}: {fg} on {bg} = {ratio(fg, bg):.2f}:1")
+    # status/muted text that sits directly on the white card (th, KPI counts)
+    for name in ("muted", "success", "danger", "pending", "ink-soft"):
+        if ratio(tokens[name], tokens["card"]) < 4.5:
+            failures.append(f"--{name} on --card = {ratio(tokens[name], tokens['card']):.2f}:1")
+    assert not failures, "WCAG AA contrast failures:\n" + "\n".join(failures)
+
+
+def test_panel_a11y_semantics(base_url):
+    """Screen-reader basics on the panel: every ``th`` carries ``scope=col``, each
+    table is named by a caption, and the active project chip is marked
+    ``aria-current`` (colour alone must not carry the selection)."""
+    _post(base_url, "/api/ask", {"worker_id": "w1", "project": "Alpha", "resource": "cpu"})
+    _post(base_url, "/api/submit", {"project": "Alpha", "resource": "cpu"})
+    _, html_body = _get(base_url, "/?project=Alpha")
+    assert 'aria-current="page"' in html_body
+    assert html_body.count("<caption") == 2
+    assert not re.search(r"<th(?![a-z])(?![^>]*scope=)", html_body)  # (?![a-z]) keeps <thead> out
+
+
+def test_panel_full_ids_and_relative_age(base_url):
+    """The 8-char job id keeps the FULL id in ``title`` (hover/copy affordance), and
+    liveness columns read as relative ages ("3s ago") with the absolute timestamp
+    preserved in ``title`` — an operator eyeballs staleness, not wall-clock math."""
+    _, sub = _post(base_url, "/api/submit", {"project": "Alpha", "resource": "cpu"})
+    _post(base_url, "/api/ask", {"worker_id": "w-age", "project": "Alpha", "resource": "cpu"})
+    _, html_body = _get(base_url, "/")
+    assert f'title="{sub["job_id"]}"' in html_body
+    assert "ago</td>" in html_body
+    assert re.search(r'title="20\d\d-\d\d-\d\d [0-9:]{8} UTC"', html_body)
+
+
+def test_panel_empty_state_hints(base_url):
+    """First-run empty states point at the calls that populate them instead of
+    dead-ending ("No jobs on the queue.")."""
+    _, html_body = _get(base_url, "/")
+    assert "POST /api/submit" in html_body
+    assert "/api/ask" in html_body

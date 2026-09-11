@@ -149,10 +149,16 @@ def _queued_gpu_job(model: str) -> tuple[str, str]:
     return run_id, job_id
 
 
-def _fresh_gpu_worker(host: str, fits: list[str], vram_mb: int = 32768) -> None:
+def _fresh_gpu_worker(host: str, fits: list[str], vram_mb: int = 32768,
+                      knows: list[str] | None = None) -> None:
+    """``knows`` = what the box HOLDS; ``fits`` = what its VRAM can load. They are
+    different questions, and the unassignable sweep now reports different verdicts for
+    them, so a fixture that leaves `known_models` empty cannot express "has it but cannot
+    hold it". Defaults to ``fits`` — a box that fits a model certainly holds it."""
     node_queue.upsert_worker_heartbeat(
         host_label=host, queue="gpu", concurrency=1,
         vram_total_mb=vram_mb, fits_models=fits,
+        known_models=fits if knows is None else knows,
     )
 
 
@@ -166,7 +172,9 @@ def _age_heartbeat(host: str, seconds: int) -> None:
 
 
 def test_unassignable_flagged_when_no_machine_fits():
-    _fresh_gpu_worker("box-a", fits=["small", "mid"], vram_mb=16384)
+    # The box HOLDS "huge" and cannot load it — the genuine VRAM verdict.
+    _fresh_gpu_worker("box-a", fits=["small", "mid"], vram_mb=16384,
+                      knows=["small", "mid", "huge"])
     _run, job_id = _queued_gpu_job("huge")
 
     flagged = node_queue.flag_unassignable_gpu_jobs()
@@ -375,3 +383,21 @@ def test_node_pool_unassignable_sweep_emits_event_and_is_gated(monkeypatch):
     assert flag_calls["n"] <= 1  # interval gate suppresses the repeat sweeps
     # Gated sweeps do no work ⇒ no events leak through.
     assert events == []
+
+
+def test_the_verdict_says_SERVES_when_no_box_holds_the_model_at_all():
+    """Possession and capacity are different failures and must read differently.
+
+    This always blamed VRAM. Once the claim gate began advertising OBSERVED capability,
+    that became wrong far more often than right: a model installed nowhere was reported as
+    "none of N live GPU machine(s) has enough VRAM" by a fleet with plenty of it. An
+    operator reading that goes shopping for a bigger box.
+    """
+    _fresh_gpu_worker("box-b", fits=["small"], vram_mb=98304, knows=["small"])
+    _run, job_id = _queued_gpu_job("never-installed")
+
+    node_queue.flag_unassignable_gpu_jobs()
+    reason = node_queue.get_node_job(job_id)["unassignable_reason"]
+
+    assert "SERVES" in reason and "never-installed" in reason, reason
+    assert "VRAM" not in reason, f"blamed capacity for a possession problem: {reason}"

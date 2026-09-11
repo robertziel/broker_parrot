@@ -474,7 +474,7 @@ def test_a_restart_mid_switch_RE_ENTERS_the_out_of_service_window(tmp_path):
     """The switch state was per-process, so a worker restart mid-switch forgot it —
     the fresh process resumed claiming while the incoming server warmed, which is
     the exact race the machine exists to close."""
-    path = str(tmp_path / "server_switch_spark-gpu.json")
+    path = str(tmp_path / "server_switch_box-a-gpu.json")
     wall = [1000.0]
     m1 = sw.ServerSwitch(label="box-a-gpu", persist_path=path,
                          wall_clock_fn=lambda: wall[0])
@@ -594,7 +594,7 @@ def test_the_lease_tick_never_clobbers_the_switch_slot(monkeypatch):
 
 
 def test_switch_timeouts_are_env_overridable(monkeypatch):
-    """box-b loads vLLM weights over NFS: 887 s against what was a 905 s window —
+    """A box loading vLLM weights from network storage took 887 s against what was a 905 s window —
     18 s of margin. The budget must be a deployment knob, not a constant edit."""
     from queue_workflows import claim_worker
     monkeypatch.setenv("QUEUE_WORKFLOWS_SWITCH_WARM_TIMEOUT_S", "2400")
@@ -626,7 +626,7 @@ def test_a_resumed_vllm_switch_on_a_vllm_less_box_is_ABANDONED(tmp_path, monkeyp
     resumed a persisted vllm switch after a restart and sat OUT OF SERVICE warming
     a server that can never exist."""
     from queue_workflows import claim_worker
-    path = str(tmp_path / "server_switch_beelink-gpu.json")
+    path = str(tmp_path / "server_switch_box-c-gpu.json")
     m1 = sw.ServerSwitch(label="box-c-gpu", persist_path=path)
     m1.request("vllm")
 

@@ -219,3 +219,115 @@ def test_redis_snapshot_reflects_state(redis_ingest):
     snap = ingest_store.ingest_snapshot()["queues"]["fetch"]
     assert snap["queued"] == 1 and snap["running"] == 1
     assert snap["workers"] >= 1
+
+
+# ── SPI seam logic, hermetic: a stub backend, no server ─────────────────────
+# The redis/mongo cases above need live servers and SKIP without them, which
+# left the seam's mapping logic (priority inversion, row re-inflation, the
+# reclaim projection) uncovered on the hermetic gate. A stub StorageBackend
+# pins those contracts with no server at all.
+
+
+class _StubBackend:
+    def __init__(self):
+        self.enqueued: list[tuple] = []
+        self.jobs: dict[str, dict] = {}
+        self.calls: list[tuple] = []
+        self.reclaim_ids: list[str] = []
+
+    def enqueue(self, queue, payload, *, job_id, priority):
+        self.enqueued.append((queue, payload, job_id, priority))
+        self.jobs[job_id] = {
+            "id": job_id, "queue": queue, "payload": payload, "priority": priority,
+        }
+        return job_id
+
+    def get(self, job_id):
+        return self.jobs.get(job_id)
+
+    def claim(self, queue, host, *, lease_s):
+        self.calls.append(("claim", queue, host, lease_s))
+        for j in self.jobs.values():
+            if j["queue"] == queue:
+                return j
+        return None
+
+    def renew_lease(self, job_id, host, *, lease_s):
+        self.calls.append(("renew_lease", job_id, host, lease_s))
+        return True
+
+    def mark_completed(self, job_id, *, result=None):
+        self.calls.append(("mark_completed", job_id, result))
+        return self.jobs.get(job_id)
+
+    def mark_failed(self, job_id, *, error=None):
+        self.calls.append(("mark_failed", job_id, error))
+        return self.jobs.get(job_id)
+
+    def reclaim_expired(self):
+        return list(self.reclaim_ids)
+
+    def counts(self, queue):
+        return {"queued": 3, "running": 1}
+
+    def workers(self, queue):
+        return ["w1", "w2"]
+
+
+@pytest.fixture
+def stub_spi(monkeypatch):
+    stub = _StubBackend()
+    monkeypatch.setattr(ingest_store, "_use_spi", lambda: True)
+    monkeypatch.setattr(ingest_store, "_backend", lambda: stub)
+    queue_workflows.register_ingest_task("probe_task", _task)
+    return stub
+
+
+def test_spi_enqueue_negates_priority_and_shapes_payload(stub_spi):
+    # Ingest orders priority ASC (lower = sooner); the SPI claims DESC. The seam
+    # must store the negation or "lower runs first" silently inverts on redis/mongo.
+    jid = ingest_store.enqueue_ingest_job(
+        task_name="probe_task", queue="fetch", reason="manual",
+        priority=25, args={"k": 1},
+    )
+    (queue, payload, job_id, priority), = stub_spi.enqueued
+    assert queue == "fetch" and job_id == jid
+    assert priority == -25
+    assert payload == {"task_name": "probe_task", "reason": "manual", "args": {"k": 1}}
+
+
+def test_spi_claim_reinflates_row_with_defaults(stub_spi):
+    # A claimed SPI Job comes back in the flat ingest-row shape execute_ingest_job
+    # reads; a payload missing reason/args re-inflates to the documented defaults.
+    jid = ingest_store.enqueue_ingest_job(task_name="probe_task", queue="fetch")
+    stub_spi.jobs[jid]["payload"] = {"task_name": "probe_task"}  # sparse payload
+    row = ingest_store.claim_next_ingest_job("fetch", host="h1", lease_s=42)
+    expected = {"id": jid, "task_name": "probe_task", "queue": "fetch",
+                "reason": "tick", "args": {}}
+    assert expected.items() <= row.items()  # re-inflated shape (superset ok)
+    assert ("claim", "fetch", "h1", 42.0) in stub_spi.calls
+
+
+def test_spi_get_and_terminal_delegation(stub_spi):
+    assert ingest_store.get_ingest_job("missing") is None
+    jid = ingest_store.enqueue_ingest_job(task_name="probe_task", queue="load")
+    assert ingest_store.get_ingest_job(jid)["id"] == jid
+    assert ingest_store.renew_ingest_lease(jid, "h1", lease_s=7) is True
+    ingest_store.mark_ingest_completed(jid, result={"ok": 1})
+    ingest_store.mark_ingest_failed(jid, error="boom")
+    kinds = [c[0] for c in stub_spi.calls]
+    assert {"renew_lease", "mark_completed", "mark_failed"} <= set(kinds)
+
+
+def test_spi_reclaim_projects_id_task_queue_and_skips_vanished(stub_spi):
+    jid = ingest_store.enqueue_ingest_job(task_name="probe_task", queue="fetch")
+    stub_spi.reclaim_ids = [jid, "vanished-id"]  # a row deleted between calls
+    out = ingest_store.reclaim_expired_ingest_leases()
+    assert out == [{"id": jid, "task_name": "probe_task", "queue": "fetch"}]
+
+
+def test_spi_snapshot_shape(stub_spi):
+    snap = ingest_store.ingest_snapshot()
+    assert set(snap["queues"]) == set(queue_workflows.get_config().ingest_queues)
+    q = snap["queues"]["fetch"]
+    assert q == {"queued": 3, "running": 1, "completed": 0, "failed": 0, "workers": 2}

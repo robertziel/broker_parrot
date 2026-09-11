@@ -177,7 +177,7 @@ This is a genuinely separate control plane from Part A, not a rewrite of it — 
 | `sweep_unhealthy(*, stale_s)` | The health check: mark every worker whose heartbeat is older than `stale_s` as `dead`, then re-queue any `granted`/`running` job whose holder is now dead **or** whose grant lease lapsed. Returns the re-queued job ids. This is the sole recovery path for a worker that died mid-job. |
 | `get_job(job_id)` / `get_worker(worker_id)` | Point reads. |
 | `list_jobs(*, project=None, status=None, limit=100)` | Recent jobs, newest first, optional filters. Read-only, powers the panel + `/api/jobs`. |
-| `list_workers()` | All registered workers, ordered by resource then id. |
+| `list_workers(project=…)` | All registered workers (optionally one project's), ordered by resource then id. |
 | `queue_counts(*, project=None)` | Per `(resource, status)` counts — powers the panel KPI strip. |
 
 **Client gate** (`permission.py`) — see next section.

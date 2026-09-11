@@ -1,6 +1,6 @@
 """Don't pay a cold start for one job — the vLLM amortisation rule.
 
-vLLM reloads its weights on every start (~7 min for a 35 GB model on unified-memory GPU box); ollama
+vLLM reloads its weights on every start (~7 min for a 35 GB model on a unified-memory GPU box); ollama
 swaps a model in seconds. So "prefer vLLM" cannot mean "start vLLM for whatever
 turns up next" — a single job would wait longer for the server than the work takes.
 
@@ -200,7 +200,7 @@ def test_resolve_for_job_never_dispatches_at_a_dead_server(monkeypatch):
 
 
 def test_a_model_less_job_treats_a_LIVE_vllm_as_warm(monkeypatch):
-    """A stamped-but-model-less LLM caller (compose_region_report — its node names
+    """A stamped-but-model-less LLM caller (compose_report — its node names
     no model) must not be amortisation-gated away from a vLLM that is ALREADY
     serving: the server being up means the weights are resident, so there is
     nothing to amortise — and routing its calls to ollama instead summons a SECOND
@@ -427,7 +427,7 @@ def test_default_kind_reads_are_cached(monkeypatch):
 
 def test_a_recently_alive_kind_survives_one_probe_blip(monkeypatch):
     """Found live: one timed-out vLLM GET rerouted dispatches to ollama, which
-    loaded a second an LLM copy, which fed the eviction loop. Recently-alive rides
+    loaded a second copy of the LLM, which fed the eviction loop. Recently-alive rides
     through a blip; never-alive gets no grace."""
     from queue_workflows import llm_probe
     from queue_workflows.llm_backends import factory
@@ -453,9 +453,9 @@ def test_a_recently_alive_kind_survives_one_probe_blip(monkeypatch):
 
 
 def test_a_no_preference_job_uses_the_LIVE_vllm_not_the_ollama_default(monkeypatch):
-    """Found live (box-b, 105/121 GB): compose_region_report — an LLM caller with
+    """Found live, on a box already short of memory: compose_report — an LLM caller with
     no model field, so nothing ever stamps server_types on it — resolved to the box
-    default ollama (whose daemon ALWAYS answers) and loaded a second 29 GB an LLM copy
+    default ollama (whose daemon ALWAYS answers) and loaded a second 29 GB copy of the LLM
     beside the actively-serving vLLM. A live vLLM only answers when it holds the
     weights: it IS the active server, and the default path must route to it."""
     from queue_workflows.llm_backends import factory

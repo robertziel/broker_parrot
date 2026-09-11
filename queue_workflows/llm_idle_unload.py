@@ -484,9 +484,9 @@ class ParkQuiesce:
 
     History, because the softer versions both failed live:
 
-    * Rule #1 (no quiesce at all): box-a parked 19:29; its vllm sidecar
+    * Rule #1 (no quiesce at all): a parked box's vllm sidecar
       crash-looped (``restart: unless-stopped`` resurrects every clean
-      self-exit) and re-loaded 65 GB at 21:13 with nothing able to stop it —
+      self-exit) and re-loaded 65 GB ~2 h later with nothing able to stop it —
       the only stop mechanism (the idle stopper) lives in the gpu claim
       worker, which was parked.
     * Rule #2 (idle-reaper composition, activity-guarded for peers): killed
@@ -509,7 +509,47 @@ class ParkQuiesce:
 
     Each half is independently best-effort and swallows its own errors, so
     :meth:`tick` never raises — it lives on the park gate's wait loop.
+
+    THE ONE EXEMPTION — our OWN in-flight work. ``stop_policy='drain'``
+    (what the panel's park lever writes) means "finish what you are holding, claim
+    nothing new", so a parked worker legitimately keeps running the job it already had.
+    Rule #3 then told ollama to unload the very model that job was streaming from —
+    290 ``keep_alive:0`` posts in 30 minutes, one identical log line at 0.2 Hz.
+
+    What that actually cost, measured rather than assumed: ollama does NOT refuse the
+    unload. It applies the zero keep-alive at the REQUEST BOUNDARY — the runner exits
+    when the in-flight call ends (``Stopping...`` means "expiry scheduled, runner
+    draining", not "refused") — and the job's NEXT call then COLD-RELOADS 34 GiB. One
+    box went from 6 model reloads in 3 h 21 m before the park to 7 in the 30 minutes
+    after it; the other from 5 in 3 h 12 m to 10 in 28 minutes. The park was not
+    releasing the card, it was making the kept job thrash it.
+
+    Rule #3 is about OTHER people's traffic — an exemption a peer could hold open for
+    ever — and that stays dead. A job THIS worker is running is the opposite: the park
+    policy itself chose to preserve it, and it ends. So the watchdog holds off while
+    ``in_flight_fn`` reports work and kills on sight the instant it does not — which is
+    immediately under ``hard`` park, since that re-queues the job first. A caller that
+    passes no seam gets rule #3 verbatim, and an unreadable probe falls back to killing.
+
+    The seam must be scoped to the lane that uses the LLM (the pool lane), NOT to every
+    GPU job: an inline diffusion render does not touch the LLM, and exempting on one
+    would let a peer's traffic keep a parked box's vLLM at 96 % — the rule #2 failure,
+    through a side door.
     """
+
+    #: How often a repeated, unchanged verdict is restated at INFO. The watchdog ticks
+    #: on the park loop (~5 s); narrating every tick is what buried the real lines.
+    DEFAULT_REPORT_EVERY_S = 60.0
+
+    #: The CEILING on the exemption above, and it is load-bearing. The exemption is
+    #: only as bounded as the job is — and a pool-lane job has no wall-clock watchdog
+    #: (``_run_pool_node`` arms none) while its lease renewer keeps renewing for as
+    #: long as the process lives, so lease-reclaim cannot fire either. One wedged HTTP
+    #: call would therefore pin the counter at 1 and hold the card SILENTLY for ever,
+    #: with the operator looking at PARKED. After this much CONTINUOUS holding off,
+    #: rule #3 wins and says why. The default is the GPU job budget: we wait no longer
+    #: than a GPU job may legitimately run.
+    DEFAULT_HOLD_OFF_MAX_S = 8100.0
 
     def __init__(
         self,
@@ -518,16 +558,78 @@ class ParkQuiesce:
         vllm_stop_fn: Callable[[], object],
         ollama_models_fn: Callable[[], list[dict]],
         ollama_unload_fn: Callable[[list[str]], object],
+        in_flight_fn: Callable[[], int] | None = None,
+        now_fn: Callable[[], float] = time.monotonic,
+        report_every_s: float = DEFAULT_REPORT_EVERY_S,
+        hold_off_max_s: float = DEFAULT_HOLD_OFF_MAX_S,
         label: str = "?",
     ) -> None:
         self._vllm_activity_fn = vllm_activity_fn
         self._vllm_stop_fn = vllm_stop_fn
         self._ollama_models_fn = ollama_models_fn
         self._ollama_unload_fn = ollama_unload_fn
+        self._in_flight_fn = in_flight_fn
+        self._now = now_fn
+        self._report_every_s = float(report_every_s)
+        self._hold_off_max_s = float(hold_off_max_s)
         self._label = label
+        self._said: dict[str, tuple[str, float]] = {}
+        #: When the CURRENT continuous stretch of holding off began. Reset the moment
+        #: the box drains, so a box that drains and is parked again gets a fresh grace
+        #: — the ceiling is about one stuck job, not a lifetime budget.
+        self._holding_since: float | None = None
+
+    def _say(self, key: str, detail: str, msg: str, *args,
+             level: int = logging.INFO) -> None:
+        """Log at ``level`` when the verdict CHANGES or the report window has elapsed,
+        at DEBUG otherwise. A change is never rate-limited away."""
+        now = self._now()
+        prev = self._said.get(key)
+        if prev is not None and prev[0] == detail and now - prev[1] < self._report_every_s:
+            log.debug(msg, *args)
+            return
+        self._said[key] = (detail, now)
+        log.log(level, msg, *args)
+
+    def _own_work_in_flight(self) -> int:
+        if self._in_flight_fn is None:
+            return 0
+        try:
+            return max(0, int(self._in_flight_fn() or 0))
+        except Exception:
+            # Fail TOWARD rule #3: if we cannot tell whether the work is ours, a
+            # parked box still serves nobody.
+            log.debug("[park-watchdog] %s: in-flight probe failed — assuming none",
+                      self._label, exc_info=True)
+            return 0
 
     def tick(self) -> tuple[bool, list[str]]:
         """One watchdog pass: ``(vllm_stopped, ollama_models_unloaded)``."""
+        in_flight = self._own_work_in_flight()
+        now = self._now()
+        if in_flight > 0:
+            if self._holding_since is None:
+                self._holding_since = now
+            held_for = now - self._holding_since
+            if held_for < self._hold_off_max_s:
+                self._say(
+                    "draining", str(in_flight),
+                    "[park-watchdog] %s: PARKED and draining — %d job(s) still in "
+                    "flight on this worker; holding off the LLM eviction until they "
+                    "finish (force-kill the job to release the card now)",
+                    self._label, in_flight,
+                )
+                return False, []
+            self._say(
+                "holdoff-expired", str(in_flight),
+                "[park-watchdog] %s: %d job(s) have held the card for %.0fs since "
+                "this box was parked (ceiling %.0fs) — releasing it anyway; a job "
+                "that never ends must not keep a parked box serving",
+                self._label, in_flight, held_for, self._hold_off_max_s,
+                level=logging.WARNING,
+            )
+        else:
+            self._holding_since = None
         stopped = False
         try:
             act = self._vllm_activity_fn() or {}
@@ -536,7 +638,8 @@ class ParkQuiesce:
                 # formatting must never be able to skip the stop.
                 self._vllm_stop_fn()
                 stopped = True
-                log.info(
+                self._say(
+                    "vllm", str(act.get("running", "?")),
                     "[park-watchdog] %s: box is PARKED but vLLM was serving "
                     "(%s request(s) in flight) — stopped it NOW; a parked box "
                     "serves nobody", self._label, act.get("running", "?"),
@@ -549,7 +652,8 @@ class ParkQuiesce:
             infos = self._ollama_models_fn() or []
             names = sorted({str(m.get("name")) for m in infos if m.get("name")})
             if names:
-                log.info(
+                self._say(
+                    "ollama", ",".join(names),
                     "[park-watchdog] %s: box is PARKED but ollama holds %s — "
                     "unloading NOW; a parked box serves nobody",
                     self._label, ", ".join(names),

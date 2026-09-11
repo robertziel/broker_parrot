@@ -222,7 +222,7 @@ def _num(v: str) -> float | int | None:
 def _nvidia_deep() -> list[dict[str, Any]]:
     # power.draw.instant rides along with the averaged power.draw: the SPREAD
     # between them is the transient-amplitude proxy for power-delivery stress
-    # (unified-memory GPU box exposes no input-rail telemetry at all — the brick is software-
+    # (a unified-memory GPU box exposes no input-rail telemetry at all — the brick is software-
     # invisible, so GPU-side echoes are the only PSU watchdog signals).
     raw = subprocess.check_output(
         [
@@ -237,7 +237,7 @@ def _nvidia_deep() -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for line in raw.splitlines():
         parts = [p.strip() for p in line.split(",")]
-        # fan.speed is [N/A] on fanless / passively-cooled parts (many unified-memory GPU box units);
+        # fan.speed is [N/A] on fanless / passively-cooled parts (many unified-memory GPU boxes);
         # tolerate both the 11-field (with fan) and legacy 10-field shape.
         if len(parts) not in (10, 11):
             continue
@@ -376,7 +376,7 @@ def _read_hwmon_temps() -> list[dict[str, Any]]:
 
 def _read_hwmon_fans() -> list[dict[str, Any]]:
     """Every hwmon ``fan*_input`` (tachometer RPM) with its chip name — chassis /
-    CPU / GPU fans. A box with no fan tach (many SoCs, some unified-memory GPU box units) yields ``[]``,
+    CPU / GPU fans. A box with no fan tach (many SoCs, some unified-memory GPU boxes) yields ``[]``,
     so the panel shows the fan chart as n/a rather than a false zero."""
     out: list[dict[str, Any]] = []
     for hw in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
@@ -486,7 +486,7 @@ def _read_cpu_temp_c() -> float | None:
 
     Prefers a dedicated x86/AMD CPU hwmon (coretemp / k10temp / zenpower /
     cpu_thermal / x86_pkg_temp) or a CPU-typed thermal zone. FALLBACK for
-    ARM/unified-memory GPU box (Grace-class): those boards expose no coretemp and no
+    ARM unified-memory GPU boxes (Grace-class): those boards expose no coretemp and no
     CPU-typed zone — the SoC package temperature is readable ONLY through the
     generic ``acpitz`` thermal zones, so return the HOTTEST acpitz. On a unified-memory GPU box
     the CPU shares the die with the GPU and it is the SoC package that hits the
@@ -538,7 +538,7 @@ def _read_cpu_throttle_count() -> int | None:
     """Summed per-core thermal-throttle counter (Intel
     ``thermal_throttle/core_throttle_count``) — the CPU analogue of the GPU
     violation counters; a rising delta = the CPU is being thermally clamped.
-    None on platforms that don't expose it (e.g. most ARM/unified-memory GPU box)."""
+    None on platforms that don't expose it (e.g. most ARM unified-memory GPU boxes)."""
     counts = []
     for f in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/thermal_throttle/core_throttle_count"):
         try:

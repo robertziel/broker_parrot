@@ -6,9 +6,9 @@ servers if box is parked." Unconditional — no idle TTL, no activity exemption.
 Why the first cut wasn't enough: rule #2's quiesce reused the idle reapers,
 which spare a BUSY server (peer safety). Found live within hours: REMOTE
 traffic — box-c POSTing chat completions over the fast iface — kept parked
-box-a's vllm "busy" at 96 % GPU indefinitely (9 concurrent requests, sourced
+box-a's vllm "busy" at 96 % GPU indefinitely (9 concurrent requests, all from
 a peer on the private interconnect), and an out-of-band `docker run` had recreated the container
-mid-park (fresh CreatedAt 12:46, RestartCount reset — the engine's lever can
+mid-park (a fresh CreatedAt, RestartCount reset — the engine's lever can
 only START an existing container, so no engine path did that). An
 activity-guarded parked box is a box that anyone can keep un-parked from the
 outside.

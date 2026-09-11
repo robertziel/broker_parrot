@@ -41,7 +41,10 @@ except Exception:  # pragma: no cover - optional
 
 from queue_workflows.cgroup_attribution import CgroupAttribution
 from queue_workflows.config import get_config
-from queue_workflows.db import connection
+# NB: queue_workflows.db is imported lazily inside _broadcast(), not here. It
+# pulls in psycopg, and the LAN-broadcast path (hw_lan) needs no database at
+# all — a slim host that only broadcasts on the local network would otherwise
+# fail at import for a dependency it never uses.
 
 log = logging.getLogger(__name__)
 
@@ -102,8 +105,8 @@ def _gpu_probe() -> list[dict[str, Any]]:
 
 # Below this, a probed "total VRAM" is treated as UNKNOWN, not as a real cap.
 # Unified-memory GPUs make the smi "dedicated VRAM total" meaningless: an AMD
-# APU's rocm-smi reports a tiny carveout (observed 512 MB on box-b) while the
-# real model memory comes from shared system RAM, and a Grace-class box-c
+# APU's rocm-smi reports a tiny carveout (512 MB observed) while the
+# real model memory comes from shared system RAM, and a Grace-class part
 # reports none at all. A reading this small can only be a carveout/parse
 # artifact — never a GPU that actually runs multi-GB diffusion models — so we
 # FAIL OPEN (return None ⇒ "capacity unknown" ⇒ the claim gate falls back to
@@ -175,8 +178,8 @@ def _which(cmd: str) -> bool:
 
 def _nvidia_smi() -> list[dict[str, Any]]:
     """Per-GPU dicts via ``nvidia-smi --query-gpu``. CSV (one row per GPU) with
-    units stripped. Empty list if the CLI fails. Unified-memory parts (Grace
-    an ARM GPU box / Jetson) report ``[N/A]`` for VRAM — per-field permissive
+    units stripped. Empty list if the CLI fails. Unified-memory parts (Grace-class
+    ARM boxes / Jetson) report ``[N/A]`` for VRAM — per-field permissive
     parse turns that into 0 instead of dropping the row."""
     try:
         raw = subprocess.check_output(
@@ -319,17 +322,62 @@ def _build_sample(attrib: CgroupAttribution | None = None) -> dict[str, Any]:
 # ── Persist ──────────────────────────────────────────────────────────────
 
 
+def build_envelope(sample: dict[str, Any]) -> str:
+    """The published form of a sample: JSON, stamped with when and from where.
+
+    ONE definition, deliberately. The sample has two publication paths — the
+    Postgres NOTIFY (:func:`_broadcast`) and the optional LAN broadcast
+    (:mod:`queue_workflows.hw_lan`) — and if each built its own envelope the two
+    would drift apart the first time a field was added. Both call this.
+    """
+    return json.dumps({
+        "sampled_at": _iso_now(),
+        "host": _host_label(),
+        **sample,
+    })
+
+
+def _lan_publish(sample: dict[str, Any]) -> None:
+    """Broadcast the sample on the LAN, if this host opted in. Never raises."""
+    try:
+        from queue_workflows import hw_lan
+        if hw_lan.enabled():
+            _lan_broadcaster().publish(sample)
+    except Exception:
+        log.exception("[hw_metrics] LAN broadcast failed")
+
+
+_LAN_BROADCASTER = None
+
+
+def _lan_broadcaster():
+    """Process-wide broadcaster, so one socket is reused across samples."""
+    global _LAN_BROADCASTER
+    if _LAN_BROADCASTER is None:
+        from queue_workflows.hw_lan import LanBroadcaster
+        _LAN_BROADCASTER = LanBroadcaster()
+    return _LAN_BROADCASTER
+
+
+def publish_sample(sample: dict[str, Any]) -> None:
+    """Send one sample down every enabled publication path.
+
+    The single place the sampler calls, so adding a transport never means
+    touching the sampler loop again. The NOTIFY is the contract consumers
+    already depend on and goes first; the LAN broadcast is opt-in and best
+    effort, and its failure is contained here so it can never stop the NOTIFY.
+    """
+    _broadcast(sample)
+    _lan_publish(sample)
+
+
 def _broadcast(sample: dict[str, Any]) -> None:
     """Fire a Postgres NOTIFY with the JSON-encoded sample. No row stored.
     Published to the METRICS DSN (the shared broker — see :func:`metrics_dsn`), so
     every project shows the SAME fleet-wide hardware view; a consumer LISTENs via
     :class:`queue_workflows.hw_feed.HwFeed`. Carries a ``host`` field so the feed
     attributes samples by source."""
-    payload = json.dumps({
-        "sampled_at": _iso_now(),
-        "host": _host_label(),
-        **sample,
-    })
+    payload = build_envelope(sample)
     if _uses_dedicated_metrics_dsn():
         # queue DB is NOT the broker → open a short autocommit connection to the
         # broker metrics DSN (the 5 s cadence makes connect-per-broadcast fine).
@@ -344,6 +392,7 @@ def _broadcast(sample: dict[str, Any]) -> None:
     else:
         # queue DB IS the metrics target (a broker-consolidated or single-DB
         # project) → reuse the engine pool, unchanged.
+        from queue_workflows.db import connection
         with connection() as conn, conn.cursor() as cur:
             cur.execute("SELECT pg_notify(%s, %s)", (NOTIFY_CHANNEL, payload))
 
@@ -390,7 +439,7 @@ class HwMetricsSampler(threading.Thread):
         if self._watch is None:
             while not self._stop_evt.is_set():
                 try:
-                    _broadcast(_build_sample(self._attrib))
+                    publish_sample(_build_sample(self._attrib))
                 except Exception:
                     log.exception("[hw_metrics] broadcast failed")
                 if self._stop_evt.wait(self.interval_s):
@@ -405,7 +454,7 @@ class HwMetricsSampler(threading.Thread):
             now = time.time()
             if now >= next_broadcast:
                 try:
-                    _broadcast(_build_sample(self._attrib))
+                    publish_sample(_build_sample(self._attrib))
                 except Exception:
                     log.exception("[hw_metrics] broadcast failed")
                 next_broadcast = now + self.interval_s

@@ -30,7 +30,7 @@ import os
 from queue_workflows.envcompat import env_get
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from queue_workflows.db import connection
 
@@ -54,7 +54,8 @@ _DEFAULT_SERVER_KIND = "ollama"
 # ── Types ────────────────────────────────────────────────────────────────
 
 
-QueueName = str  # 'cpu' | 'gpu' — soft type; enforced by CHECK in DB.
+QueueName = str  # 'cpu' | 'gpu' | 'download' — soft type; validated HOST-SIDE
+# (enqueue_node_job); migration 0025 dropped the DB CHECK, 0008-style.
 NodeStatus = str  # queued|running|completed|failed|cancelled|awaiting_input
 
 
@@ -95,6 +96,7 @@ def enqueue_node_job(
     node_module: str,
     queue: QueueName,
     required_model: str | None = None,
+    required_models: Sequence[dict[str, Any]] | None = None,
     inputs: dict[str, Any] | None = None,
     priority: int = 100,
     pipeline_name: str | None = None,
@@ -103,8 +105,18 @@ def enqueue_node_job(
     force_box: Iterable[str] | None = None,
     server_types: Iterable[str] | None = None,
     cpu_slots: int | None = None,
+    dedup_key: str | None = None,
 ) -> str:
     """Insert a fresh ``queued`` node-job row. Returns the row id.
+
+    ``dedup_key`` (migration 0025) is an opt-in, opaque OUTPUT-IDENTITY string
+    — "this job produces X". When a node-job with the same (project,
+    dedup_key) has already COMPLETED, ``execute_node`` finalizes this one as
+    completed without invoking the body (see
+    :func:`find_completed_duplicate`): one file is never downloaded twice.
+    ``None``/empty ⇒ stored NULL = no dedup, byte-identical to pre-0025. The
+    engine only compares strings, so a host whose outputs are box-local must
+    encode the location in the key (or omit it).
 
     ``cpu_slots`` (migration 0024) is how many slots of a WIDENED cpu lane this
     one job occupies — the weight for a node whose body runs its own threads.
@@ -131,19 +143,24 @@ def enqueue_node_job(
     project so the node inherits it. See :func:`_project`.
 
     Invariants:
-        - queue in {'cpu', 'gpu'}.
-        - queue='cpu' ⇒ required_model IS NULL (CPU tasks don't use
-          the model cache).
-        - queue='gpu' MAY or MAY NOT have required_model.
+        - queue in {'cpu', 'gpu', 'download'} — validated HERE (host-side;
+          migration 0025 dropped the DB CHECK, the 0008 move).
+        - only queue='gpu' MAY carry required_model (cpu/download tasks don't
+          use the model cache).
         - (run_id, node_id) UNIQUE — one row per DAG cell.
 
+    ``download`` (migration 0025) is the network-WAIT lane: full DAG
+    citizenship (deps, placement, lease/watchdog), but its claim enforces a
+    fleet-wide per-project width cap — see :func:`claim_next_download_job`.
+
     Raises ``ValueError`` before hitting the DB on a bad queue name
-    or a CPU row with a stray model.
+    or a non-gpu row with a stray model.
     """
-    if queue not in ("cpu", "gpu"):
-        raise ValueError(f"queue must be 'cpu' or 'gpu', got {queue!r}")
-    if queue == "cpu" and required_model:
-        raise ValueError("cpu node-job must not set required_model")
+    if queue not in ("cpu", "gpu", "download"):
+        raise ValueError(
+            f"queue must be 'cpu', 'gpu' or 'download', got {queue!r}")
+    if queue != "gpu" and required_model:
+        raise ValueError(f"{queue} node-job must not set required_model")
     # Reject a 0/negative width at the API edge: the fit test would be
     # meaningless and a 0-weight row would let a lane admit unboundedly many.
     if cpu_slots is not None and int(cpu_slots) < 1:
@@ -160,6 +177,19 @@ def enqueue_node_job(
     # never "no server", which would make the row permanently unclaimable. ORDER IS
     # SIGNIFICANT (it IS the preference), so this filters without sorting.
     _servers = [s for s in (server_types or []) if s] or None
+    # DUAL-WRITE (0026). `required_model` is set to the array's FIRST model so a worker
+    # that has not been bumped yet still claims this row correctly — that is what makes
+    # the rollout flag-day-free. `required_models` carries the full ordered structure and
+    # `required_model_ids` is its flat claim index; all three are written HERE, together,
+    # so they cannot drift apart at any other call site.
+    _models = [e for e in (required_models or [])
+               if isinstance(e, dict) and str(e.get("model") or "").strip()] or None
+    _model_ids = [str(e["model"]).strip() for e in _models] if _models else None
+    if _models and not required_model:
+        required_model = _model_ids[0]
+    # Empty/whitespace ⇒ NULL: a blank key must mean "no dedup", never a
+    # universal twin every other blank-keyed job would match.
+    _dedup = (str(dedup_key).strip() if dedup_key is not None else "") or None
 
     row_id = str(uuid.uuid4())
     with connection() as conn, conn.cursor() as cur:
@@ -169,13 +199,15 @@ def enqueue_node_job(
                 (id, run_id, pipeline_name, node_id, node_module,
                  queue, required_model, project,
                  status, priority, inputs, context_delta,
-                 avoid_box, force_box, server_types, cpu_slots,
+                 avoid_box, force_box, server_types, cpu_slots, dedup_key,
+                 required_models, required_model_ids,
                  created_at)
             VALUES
                 (%s, %s, %s, %s, %s,
                  %s, %s, %s,
                  'queued', %s, %s, '{}'::jsonb,
-                 %s, %s, %s, %s,
+                 %s, %s, %s, %s, %s,
+                 %s, %s,
                  now())
             """,
             (
@@ -186,6 +218,9 @@ def enqueue_node_job(
                 _d.array_literal(_force) if _force else None,
                 _d.array_literal(_servers) if _servers else None,
                 _slots,
+                _dedup,
+                _as_json(_models) if _models else None,
+                _d.array_literal(_model_ids) if _model_ids else None,
             ),
         )
     return row_id
@@ -350,6 +385,7 @@ SET status = 'running',
     worker_lane = %(worker_lane)s,
     claimed_by = %(host)s,
     resolved_server = {stamp},
+    resolved_model = {model_stamp},
     lease_expires_at = {lease_expr}
 WHERE j.id = (
     SELECT c.id FROM workflow_node_jobs c
@@ -590,6 +626,7 @@ def claim_next_cpu_job(
         run_guard=_RUN_CLAIMABLE_GUARD,
         lease_expr=_d.future_seconds("%(lease_s)s"), skip_locked=_d.skip_locked,
         stamp="NULL",   # cpu rows have no LLM serving kind (migration 0023)
+        model_stamp="NULL",   # ...and therefore no resolved model either (0026)
     )
     params = {
         "worker_lane": worker_lane,
@@ -603,6 +640,160 @@ def claim_next_cpu_job(
     if width:
         params["lane_width"] = int(lane_width)
         params["free_slots"] = int(free_slots)
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(sql, params)
+        return cur.fetchone()
+
+
+def resolve_download_max_concurrent() -> int:
+    """The effective download-lane width, resolved at CALL time so a host's
+    ``configure()`` (which runs after import) is honoured: the
+    ``QUEUE_WORKFLOWS_DOWNLOAD_MAX_CONCURRENT`` env knob wins (operator
+    override, legacy spelling free via envcompat), then
+    ``EngineConfig.download_max_concurrent``, then the engine default **1**.
+
+    Always ``>= 1``: a malformed or sub-1 value falls through to the floor —
+    a 0 cap would be a lane that admits nothing, silently, forever.
+
+    Mirrors :func:`queue_workflows.claim_worker.resolve_cpu_worker_threads`."""
+    raw = env_get("QUEUE_WORKFLOWS_DOWNLOAD_MAX_CONCURRENT")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    try:
+        from queue_workflows.config import get_config
+        val = getattr(get_config(), "download_max_concurrent", None)
+        if val is not None:
+            return max(1, int(val))
+    except Exception:
+        pass
+    return 1
+
+
+def claim_next_download_job(
+    worker_lane: int = 0,
+    *,
+    host: str | None = None,
+    lease_s: int = DEFAULT_LEASE_S,
+    host_priority: int = 0,
+    project: str | None = None,
+    box: str | None = None,
+    max_concurrent: int | None = None,
+) -> dict[str, Any] | None:
+    """Atomically grab the next queued DOWNLOAD job — with THE LANE CAP
+    (migration 0025).
+
+    The download lane exists for two guarantees at once: network WAIT never
+    occupies a cpu/gpu claim slot, and the shared uplink is never saturated —
+    at most ``max_concurrent`` download rows (engine default **1**) may be
+    ``running`` at a time, counted **fleet-wide per project**, NOT per host.
+    Contrast the gpu box-slot arbiter (``max_running``), which scopes its count
+    to ``claimed_by = host``: here ANY box's running download occupies the
+    lane, because the resource being protected (the uplink) is shared by all
+    of them. Cross-project downloads don't contend in this count — tenant
+    isolation (0017) wins over uplink pessimism, and a single-tenant deploy
+    (project ``''``) gets a true global cap anyway.
+
+    ALWAYS ON: ``max_concurrent=None`` resolves the knob
+    (:func:`resolve_download_max_concurrent`) rather than skipping the gate,
+    so no call path can forget the lane's whole point. An explicit value wins
+    (tests; a host that computes its own width).
+
+    RACE-SAFETY (the audit-delta-D1 lesson): the cap is a COUNT guard, so two
+    concurrent claimants can both read "cap-1 running" under MVCC and both
+    take the last slot. The (queue, project)-keyed advisory xact lock
+    (:meth:`~queue_workflows.dialect.Dialect.queue_claim_serializer`)
+    serializes them — keyed WITHOUT the host, unlike the box serializer,
+    precisely because the contenders are on different boxes. SQLite's single
+    writer needs none.
+
+    RECOVERY: a dead downloader's slot frees when its row leaves ``running`` —
+    the ordinary lease reclaim (:func:`reclaim_expired_leases`), no
+    lane-specific machinery. A zombie row therefore holds the lane until the
+    reclaim sweep lands, the same accepted semantics as the box-slot arbiter.
+
+    Ordering, placement and the run-cancel guard are the cpu claim's:
+    ``is_priority DESC, priority ASC``, the ``host_priority``-directed
+    creation tiebreak; ``avoid_box``/``force_box`` honoured; no serving-kind
+    stamp (``resolved_server`` stays NULL — nothing serves an LLM here)."""
+    from queue_workflows.dialect import get_dialect
+    _d = get_dialect()
+    cap = (resolve_download_max_concurrent()
+           if max_concurrent is None else max(1, int(max_concurrent)))
+    order = f"c.is_priority DESC, c.priority ASC, {_host_dir_term()}"
+    # THE LANE CAP — fleet-wide per project: no claimed_by/host term on
+    # purpose (see the docstring). Counted over the same statement that flips
+    # the row, so the guard and the claim can never disagree.
+    capability = (
+        "AND (SELECT COUNT(*) FROM workflow_node_jobs r "
+        "WHERE r.status = 'running' AND r.queue = %(queue)s "
+        "AND r.project = %(project)s) < %(max_concurrent)s "
+    )
+    sql = _CLAIM_SQL.format(
+        order=order, capability=capability, placement=_placement_terms(),
+        run_guard=_RUN_CLAIMABLE_GUARD,
+        lease_expr=_d.future_seconds("%(lease_s)s"), skip_locked=_d.skip_locked,
+        stamp="NULL",   # download rows have no LLM serving kind (0023)
+        model_stamp="NULL",   # ...nor a resolved model (0026)
+    )
+    params = {
+        "worker_lane": worker_lane,
+        "host": host,
+        "lease_s": int(lease_s),
+        "queue": "download",
+        "project": _project(project),
+        "host_dir": _host_dir(host_priority),
+        "box": box or None,
+        "max_concurrent": cap,
+    }
+    with connection() as conn, conn.cursor() as cur:
+        # Serialize claims fleet-wide per (queue, project) — the D1 rule: any
+        # count-based arbiter needs the lock, or two claimants both read
+        # "cap-1 running" and both take the last slot.
+        ser = _d.queue_claim_serializer()
+        if ser:
+            cur.execute(ser, params)
+        cur.execute(sql, params)
+        return cur.fetchone()
+
+
+def find_completed_duplicate(
+    *,
+    dedup_key: str | None,
+    project: str | None = None,
+    exclude_id: str | None = None,
+) -> dict[str, Any] | None:
+    """The most recent COMPLETED node-job with this (project, ``dedup_key``) —
+    the "one file is never downloaded twice" lookup (migration 0025).
+
+    ``execute_node`` calls this before invoking a keyed job's body; a hit means
+    the OUTPUT already exists, so the new job finalizes as completed with the
+    twin's ``context_delta`` instead of re-doing the work. Only ``completed``
+    counts — a failed/cancelled twin proves nothing about the output, and a
+    ``running`` twin is not yet proof (under the download lane's cap-1 the
+    same-key jobs serialize, so by the time the second executes the first IS
+    terminal; with a wider cap two same-key jobs may both run — dedup is a
+    short-circuit, not a lock, and the body's own idempotency is the second
+    layer).
+
+    Scoped to one tenant (0017): a ``project`` of ``None`` resolves to this
+    client's configured project, mirroring every claim. ``exclude_id`` guards
+    against self-matching (the caller's own row can never be its twin)."""
+    key = (str(dedup_key).strip() if dedup_key is not None else "") or None
+    if key is None:
+        return None
+    sql = (
+        "SELECT * FROM workflow_node_jobs "
+        "WHERE dedup_key = %(key)s AND project = %(project)s "
+        "AND status = 'completed'"
+    )
+    params: dict[str, Any] = {"key": key, "project": _project(project)}
+    if exclude_id:
+        sql += " AND id != %(exclude_id)s"
+        params["exclude_id"] = exclude_id
+    sql += " ORDER BY finished_at DESC LIMIT 1"
     with connection() as conn, conn.cursor() as cur:
         cur.execute(sql, params)
         return cur.fetchone()
@@ -728,9 +919,16 @@ def claim_next_gpu_job(
             + _d.arrays_overlap("c.server_types", "%(served_types)s") + ")"
         )
     if known:
+        # Capability gate over BOTH job shapes (0026). The scalar path is unchanged; the
+        # array path passes when ANY acceptable model is one this box serves — which is
+        # the entire point of the array, and would be lost if only the dual-written head
+        # (`required_model`) were tested. `required_model_ids` is the flat denormalised
+        # index so this stays one cheap `arrays_overlap`, identical on both dialects.
         capability_terms.append(
             "AND (c.required_model IS NULL "
-            "OR " + _d.value_in_param_array("c.required_model", "%(known_models)s") + ")"
+            "OR " + _d.value_in_param_array("c.required_model", "%(known_models)s")
+            + " OR (c.required_model_ids IS NOT NULL AND "
+            + _d.arrays_overlap("c.required_model_ids", "%(known_models)s") + "))"
         )
     # REMOTE-SERVED (0022): a row naming ``server_types`` is executed by an EXTERNAL
     # server, so it loads NO model into this process — it belongs in the PAR-wide
@@ -805,12 +1003,31 @@ def claim_next_gpu_job(
     #
     # The previous build stamped NULL for any undeclared row and EXEMPTED it from
     # the caps ("not LLM-served work"). That premise was false — the dispatch
-    # layer's own docs (llm_backends/factory.py) name compose_region_report as an
+    # layer's own docs (llm_backends/factory.py) name compose_report as an
     # LLM user whose rows never carry server_types — and the
     # exemption admitted a ComfyUI render beside an ollama LLM job on one
-    # unified-memory unified-memory GPU box. Undeclared work IS served by something; predict it,
+    # unified-memory GPU box. Undeclared work IS served by something; predict it,
     # stamp it, and let the D4 re-stamp correct the label if dispatch lands
     # elsewhere.
+    def _model_stamp(alias: str) -> str:
+        """WHICH model this row will actually run (migration 0026).
+
+        The array's ORDER is a PRIORITY, so this is `first_overlap`: the FIRST entry in
+        `required_model_ids` that this box can serve. Without it the array degrades into an
+        unordered SET — the row still claims, nothing looks broken, and the fleet quietly
+        runs the fallback while the preferred model sits loaded and idle.
+
+        Falls back to the scalar `required_model` so a single-model row (every row written
+        before 0026) is stamped identically, and ONE column answers "what actually ran" for
+        both shapes. NULL for an unconstrained row, which names no model by definition."""
+        if not known:
+            return f"{alias}.required_model"
+        return (
+            "COALESCE("
+            + _d.first_overlap(f"{alias}.required_model_ids", "%(known_models)s")
+            + f", {alias}.required_model)"
+        )
+
     def _stamp(alias: str) -> str:
         return (
             "COALESCE("
@@ -854,6 +1071,10 @@ def claim_next_gpu_job(
         lease_expr=_d.future_seconds("%(lease_s)s"), skip_locked=_d.skip_locked,
         # The opt-out opts out of stamping too — byte-compat with the legacy claim.
         stamp=_stamp("j") if law_on else "NULL",
+        # Stamped even when the per-kind law is off: "which model ran" is a fact about the
+        # row, not part of the arbiter, and a NULL here would blind the panel and the
+        # warm-affinity sort for every deployment that opts out of the caps.
+        model_stamp=_model_stamp("j"),
     )
     params = {
         "worker_lane": worker_lane,
@@ -1189,7 +1410,6 @@ def mark_ingest_completed(
     """Transition an ingest row to ``completed`` (idempotent — returns
     ``None`` if already terminal). Same WHERE-narrowed contract as
     :func:`mark_completed`."""
-    import json
     json.dumps(result or {})
     with connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -2183,7 +2403,6 @@ def mark_completed_in_txn(
     """Same as :func:`mark_completed` but runs on a caller-supplied
     cursor — lets the worker write the dispatch-event row in the same
     transaction (outbox atomicity contract)."""
-    import json
     json.dumps(context_delta or {})
     cur.execute(
         """
@@ -2295,7 +2514,6 @@ def set_input_spec(run_id: str, node_id: str, spec: dict | None) -> None:
     """Persist a per-job ``input_spec`` so the frontend can render
     N awaiting inputs side-by-side. Idempotent — re-calling with the
     same spec is a no-op write."""
-    import json
     payload = json.dumps(spec) if spec is not None else None
     with connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -2615,6 +2833,11 @@ def flag_unassignable_gpu_jobs(
     # rendering equals the literal below, so ``.replace`` is a no-op on pg.
     _contains = get_dialect().array_contains_value("lg.fits_models", "j.required_model")
     _ANY = "j.required_model = ANY(lg.fits_models)"
+    # Possession vs capacity are DIFFERENT questions and now have different answers:
+    # `fits_models` is (what the box HOLDS ∩ what its VRAM fits), so a model missing from it
+    # may be missing for either reason. `known_models` isolates possession.
+    _knows = get_dialect().array_contains_value("lg.known_models", "j.required_model")
+    _ANY_KNOWN = "j.required_model = ANY(lg.known_models)"
     with connection() as conn, conn.cursor() as cur:
         # CLEAR first: un-flag any flagged job that is now fittable, or that has
         # left the queued state (claimed / cancelled / terminal) — so a red flag
@@ -2652,7 +2875,7 @@ def flag_unassignable_gpu_jobs(
         cur.execute(
             """
             WITH live_gpu AS (
-                SELECT fits_models, vram_total_mb FROM worker_heartbeats
+                SELECT fits_models, known_models, vram_total_mb FROM worker_heartbeats
                 WHERE queue = 'gpu'
                   AND project = %(project)s
                   AND last_seen > now() - make_interval(secs => %(window)s)
@@ -2663,12 +2886,28 @@ def flag_unassignable_gpu_jobs(
             )
             UPDATE workflow_node_jobs AS j
             SET unassignable_at = now(),
-                unassignable_reason =
-                    'no live GPU machine can hold model ' || j.required_model
-                    || ' — none of ' || (SELECT n FROM fleet)::text
-                    || ' live GPU machine(s) has enough VRAM (max '
-                    || COALESCE((SELECT max_vram FROM fleet)::text, 'unknown')
-                    || 'MB)'
+                -- SAY WHICH PROBLEM IT IS. This always blamed VRAM, and once the claim
+                -- gate started advertising OBSERVED capability that became wrong far more
+                -- often than right: a model installed on no box at all was reported as
+                -- "none of N live GPU machine(s) has enough VRAM (max …MB)" — a capacity
+                -- verdict for a model whose problem was that nobody had it.
+                -- An operator reading that goes looking for a bigger box.
+                unassignable_reason = CASE
+                    WHEN NOT EXISTS (
+                        SELECT 1 FROM live_gpu lg
+                        WHERE j.required_model = ANY(lg.known_models)
+                    ) THEN
+                        'no live GPU machine SERVES model ' || j.required_model
+                        || ' — none of ' || (SELECT n FROM fleet)::text
+                        || ' live GPU machine(s) advertises it (weights not installed, or '
+                        || 'its server does not report the tag)'
+                    ELSE
+                        'no live GPU machine can hold model ' || j.required_model
+                        || ' — none of ' || (SELECT n FROM fleet)::text
+                        || ' live GPU machine(s) has enough VRAM (max '
+                        || COALESCE((SELECT max_vram FROM fleet)::text, 'unknown')
+                        || 'MB)'
+                END
             WHERE j.queue = 'gpu'
               AND j.project = %(project)s
               AND j.status = 'queued'
@@ -2681,7 +2920,7 @@ def flag_unassignable_gpu_jobs(
               )
             RETURNING id, run_id, node_id, required_model,
                       unassignable_reason
-            """.replace(_ANY, _contains),
+            """.replace(_ANY_KNOWN, _knows).replace(_ANY, _contains),
             {"window": window, "project": proj},
         )
         return list(cur.fetchall())
@@ -2789,7 +3028,6 @@ def set_resolved_inputs(job_id: str, resolved_inputs: dict[str, Any]) -> None:
 
     Pre-validates JSON serialisation so a bad input fails before any
     state mutation, matching :func:`mark_completed`'s contract."""
-    import json
     json.dumps(resolved_inputs or {})
     with connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -2863,6 +3101,10 @@ def snapshot(*, project: str | None = None) -> dict[str, Any]:
                 "running": _top("gpu", "running"),
                 "queued":  _top("gpu", "queued"),
             },
+            "download": {
+                "running": _top("download", "running"),
+                "queued":  _top("download", "queued"),
+            },
             "counts": {
                 f"{q}_{s}": n for (q, s), n in counts.items()
             },
@@ -2914,6 +3156,124 @@ def ingest_snapshot(*, project: str | None = None) -> dict[str, Any]:
             "workers": workers.get(q, 0),
         }
     return {"queues": queues}
+
+
+def set_resolved_artifact(job_id, artifact: str) -> None:
+    """Stamp the ARTIFACT tag a freshly-claimed job will actually run (migration 0027).
+
+    Called by the claim worker immediately after its claim returns, from the worker's own
+    live digest observation — see ``ClaimWorker._stamp_resolved_artifact`` for the why.
+    Guarded to running rows so a delayed call cannot label a row some other worker has
+    since reclaimed; the claim's own UPDATE set status='running' + claimed_by, so between
+    the claim and this statement the row is exclusively ours.
+    """
+    if not job_id or not artifact:
+        return
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE workflow_node_jobs SET resolved_artifact = %s "
+            "WHERE id = %s AND status = 'running'",
+            (str(artifact), job_id),
+        )
+        conn.commit()
+
+
+def upsert_model_catalog(entries) -> int:
+    """Publish this box's OBSERVED serving capability (migration 0026). Returns rows written.
+
+    Upsert, never delete-then-insert: a transient probe failure must not blank a box's
+    capability and strand every job that needs it. Losing a row costs a missed claim;
+    blanking the table costs the whole fleet.
+
+    RETIRE WHAT VANISHED, but only within the (host, server kind) pairs THIS observation
+    actually covered. That distinction is the whole safety argument:
+
+      * a kind the probe did not report on is left completely alone — that is the
+        transient-failure case above, and it is why this is not a wholesale sync;
+      * a kind the probe DID report on is authoritative for that kind, so a model it no
+        longer lists is genuinely gone and gets `enabled = FALSE`.
+
+    Without the second half the catalog only ever grew. Measured on a live fleet:
+    `chat-expert-b` and `chat-expert-a` were removed from box-a's ollama store and the
+    catalog went on advertising both for `box-a-gpu/ollama` indefinitely — the exact
+    "declared, not observed" failure
+    this table exists to end, reintroduced by its own writer. The heartbeat's `known_models`
+    was correct the whole time, which is what made the disagreement visible.
+
+    KNOWN LIMITATION, stated rather than papered over: retirement writes `enabled`, which
+    migration 0026 also documents as the OPERATOR's park lever. So a retired row is
+    currently indistinguishable from a parked one. Separating them needs a column
+    (`retired_at`) and therefore a migration; it has not been done because
+    :func:`fetch_model_catalog` still has no non-test caller — the claim gate reads the
+    heartbeat's `known_models`, not this table — so the conflict is unreachable today, and
+    a 3am schema change to shared infra for an unread table is the larger risk. Wire a
+    reader and this needs fixing first.
+
+    (An operator park being cleared by the next observation is NOT new here: the upsert has
+    always set `enabled = TRUE` on conflict. This change adds the opposite direction.)
+    """
+    rows = list(entries or [])
+    if not rows:
+        return 0
+    from queue_workflows.dialect import get_dialect
+    _d = get_dialect()
+
+    covered: dict[tuple[str, str], set[str]] = {}
+    for e in rows:
+        covered.setdefault((e.host_label, e.server_type), set()).add(e.model_id)
+
+    with connection() as conn, conn.cursor() as cur:
+        for e in rows:
+            cur.execute(
+                "INSERT INTO llm_model_catalog "
+                "(host_label, server_type, model_id, enabled, observed_at, digest) "
+                f"VALUES (%s, %s, %s, TRUE, {_d.now}, %s) "
+                "ON CONFLICT (host_label, server_type, model_id) DO UPDATE SET "
+                # digest updates with the observation — a promotion re-points the role
+                # tag to new bytes and the very next probe must say so, or artifact
+                # resolution keeps answering for the previous version.
+                f"observed_at = {_d.now}, enabled = TRUE, digest = EXCLUDED.digest",
+                (e.host_label, e.server_type, e.model_id,
+                 str(getattr(e, "digest", "") or "")),
+            )
+        for (host, kind), models in covered.items():
+            placeholders = ", ".join(["%s"] * len(models))
+            cur.execute(
+                "UPDATE llm_model_catalog SET enabled = FALSE "
+                "WHERE host_label = %s AND server_type = %s AND enabled "
+                f"AND model_id NOT IN ({placeholders})",
+                (host, kind, *sorted(models)),
+            )
+        conn.commit()
+    return len(rows)
+
+
+def fetch_model_catalog(*, stale_after_s: float | None = None) -> list:
+    """Every enabled catalog row, optionally excluding ones not observed recently.
+
+    `stale_after_s=None` returns all enabled rows — the conservative default, because a
+    box that is merely quiet still holds its models."""
+    from queue_workflows.model_catalog import CatalogEntry
+
+    sql = ("SELECT host_label, server_type, model_id, digest FROM llm_model_catalog "
+           "WHERE enabled")
+    params: dict = {}
+    if stale_after_s is not None:
+        from queue_workflows.dialect import get_dialect
+        _d = get_dialect()
+        sql += f" AND observed_at >= {_d.past_seconds('%(stale)s')}"
+        params["stale"] = float(stale_after_s)
+    try:
+        with connection() as conn, conn.cursor() as cur:
+            cur.execute(sql, params)
+            return [CatalogEntry(r["host_label"], r["server_type"], r["model_id"],
+                                 digest=str(r.get("digest") or ""))
+                    for r in (cur.fetchall() or [])]
+    except Exception:
+        # A catalog read that raises must not break a claim; an empty answer is the
+        # conservative direction (see model_catalog.best_match).
+        log.debug("[model-catalog] fetch failed", exc_info=True)
+        return []
 
 
 def fleet_snapshot(

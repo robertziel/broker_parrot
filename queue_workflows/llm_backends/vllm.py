@@ -58,11 +58,13 @@ supervisor ``is_running`` probe isn't blocked behind a 90 s cold-start wait.
 from __future__ import annotations
 
 import enum
+import json
 import logging
+import os
 import shutil
 import subprocess
 import time
-from typing import Callable
+from typing import Any, Callable
 
 from queue_workflows.llm_backends.base import LLMBackend
 
@@ -127,7 +129,7 @@ def _default_kill_fn() -> bool:
         # at least one matched, 1 ⇒ none matched.
         proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
             [pkill, "-f", _VLLM_PROC_PATTERN],
-            capture_output=True,
+            capture_output=True, check=False,  # exit 1 = "none matched", a result
         )
         return proc.returncode == 0
     except OSError:
@@ -135,13 +137,128 @@ def _default_kill_fn() -> bool:
         return False
 
 
-def _default_ensure_up_fn(model_id: str) -> None:  # noqa: ARG001 — Phase-6 seam
-    """Default bring-up: a NO-OP. Today the sidecar's respawn is owned by docker
-    ``restart: unless-stopped`` and a (Phase-6) entrypoint that reads the desired
-    model from config; this library hook is the place that entrypoint plugs into.
-    Documented as a seam so the state machine's health-poll loop already accounts
-    for a restart it doesn't itself trigger."""
-    return None
+def _default_ensure_up_fn(model_id: str) -> None:
+    """Default bring-up: recreate the sidecar serving ``model_id`` (Phase 6, built).
+
+    This was a NO-OP for as long as the backend existed, and the cost was concrete: the
+    cold-start leg relied on docker ``restart: unless-stopped`` returning the container on
+    its BAKED ``--model``, so a box could not be asked to serve anything else. A model on
+    that box's own disk was unreachable.
+
+    Now it asks docker what the sidecar currently runs and, if that is not ``model_id``,
+    recreates it with the same argv and a swapped ``--model`` — see
+    :mod:`queue_workflows.llm_backends.vllm_sidecar` for the decision, which is pure and
+    unit-tested without a daemon.
+
+    Still OVERRIDABLE, and deliberately so: a deployment that runs the sidecar somewhere
+    this process cannot reach (a different host, k8s) wires
+    :attr:`EngineConfig.vllm_start_fn` and this default never runs. Absent docker, it
+    RAISES — ``ensure_ready`` turns that into a failed bring-up the caller can soft-degrade
+    from, which is strictly better than a silent no-op that ends in a served-id mismatch
+    90 seconds later.
+    """
+    from queue_workflows.llm_backends.vllm_sidecar import ensure_sidecar
+
+    ensure_sidecar(model_id,
+                   inspect_fn=_docker_inspect_sidecar,
+                   recreate_fn=_docker_recreate_sidecar)
+
+
+#: Container name the default bring-up manages. Overridable for a deployment that names
+#: its sidecar differently; ``EngineConfig.vllm_start_fn`` is the escape hatch for anything
+#: stranger (a sidecar on another host, k8s).
+_VLLM_CONTAINER = os.environ.get("QUEUE_WORKFLOWS_VLLM_CONTAINER", "vllm")
+#: The docker socket. Talking to the Engine API directly — not the CLI, not compose — is what
+#: lets the model come from the NODE-JOB: compose re-reads its file and would ignore the argv
+#: we computed, which is why an earlier draft had to smuggle the model through an env var the
+#: compose file interpolated. The container's own config is authoritative and already here.
+_DOCKER_SOCK = os.environ.get("QUEUE_WORKFLOWS_DOCKER_SOCK", "/var/run/docker.sock")
+
+
+def _docker_api(method: str, path: str, body: dict | None = None) -> tuple[int, Any]:
+    """One request to the docker Engine API over the UDS. stdlib only (psycopg stays the
+    engine's single hard dependency), so this uses http.client with a unix socket."""
+    import http.client
+    import socket as _socket
+
+    class _UDSConnection(http.client.HTTPConnection):
+        def connect(self):  # noqa: D102
+            self.sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+            # 30 s was not enough: a recreate is stop(t=30) + remove + create + start, and
+            # the stop alone can use the full grace period. The call then timed out MID-CYCLE
+            # on a live box — container removed, replacement not yet created — which is the
+            # worst place to give up. Generous, because the alternative to waiting is a
+            # half-recreated sidecar.
+            self.sock.settimeout(180)
+            self.sock.connect(_DOCKER_SOCK)
+
+    conn = _UDSConnection("localhost")
+    try:
+        payload = json.dumps(body).encode() if body is not None else None
+        conn.request(method, path, body=payload,
+                     headers={"Content-Type": "application/json"} if payload else {})
+        resp = conn.getresponse()
+        raw = resp.read()
+        try:
+            return resp.status, (json.loads(raw) if raw else None)
+        except ValueError:
+            return resp.status, raw.decode("utf-8", "replace")
+    finally:
+        conn.close()
+
+
+def _docker_inspect_sidecar():
+    """What docker says the sidecar is, or None if there is no such container."""
+    from queue_workflows.llm_backends.vllm_sidecar import SidecarSpec
+
+    status, data = _docker_api("GET", f"/containers/{_VLLM_CONTAINER}/json")
+    if status == 404:
+        return None
+    if status >= 400 or not isinstance(data, dict):
+        raise RuntimeError(f"docker inspect {_VLLM_CONTAINER!r} failed: {status} {data!r}"[:300])
+    config = data.get("Config") or {}
+    return SidecarSpec(
+        name=_VLLM_CONTAINER,
+        running=bool((data.get("State") or {}).get("Running")),
+        argv=list(config.get("Cmd") or []),
+        image=str(config.get("Image") or ""),
+    )
+
+
+def _docker_recreate_sidecar(spec, argv: list[str]) -> None:
+    """Replace the sidecar with the SAME container carrying a new ``Cmd``.
+
+    Rebuilt from the container's own inspect output (see
+    :func:`~queue_workflows.llm_backends.vllm_sidecar.recreate_payload`), so image, env,
+    ports, binds, devices and restart policy survive verbatim — a model switch must not
+    become a silent redeploy.
+    """
+    from queue_workflows.llm_backends.vllm_sidecar import recreate_payload
+
+    status, inspected = _docker_api("GET", f"/containers/{spec.name}/json")
+    if status >= 400 or not isinstance(inspected, dict):
+        raise RuntimeError(f"docker inspect {spec.name!r} failed: {status}")
+
+    payload = recreate_payload(inspected, argv)
+
+    # Stop + remove BEFORE create: the name is the identity the topology dials, so the
+    # replacement must take it back. Ignore 404/304 (already stopped / already gone).
+    # t=10, not 30: vLLM has nothing to flush, and every second here is a second the box
+    # serves nothing. The generous SOCKET timeout above covers the whole cycle; this one
+    # bounds only how long we wait for a graceful exit before docker SIGKILLs.
+    _docker_api("POST", f"/containers/{spec.name}/stop?t=10")
+    status, body = _docker_api("DELETE", f"/containers/{spec.name}?force=1")
+    if status >= 400 and status != 404:
+        raise RuntimeError(f"could not remove sidecar {spec.name!r}: {status} {body!r}"[:300])
+
+    status, body = _docker_api("POST", f"/containers/create?name={spec.name}", payload)
+    if status >= 400:
+        raise RuntimeError(f"could not create sidecar {spec.name!r}: {status} {body!r}"[:300])
+
+    status, body = _docker_api("POST", f"/containers/{spec.name}/start")
+    if status >= 400 and status != 304:
+        raise RuntimeError(f"could not start sidecar {spec.name!r}: {status} {body!r}"[:300])
+    log.info("[VLLMBackend] sidecar %s recreated serving %s", spec.name, argv)
 
 
 def _default_health_fn(health_url: str) -> bool:

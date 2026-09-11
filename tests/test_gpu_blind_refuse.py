@@ -4,7 +4,7 @@ A GPU worker whose container can't use a CUDA device (``torch.cuda.is_available(
 False — the box-c post-recreate device-cgroup race: HOST GPU healthy, container
 blind) must REFUSE to claim. Otherwise it fast-fails every GPU job ~1 s after
 claiming (``cudaErrorNoDevice``) — a silent black hole that poisons every run a
-lane fans onto it. See ``worklog/gpu-blind-worker-self-exclude.md``.
+lane fans onto it.
 
 The probe is TRI-STATE so the gate fires ONLY on the real blind condition (torch
 present but no device), not when torch is merely absent (a non-GPU / test env) —

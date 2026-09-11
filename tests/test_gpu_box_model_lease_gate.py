@@ -78,8 +78,8 @@ def test_comfyui_render_and_ollama_job_MUTUALLY_EXCLUDE_on_one_box(monkeypatch, 
     # The exact observed collision: an ollama dispatch and a ComfyUI render, both
     # no-model, on ONE physical box. Before the fix they shared __llm_server__; now
     # they are different server kinds → the second one spills.
-    llm = _worker(host="lm-gpu", lease=_file_lease(tmp_path, "lm:1"))
-    vid = _worker(host="vg-gpu", lease=_file_lease(tmp_path, "vg:1"))
+    llm = _worker(host="llm-gpu", lease=_file_lease(tmp_path, "llm:1"))
+    vid = _worker(host="render-gpu", lease=_file_lease(tmp_path, "render:1"))
     monkeypatch.setattr(llm, "_box_serves_comfyui", lambda: False)   # ollama dispatch
     monkeypatch.setattr(vid, "_box_serves_comfyui", lambda: True)    # ComfyUI render
     requeued = []
@@ -93,8 +93,8 @@ def test_comfyui_render_and_ollama_job_MUTUALLY_EXCLUDE_on_one_box(monkeypatch, 
 
 def test_comfyui_render_excludes_a_later_ollama_job_too(monkeypatch, tmp_path):
     # Symmetric: the render takes the box first, an ollama job is then refused.
-    vid = _worker(host="vg-gpu", lease=_file_lease(tmp_path, "vg:1"))
-    llm = _worker(host="lm-gpu", lease=_file_lease(tmp_path, "lm:1"))
+    vid = _worker(host="render-gpu", lease=_file_lease(tmp_path, "render:1"))
+    llm = _worker(host="llm-gpu", lease=_file_lease(tmp_path, "llm:1"))
     monkeypatch.setattr(vid, "_box_serves_comfyui", lambda: True)
     monkeypatch.setattr(llm, "_box_serves_comfyui", lambda: False)
     monkeypatch.setattr(claim_worker.node_queue, "requeue_job_for_retry", lambda jid: None)
@@ -157,8 +157,8 @@ def test_two_no_model_jobs_share_the_llm_slot(tmp_path):
 
 def test_llm_job_and_diffusion_job_mutually_exclude_on_one_box(monkeypatch, tmp_path):
     # Two consumers on one box: one dispatches to ollama, one loads sdxl in-process.
-    llm = _worker(host="lm-gpu", lease=_file_lease(tmp_path, "lm:1"))
-    vid = _worker(host="vg-gpu", lease=_file_lease(tmp_path, "vg:1"))
+    llm = _worker(host="llm-gpu", lease=_file_lease(tmp_path, "llm:1"))
+    vid = _worker(host="render-gpu", lease=_file_lease(tmp_path, "render:1"))
     requeued = []
     monkeypatch.setattr(claim_worker.node_queue, "requeue_job_for_retry",
                         lambda jid: requeued.append(jid))

@@ -75,10 +75,36 @@ def _box_load_gate(model_id: str) -> None:
     un-evictable second model must fail the load, never silently coexist). Every
     probe/evict is best-effort: a dead endpoint degrades to 'saw nothing' and can't wedge
     the load. Logs which kind(s) it cleared so "what server type held the box" is visible."""
-    from queue_workflows import llm_probe, model_residency
+    from queue_workflows import llm_probe, model_registry, model_residency
     from queue_workflows.config import get_config
     from queue_workflows.envcompat import env_get
     from queue_workflows.llm_backends import factory as _llm_factory
+
+    # A SERVER-SERVED MODEL NEVER LOADS IN THIS PROCESS — so this gate must not run for it.
+    #
+    # `ModelSpec.served_by` marks ids an ollama/vLLM serves (the sentinel specs a project
+    # registers for its LLM tags: their "loader" returns the id and puts nothing in VRAM).
+    # Running the clear-then-load gate for one is actively harmful in two ways, both measured
+    # on a live fleet:
+    #
+    #   1. It EVICTS the very server-resident copy the node is about to call. The node then
+    #      dials ollama for a model this gate just unloaded — the "one flag, two meanings"
+    #      failure where an LLM CLIENT is treated as an LLM LOADER.
+    #   2. It then refuses the load, because the surviving resident is reported by the server
+    #      under its full tag (`chat-expert-a:latest`) while the load asks for the bare id
+    #      (`chat-expert-a`) — the same model, compared unequal:
+    #
+    #        MODEL LOAD BLOCKED on box-c-gpu: cleared the box for 'chat-expert-a' (inprocess)
+    #        but chat-expert-a:latest[ollama] is STILL resident after eviction
+    #
+    # 482 `chat-model-a:latest` failures on that fleet share this shape. The residency comparison
+    # is canonicalised below as defence in depth, but the real fix is not entering the gate:
+    # nothing is about to occupy VRAM here, so there is no second model to prevent.
+    _spec = model_registry.MODELS.get(model_id)
+    if _spec is not None and getattr(_spec, "served_by", ()):
+        log.debug("[box] %s is server-served (%s) — no in-process load, gate skipped",
+                  model_id, ",".join(_spec.served_by))
+        return
 
     cfg = get_config()
     label = env_get(cfg.host_label_env, "") or "this-box"
@@ -89,8 +115,13 @@ def _box_load_gate(model_id: str) -> None:
         # grace runs out — absorbs a slow ollama unload without a spurious refusal.
         residents = model_residency.probe_box_residents()
         for _ in range(_GATE_SETTLE_TRIES - 1):
+            # Canonical tags — see the note in assert_can_load. `chat-expert-a:latest` from an
+            # ollama probe is the same model as a load of `chat-expert-a`.
+            from queue_workflows.model_catalog import canonical_tag
+            _w = canonical_tag(model_id)
             if not [r for r in residents
-                    if not (r.server == llm_probe.INPROCESS and r.model == model_id)]:
+                    if not (r.server == llm_probe.INPROCESS
+                            and canonical_tag(r.model) == _w)]:
                 return residents
             _GATE_SLEEP(_GATE_SETTLE_SLEEP_S)
             residents = model_residency.probe_box_residents()

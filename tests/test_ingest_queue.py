@@ -254,16 +254,16 @@ def test_enqueue_with_conn_rolls_back_with_caller():
 
 
 def test_enqueue_accepts_host_configured_queue():
-    queue_workflows.configure(ingest_queues=frozenset({"hydraulic", "corrdiff"}))
+    queue_workflows.configure(ingest_queues=frozenset({"sim", "reports"}))
     queue_workflows.register_ingest_task("run_scenario", lambda r, a: {"ok": True})
     jid = node_queue.enqueue_ingest_job(
-        task_name="run_scenario", queue="hydraulic", args={"scenario_id": 1},
+        task_name="run_scenario", queue="sim", args={"scenario_id": 1},
     )
-    assert _row(jid)["queue"] == "hydraulic"
+    assert _row(jid)["queue"] == "sim"
 
 
 def test_enqueue_rejects_queue_outside_configured_set():
-    queue_workflows.configure(ingest_queues=frozenset({"hydraulic"}))
+    queue_workflows.configure(ingest_queues=frozenset({"sim"}))
     queue_workflows.register_ingest_task("run_scenario", lambda r, a: {"ok": True})
     with pytest.raises(ValueError):
         node_queue.enqueue_ingest_job(task_name="run_scenario", queue="fetch")
@@ -273,21 +273,21 @@ def test_enqueue_rejects_queue_outside_configured_set():
 
 
 def test_ingest_snapshot_reports_depth_and_workers():
-    queue_workflows.configure(ingest_queues=frozenset({"hydro", "hydraulic"}))
+    queue_workflows.configure(ingest_queues=frozenset({"etl", "sim"}))
     queue_workflows.register_ingest_task("t", lambda r, a: {})
-    node_queue.enqueue_ingest_job(task_name="t", queue="hydro")
-    node_queue.enqueue_ingest_job(task_name="t", queue="hydro")
-    node_queue.enqueue_ingest_job(task_name="t", queue="hydraulic")
-    node_queue.claim_next_ingest_job("hydraulic", host="h")  # → running
+    node_queue.enqueue_ingest_job(task_name="t", queue="etl")
+    node_queue.enqueue_ingest_job(task_name="t", queue="etl")
+    node_queue.enqueue_ingest_job(task_name="t", queue="sim")
+    node_queue.claim_next_ingest_job("sim", host="h")  # → running
     node_queue.upsert_worker_heartbeat(
-        host_label="host-c", queue="hydro", concurrency=1,
+        host_label="host-c", queue="etl", concurrency=1,
     )
 
     snap = node_queue.ingest_snapshot()
-    assert snap["queues"]["hydro"]["queued"] == 2
-    assert snap["queues"]["hydro"]["workers"] == 1
-    assert snap["queues"]["hydraulic"]["running"] == 1
-    assert snap["queues"]["hydraulic"]["workers"] == 0
+    assert snap["queues"]["etl"]["queued"] == 2
+    assert snap["queues"]["etl"]["workers"] == 1
+    assert snap["queues"]["sim"]["running"] == 1
+    assert snap["queues"]["sim"]["workers"] == 0
 
 
 # ── ingest_executor terminal/idempotency contract (rank 9) ───────────────────

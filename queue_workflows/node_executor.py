@@ -268,6 +268,37 @@ def execute_node(
     run = run_store.get_run(job["run_id"]) or {}
     t0 = time.time()
 
+    # DEDUP short-circuit (migration 0025) — "one file is never downloaded
+    # twice". A job carrying a ``dedup_key`` names its OUTPUT IDENTITY; if a
+    # node-job with the same (project, key) already COMPLETED, this job's
+    # output already exists — finalize as completed (the twin's context_delta
+    # + a ``_deduped_from`` marker) through the SAME one-txn terminal+outbox
+    # path, and never invoke the body. Opt-in per node (NULL = never), checked
+    # BEFORE any model load / input resolution so a dedup hit costs one
+    # indexed SELECT. Under the download lane's cap-1, same-key jobs
+    # serialize, so the second reliably sees the first's terminal; at wider
+    # caps this is a best-effort skip and the body's own idempotency is the
+    # second layer.
+    if job.get("dedup_key"):
+        twin = node_queue.find_completed_duplicate(
+            dedup_key=job["dedup_key"],
+            project=job.get("project"),
+            exclude_id=job_id,
+        )
+        if twin is not None:
+            delta = dict(twin.get("context_delta") or {})
+            delta["_deduped_from"] = twin["id"]
+            log.info(
+                "[execute_node] %s dedup hit: %r already completed by %s — "
+                "returning success without invoking the body",
+                job_id, job["dedup_key"], twin["id"],
+            )
+            return _finalise_completed(
+                job, delta, t0, run=run,
+                event_detail={"deduped_from": twin["id"],
+                              "dedup_key": job["dedup_key"]},
+            )
+
     required_model = job.get("required_model")
     # REMOTE-SERVED (migration 0022): a row naming ``server_types`` is executed by an
     # EXTERNAL LLM server, so its ``required_model`` says "the box's server must be
@@ -366,32 +397,7 @@ def execute_node(
         context_delta = result.get("context_delta", {})
         if _finalize is not None:
             context_delta = _finalize(context_delta)
-        seconds = time.time() - t0
-        with _db_connection() as conn, conn.cursor() as cur:
-            row = node_queue.mark_completed_in_txn(
-                cur, job_id,
-                context_delta=context_delta,
-                seconds=seconds,
-                vm_rss_mb_peak=_rss_mb(),
-            )
-            if row is None:
-                log.warning(
-                    "[execute_node] %s already terminal; skipping completion event",
-                    job_id,
-                )
-                return "skipped"
-            node_queue.enqueue_dispatch_event_in_txn(
-                cur, job["run_id"], job["node_id"], "completed",
-            )
-        # Forensic node event — best-effort, AFTER the load-bearing terminal txn
-        # commits, so an event-write blip can never roll back the completion.
-        node_queue.record_node_event(
-            event_type="completed", elapsed_s=seconds, **_event_base(job),
-        )
-        _update_run_thumbnail(
-            job["run_id"], job["node_id"], run, context_delta,
-        )
-        return "completed"
+        return _finalise_completed(job, context_delta, t0, run=run)
 
 
 def _event_base(job: dict) -> dict[str, Any]:
@@ -458,6 +464,51 @@ def _requeue_for_transient_gpu(job: dict, error: str, t0: float) -> str:
         job["id"], int(requeued.get("watchdog_retries") or 0), _watchdog_max_retries(), error,
     )
     return "requeued"
+
+
+def _finalise_completed(
+    job: dict,
+    context_delta: dict,
+    t0: float,
+    *,
+    run: dict | None = None,
+    event_detail: dict | None = None,
+) -> str:
+    """Write the terminal ``completed`` row + ``completed`` dispatch event in
+    ONE txn (the outbox atomicity contract) — the single completion writer,
+    shared by the normal invoke path and the dedup short-circuit (its
+    ``event_detail`` stamps ``deduped_from`` on the forensic event). Returns
+    ``"completed"`` (or ``"skipped"`` if the row was already terminal —
+    a duplicate delivery / claim-race loser)."""
+    job_id = job["id"]
+    seconds = time.time() - t0
+    with _db_connection() as conn, conn.cursor() as cur:
+        row = node_queue.mark_completed_in_txn(
+            cur, job_id,
+            context_delta=context_delta,
+            seconds=seconds,
+            vm_rss_mb_peak=_rss_mb(),
+        )
+        if row is None:
+            log.warning(
+                "[execute_node] %s already terminal; skipping completion event",
+                job_id,
+            )
+            return "skipped"
+        node_queue.enqueue_dispatch_event_in_txn(
+            cur, job["run_id"], job["node_id"], "completed",
+        )
+    # Forensic node event — best-effort, AFTER the load-bearing terminal txn
+    # commits, so an event-write blip can never roll back the completion.
+    node_queue.record_node_event(
+        event_type="completed", elapsed_s=seconds,
+        **({"detail": event_detail} if event_detail else {}),
+        **_event_base(job),
+    )
+    _update_run_thumbnail(
+        job["run_id"], job["node_id"], run or {}, context_delta,
+    )
+    return "completed"
 
 
 def _finalise_failed(job: dict, error: str, t0: float) -> str:

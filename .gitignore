@@ -38,9 +38,8 @@ htmlcov/
 .DS_Store
 *.swp
 
-# ── Claude / agent-generated journals + tooling (operator-confirmed) ──────────
+# ── local journals + agent tooling (never committed) ─────────────────────────
 worklog/
-docs/fleet_cutover_runbook.md
 # Claude Workflow scripts + session dirs (they live in ~/.claude — never commit these)
 .claude/
 **/workflows/scripts/

@@ -189,7 +189,10 @@ class FileLeaseStore:
         self.dir = directory
         os.makedirs(self.dir, exist_ok=True)
         try:
-            os.chmod(self.dir, 0o777)
+            # 0o1777, not 0o777: cross-uid writability is the requirement (root
+            # containers + host procs share this dir), but the STICKY bit — like
+            # /tmp's — stops one uid unlinking/squatting another's lease file.
+            os.chmod(self.dir, 0o1777)  # nosec B103 — deliberate: shared cross-uid dir, sticky like /tmp
         except OSError:
             pass  # not the owner — fine, as long as we can write into it
 
@@ -213,7 +216,7 @@ class FileLeaseStore:
         with open(path, "a+") as fh:
             if created:
                 try:
-                    os.chmod(path, 0o666)   # cross-uid: root containers + host procs
+                    os.chmod(path, 0o666)  # nosec B103 — deliberate: cross-uid flock target (root containers + host procs)
                 except OSError:
                     pass
             # NON-BLOCKING with a bounded retry — found live on box-c: a plain

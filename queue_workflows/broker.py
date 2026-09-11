@@ -51,13 +51,14 @@ def _status() -> int:
         snap = node_queue.snapshot(project=p)
         c = snap.get("counts", {})
 
-        def n(q: str, s: str) -> int:
+        def n(q: str, s: str, c: dict = c) -> int:  # bind THIS iteration's counts
             return int(c.get(f"{q}_{s}", 0))
 
         label = "(default)" if p == "" else p
         print(
             f"  {label:24s}  cpu[q{n('cpu','queued')} r{n('cpu','running')}]"
             f"  gpu[q{n('gpu','queued')} r{n('gpu','running')}]"
+            f"  dl[q{n('download','queued')} r{n('download','running')}]"
         )
     return 0
 

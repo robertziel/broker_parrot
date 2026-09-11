@@ -2,7 +2,7 @@
 #
 # NOT APPLIED by CI or any agent — these are starting-point manifests. Review, set the
 # placeholders (image, DSN, token), and `kubectl apply` yourself. See ./README.md and
-# docs/broker_k8s_llm.md.
+# docs/gpu_and_llm.md §4.
 apiVersion: v1
 kind: Namespace
 metadata:

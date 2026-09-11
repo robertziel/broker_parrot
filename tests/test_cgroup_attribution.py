@@ -120,7 +120,7 @@ def test_foreign_containers_excluded_by_prefix(tmp_path):
     a = _make(tmp_path)
     a._docker = _FakeDocker([
         _FakeContainer("ours", "ai_leads-workers-1"),
-        _FakeContainer("theirs", "icon-pk-prep"),
+        _FakeContainer("theirs", "otherapp-prep-1"),
     ])
     out = a.sample()
     assert out is not None

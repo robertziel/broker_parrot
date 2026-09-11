@@ -7,7 +7,7 @@ governed by deployment config — ``OLLAMA_MAX_LOADED_MODELS``, ``KEEP_ALIVE``,
 compose healthchecks, host crons — and deployment config drifts. Worse, multi-tenant
 pooling (migration 0017) puts several PROJECTS on one box, each free to load its own
 model through its own path, with nothing at box level able to see the total. The
-observed result, repeatedly: a 124 GB unified-memory box at 5 GB free with two ~30 GB
+observed result, repeatedly: a large unified-memory box at 5 GB free with two ~30 GB
 models resident, discovered by a human reading a dashboard.
 
 THE INVARIANT. Across a box's LLM servers, at most ``cap`` (default 1) DISTINCT
@@ -84,12 +84,20 @@ def assert_can_load(model_id: str, residents: list["Resident"], *, label: str = 
     fine (one model, no violation). ``residents`` is the box's OBSERVED residency
     (ollama ``/api/ps`` + vLLM ``/v1/models`` — see :func:`probe_box_residents`), so
     this catches a rogue model no cooperative lease tracks."""
-    foreign = sorted({r.model for r in residents if r.model != model_id})
+    # CANONICAL TAGS. ollama reports a resident as `chat-model-a:latest` while a load asks for
+    # `chat-model-a` — the same model, and comparing the raw strings makes it look foreign, so the
+    # box "already holds" the model it is being asked to load and the load is refused. That
+    # produced 482 failures on one fleet before it was traced. `canonical_tag`
+    # is the same normaliser the claim gate's capability narrowing uses, so "is this the same
+    # model?" has ONE answer everywhere.
+    from queue_workflows.model_catalog import canonical_tag
+
+    _want = canonical_tag(model_id)
+    _foreign_r = [r for r in residents if canonical_tag(r.model) != _want]
+    foreign = sorted({r.model for r in _foreign_r})
     if not foreign:
         return
-    where = ", ".join(
-        sorted({f"{r.model}[{r.server}]" for r in residents if r.model != model_id})
-    )
+    where = ", ".join(sorted({f"{r.model}[{r.server}]" for r in _foreign_r}))
     raise ModelAlreadyLoadedError(
         f"MODEL LOAD BLOCKED on {label}: refusing to load {model_id!r} — the box "
         f"already holds {where}. One model per box: unload it first, or route this "
@@ -107,7 +115,7 @@ def held_server_types(residents: list["Resident"]) -> list[str]:
 
 def describe_box_residency(residents: list["Resident"], *, label: str = "?") -> str:
     """One operator-readable line naming the server kind(s) + model(s) a box holds — so
-    "box-c is running ollama:an LLM" (or the two-kind violation) is a visible fact,
+    "box-c is running ollama:chat-model-a" (or the two-kind violation) is a visible fact,
     logged at claim/heartbeat, not something a human infers from a VRAM dashboard."""
     if not residents:
         return f"[box] {label}: idle — no model resident"
@@ -356,7 +364,7 @@ class ModelResidencyEnforcer:
     def _report_residency(self, residents: list[Resident]) -> None:
         """INFORM what server kind + model holds this box, but only when it CHANGES —
         so the daemon log carries an operator-readable, up-to-date 'box-c held by
-        ollama:an LLM' (or a two-kind violation) without per-poll spam. This is the
+        ollama:chat-model-a' (or a two-kind violation) without per-poll spam. This is the
         engine answering "what server type is loaded here" out loud."""
         key = tuple(sorted({(r.server, r.model) for r in residents}))
         if key == self._last_reported:

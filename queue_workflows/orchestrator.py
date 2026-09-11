@@ -57,6 +57,24 @@ def main(argv: list[str] | None = None) -> int:
     argparse.ArgumentParser(prog="queue-orchestrator").parse_args(argv or [])
     _install_signal_handlers()
 
+    # The orchestrator is the process that MIGRATES, so it must not race a database
+    # that is merely slow to come up (a host reboot brings the DB container back after
+    # its dependants). Wait rather than exit — a supervisor restart loop against an
+    # unreachable DB writes nothing anyone reads. A misconfigured DSN still exits.
+    try:
+        # stop_event is NOT optional here. The handlers installed one line above set
+        # it, and without it a SIGTERM during an unbounded wait is READ AND IGNORED:
+        # the orchestrator logs "received signal 15; stopping" and then sits in the
+        # loop until the supervisor SIGKILLs it. That is the wedge the in-process wait
+        # exists to remove, reintroduced one keyword argument at a time.
+        if not db.wait_for_db(stop_event=_stop_event):
+            log.warning("[orchestrator] gave up waiting for the database "
+                        "(QUEUE_WORKFLOWS_DB_WAIT_MAX_S elapsed)")
+            return 1
+    except db.DbMisconfigured as exc:
+        log.error("[orchestrator] %s", exc)
+        return 2
+
     log.info("[orchestrator] bootstrapping engine migrations")
     # Fast path from the snapshot if shipped, then any pending migrations.
     db.bootstrap_from_schema()

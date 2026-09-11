@@ -11,6 +11,8 @@ from __future__ import annotations
 import time
 
 import queue_workflows
+import pytest
+
 from queue_workflows import hw_metrics
 from queue_workflows.db import db_url
 from queue_workflows.hw_feed import HwFeed
@@ -28,6 +30,9 @@ def test_metrics_dsn_resolution(monkeypatch):
     assert hw_metrics.metrics_dsn() == "postgresql://broker/x"
 
 
+# `_broadcast` is pg_notify — LISTEN/NOTIFY DELIVERY, which is the first mechanic the
+# pg_only marker names. SQLite has no pg_notify function, so this asserts nothing there.
+@pytest.mark.pg_only
 def test_hwfeed_receives_broadcast():
     """End-to-end: a published hw sample lands in HwFeed.latest_by_host(),
     keyed by host, fresh (not stale)."""
@@ -49,6 +54,7 @@ def test_hwfeed_receives_broadcast():
         feed.stop()
 
 
+@pytest.mark.pg_only
 def test_hwfeed_keeps_capped_history():
     """HwFeed.history_by_host() accumulates a per-host ring buffer (oldest→newest),
     capped at ``history`` — the time-series a dashboard sparkline renders."""

@@ -40,9 +40,9 @@ Keep the `host_label` **shared** across the N processes in one container. Giving
 
 | Queue | Env var | Default |
 |---|---|---|
-| `cpu` | `LM_WORKFLOW_CPU_WORKERS` | 30 |
-| `gpu` | `LM_WORKFLOW_GPU_WORKERS` | 1 |
-| anything else | `LM_WORKFLOW_LANE_WORKERS` | 1 |
+| `cpu` | `QUEUE_WORKFLOWS_CPU_LANE_WORKERS` | 30 |
+| `gpu` | `QUEUE_WORKFLOWS_GPU_LANE_WORKERS` | 1 |
+| anything else | `QUEUE_WORKFLOWS_LANE_WORKERS` | 1 |
 
 ```yaml
 # docker-compose.yml sketch
@@ -52,7 +52,7 @@ workers-claim-cpu:
   restart: unless-stopped
   stop_grace_period: 60s
   environment:
-    - LM_WORKFLOW_CPU_WORKERS=32   # process count — was the replica count
+    - QUEUE_WORKFLOWS_CPU_LANE_WORKERS=32   # process count — was the replica count
   # NO deploy.replicas — ONE container.
 ```
 

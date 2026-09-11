@@ -7,7 +7,7 @@
 -- exactly the move migration 0007 already made for task_name (the host
 -- validates against its registered set before enqueue). This lets a non-ingest
 -- domain (a second consumer — a non-DAG forecast service) route its own queues
--- (ingest/hydro/hydraulic/gpu) and carry per-job arguments, without forking the
+-- (e.g. ingest/etl/sim) and carry per-job arguments, without forking the
 -- shared engine.
 --
 -- Idempotent (`IF NOT EXISTS` / `IF EXISTS`) so re-running on the live ai_leads

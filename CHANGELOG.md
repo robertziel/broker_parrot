@@ -5,6 +5,234 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [1.4.0] — 2026-09-11
+
+A feature release on from 1.1.0. Migrations 0025–0027 are additive (one dropped
+`CHECK`, nullable columns, a new table) and new features default to off or to the
+old behaviour — **except** two deliberate changes: what a process does when the
+*database* is the problem, and the env names the reference lane script reads. Read
+*Changed — an unreachable database is waited for* and *Changed — the reference lane
+supervisor's knobs* before upgrading a supervised fleet. Versions
+1.2.0–1.3.2 were internal builds that were never published; everything they
+contained is listed here.
+
+### Added — the `download` node-job queue (migration 0025)
+
+- **A third first-class node queue, `download`** — the network-WAIT lane. A
+  pipeline schema marks a node `download: true` and the dispatcher routes it to
+  `queue='download'` (full DAG citizenship: `depends_on` edges, `force_box`
+  placement, lease/watchdog/outbox; `download`+`gpu` on one node is a loud
+  expansion error). Downloads no longer burn a cpu/gpu claim slot on
+  wall-clock.
+- **One downloader at a time, engine-enforced**: the download claim
+  (`claim_next_download_job`) carries a **fleet-wide per-project width cap**
+  (`download_max_concurrent`, default **1**, env
+  `QUEUE_WORKFLOWS_DOWNLOAD_MAX_CONCURRENT`) — counted with no per-host scope
+  (any box's running download occupies the lane; the shared uplink is the
+  protected resource) and serialized by a (queue, project)-keyed advisory
+  lock so two simultaneous claimants can't both take the last slot. A dead
+  downloader's slot frees via the ordinary lease reclaim.
+- **"One file is never downloaded twice"** — opt-in per-node `dedup_key`
+  (`workflow_node_jobs.dedup_key`, literal or `$ref` resolved at enqueue):
+  when a node-job with the same `(project, dedup_key)` has already completed,
+  `execute_node` finalizes the new job as success (the twin's
+  `context_delta` + a `_deduped_from` marker, dispatch event included)
+  without invoking the body. The engine compares strings only — a host whose
+  outputs are box-local encodes the location in the key.
+- Migration `0025` drops the `workflow_node_jobs` cpu/gpu queue `CHECK`
+  (matched by definition, not name — the 0008 "allow-list moves host-side"
+  move; sqlite twin = a one-time transactional table rebuild) and adds
+  `dedup_key` + its partial index. Download workers gate on schema ≥ 25.
+
+### Added — a model catalog, and an ordered array of acceptable models (migrations 0026, 0027)
+
+- **`llm_model_catalog`** — which `(box, server kind)` can actually serve which
+  model. OBSERVED, never declared: the claim worker's GPU heartbeat probe asks its
+  box's servers (ollama `/api/tags` — everything installed, since ollama swaps on
+  demand; vLLM `/v1/models` — the one pinned model) and publishes the answer. It
+  runs in the claim worker because that is the process that can reach the server.
+  An empty catalog means "we do not know", and the matcher treats it as
+  cannot-serve. A model a probe stops listing is retired — scoped to the
+  `(host, kind)` pairs that observation covered, so a transient probe failure never
+  blanks a box.
+- **`required_models`** — a node-job may name an ORDERED array of acceptable
+  `{model, server_types}` entries (`workflow_node_jobs.required_models` JSONB +
+  `required_model_ids`, its flat claim index; schemas declare it per node). The
+  order is a priority: the claim picks the first entry this box can serve and
+  stamps it on **`resolved_model`**. The scalar `required_model` is unchanged and
+  dual-written as the array's head, so a worker on an older engine still claims a
+  new row correctly — no flag day.
+- **The claim advertises what the box HOLDS, not what the registry declares.** A
+  GPU worker narrows `model_registry.known_ids()` by what its own servers just
+  reported, so a job for a model no box has pulled is no longer claimable
+  anywhere. Only ids whose `ModelSpec` declares `served_by=(…)` are narrowed — an
+  in-process model can never appear in a server's listing, so an unmarked spec is
+  treated as in-process (the safe default). An empty or non-intersecting
+  observation leaves the declared list untouched.
+- **Which BYTES ran (migration 0027)** — `llm_model_catalog.digest` keeps each
+  tag's server-reported content digest, and the claim worker stamps
+  `workflow_node_jobs.resolved_artifact`: the immutable artifact tag
+  (`<role>-v<N>-<precision>-<server>`) whose digest matches the role tag's on that
+  box, or vLLM's served id when that is itself an artifact tag.
+  `ModelSpec.server_models` declares artifact options per kind as a tie-break
+  only. NULL when nothing matches — an absent answer, never a guessed one.
+- `flag_unassignable_gpu_jobs` says WHICH problem a stuck job has: "no live GPU
+  machine SERVES model X" (installed nowhere) versus the VRAM verdict.
+
+### Added — vLLM brought up on the REQUESTED model
+
+- The default `ensure_up_fn` is no longer a no-op: it inspects the vLLM sidecar
+  over the docker Engine API (stdlib, unix socket) and, when it serves a
+  different model, recreates it from its own inspect output with only `--model`
+  swapped — image, env, ports, binds, device requests and restart policy survive
+  verbatim. An already-correct sidecar is left alone; a missing one raises so the
+  caller can soft-degrade. The container name and socket are overridable
+  (`QUEUE_WORKFLOWS_VLLM_CONTAINER`, `QUEUE_WORKFLOWS_DOCKER_SOCK`), and
+  `EngineConfig.vllm_start_fn` still replaces the whole mechanism.
+
+### Added — LAN broadcast of hardware metrics (opt-in)
+
+- `configure(broadcast_hw_stats=True)` or `QUEUE_WORKFLOWS_BROADCAST_HW_STATS=1`:
+  the hw-metrics sampler also sends each sample as a UDP broadcast on the local
+  network (`hw_broadcast_port`, default 48291) beside the Postgres NOTIFY — one
+  shared envelope builder, no extra sampling, the default-route interface only
+  unless asked, and no network error can reach the sampler thread. **Off by
+  default.** `hw_metrics` no longer imports the database at module scope, so a
+  broadcast-only host needs no psycopg; `deploy/hw-broadcast.sh` runs a
+  standalone sampler for a host with no claim worker (ROCm or NVIDIA GPU
+  passthrough). See `docs/hw_lan_broadcast.md`.
+
+### Changed — an unreachable database is waited for, not crash-looped on
+
+- `db.get_pool` installs the pool only after a successful open. A timed-out open
+  used to leave a permanently-closed pool installed, so every later call raised
+  `PoolClosed` however healthy the database became; now it raises
+  `db.DbUnreachable` and the next call builds a fresh pool.
+- The claim worker, orchestrator and scheduler **wait in process** for an
+  unreachable database (`db.wait_for_db`: capped 1→30 s backoff, one
+  `waiting_db target=host:port/db` line a minute, interruptible by SIGTERM)
+  instead of exiting into a supervisor restart loop. A waiting worker holds no
+  lease and claims nothing. **Behaviour change** — set
+  `QUEUE_WORKFLOWS_DB_WAIT_MAX_S` to bound the wait and get exit-and-restart back.
+- A database that can never work **as configured** (bad credentials, no such
+  database, a malformed or unset DSN — `db.DbMisconfigured`) exits with code **2**,
+  distinct from the watchdog codes 75–79, naming `host:port/dbname` and never the
+  password. `db.mask_dsn` / `db.scrub_secrets` also redact libpq's own echoes of a
+  malformed DSN.
+
+### Changed — the reference lane supervisor's knobs
+
+- `deploy/run_claim_lane.sh` reads its per-lane process counts from
+  `QUEUE_WORKFLOWS_CPU_LANE_WORKERS` (default 30), `QUEUE_WORKFLOWS_GPU_LANE_WORKERS`
+  (default 1) and `QUEUE_WORKFLOWS_LANE_WORKERS` (any other queue, default 1) — the
+  engine's own env namespace. If you run this script, set these names.
+
+### Changed — broker panel UX pass (Chromium-audited)
+
+- **The v2 operator panel** (`queue-broker-web`, `GET /`) got a measured UX/a11y
+  pass, canon intact (stdlib-only, server-rendered, still zero `<script>`):
+  - `?project=` now scopes **all three** sections — the workers table (and
+    `GET /api/workers` / `/api/snapshot`) previously ignored the filter and
+    showed every tenant's fleet on a filtered view
+    (`orchestrator.list_workers(project=…)`).
+  - Filter chips come from a new `orchestrator.list_projects()` DISTINCT view
+    instead of scanning the newest-500 jobs — a project whose only job is old
+    keeps its chip (it was an unreachable filter), and the panel renders ~5×
+    faster (5.78 → 1.19 ms at 523 jobs; the scan was 79 % of render time,
+    paid per viewer per refresh).
+  - `?refresh=` cadence control (5s default · 30s · off, clamped, malformed
+    falls back): the WCAG 2.2.1 "user can stop the timed reload" affordance,
+    still no-JS — `0` renders no meta-refresh tag at all.
+  - Tables scroll inside their own `overflow-x:auto` wrapper — at 390 px the
+    page itself side-scrolled (scrollWidth 664), pushing status/time columns
+    off-screen.
+  - WCAG AA contrast: all six job chips + three worker chips sat at
+    2.88–3.77:1; text-role tokens darkened hue-for-hue (every pair now
+    ≥ 4.62:1), enforced by a test that parses the live stylesheet.
+  - Semantics: `scope="col"` on every `th`, visually-hidden table captions,
+    `aria-current="page"` on the active project chip.
+  - Scannability: the 8-char job id keeps the full id in `title`; liveness
+    columns render relative ages ("3s/5m/2h/4d ago", absolute UTC in `title`);
+    the capped jobs table says "newest 50 of N"; empty states point at
+    `POST /api/submit` / `/api/ask`.
+
+### Fixed
+
+- **A server switch no longer holds a box out of service for a start that
+  cannot work.** The host's start lever may report what it did
+  (`server_switch.StartOutcome`, a plain `{"status", "reason"}` dict, or `None` —
+  "no verdict", which keeps the old behaviour). A PERMANENT failure (no such
+  container, an OCI error, no lever wired) aborts on the same tick and
+  QUARANTINES that kind with a doubling, persisted backoff; a start that is never
+  acknowledged gives up after `start_ack_timeout_s` (300 s) instead of the 1800 s
+  warm window; and the whole switch budget belongs to the REQUEST, so a restart
+  mid-switch inherits what is left instead of re-arming a full window. A completed
+  switch clears the kind's quarantine.
+- **A drain-park no longer fights the job it keeps.** The park watchdog holds off
+  the LLM eviction while this worker's own pool-lane job is still in flight
+  (bounded by the GPU job budget) instead of forcing a cold reload on every call
+  of the job it promised to keep; a peer's remote traffic still gets nothing. Its
+  repeated verdict is logged once a minute, not every tick.
+- **The spill storm.** A GPU worker denied the card by its own box's lease pauses
+  its GPU claiming (1 s doubling to 30 s, under the lease TTL) instead of
+  re-claiming the row it just re-queued to the front, a dozen times a second.
+- **A server-served model no longer enters the in-process load gate** — which
+  evicted the very server copy the node was about to call, then refused the
+  load — and residency comparisons use canonical tags (`model` ≡ `model:latest`)
+  everywhere.
+- `register_worker`'s UPSERT used a bare `state` inside ON CONFLICT DO UPDATE —
+  AmbiguousColumn on Postgres, silently resolved to the target on SQLite.
+- **Oversized `POST` bodies (413) killed clients with EPIPE**: the broker web
+  service answered 413 and closed while the client was still mid-`send()`, so
+  urllib-style clients raised a broken pipe instead of reading the response
+  (the intermittent `test_oversized_body_rejected_413` failure). The handler
+  now discards the rejected body in bounded 64 KiB chunks (8 MiB drain cap —
+  the OOM guard holds) and drops the connection so the remainder can't be
+  parsed as a next keep-alive request.
+- **Schema `cpu_slots` never reached pipeline-expanded rows** (0024
+  regression): the `_nodes_of` whitelist silently dropped the key, so every
+  pipeline-schema node enqueued as an ordinary 1-slot job regardless of its
+  declared width. `cpu_slots` (and the new `download`/`dedup_key`) are now
+  threaded through explicitly, with a regression test.
+- The vLLM sidecar recreate no longer times out mid-cycle (socket 180 s, stop
+  grace 10 s) and leaves the box with no sidecar at all.
+- The wheel builds again: a redundant `force-include` of the migrations made
+  hatchling refuse to add the same files twice.
+
+### Security & hardening — full-system audit pass
+
+- **Probe URL scheme guard**: the four `llm_probe` fetch helpers now refuse
+  non-`http(s)` URLs (`file://` etc.). Base URLs come from operator config and
+  the DB (`worker_controls`, 0013), so a DB writer must not be able to turn an
+  LLM probe into a local file read. GET-style helpers treat a refused scheme as
+  unreachable (logged); JSON/POST helpers raise `ValueError`.
+- **GPU lease dir is sticky**: the cross-uid `FileLeaseStore` directory is now
+  `0o1777` (like `/tmp`), not bare `0o777` — root containers and host processes
+  still share it, but one uid can no longer unlink/squat another's lease file.
+- Latent-NameError annotations fixed (`claim_worker.predict_default_kind`'s
+  `Iterable`, `vllm._docker_api`'s `Any`) and pinned by a hints-resolve test;
+  4 shadowed local `import json` removed (node_queue); `queue-broker --status`'s
+  count closure default-binds its loop variable; the two rc-handled
+  `subprocess.run` calls declare `check=False` explicitly.
+- **`ingest_store` SPI seam covered hermetically**: 5 stub-backend tests pin the
+  priority inversion (ingest ASC ⇄ SPI DESC), sparse-payload re-inflation
+  defaults, terminal delegation, the reclaim projection, and the snapshot shape —
+  previously only exercised by live-redis tests that skip without a server.
+- Audit clean bills: immutability guards verified on every status transition
+  (no violation), pip-audit clean, no committed secrets, claim path
+  index-backed at 50k rows (21–37 ms), 59× bandit B608 confirmed
+  false-positive per the validated-fragments house rule.
+
+### Notes
+
+- `deploy/k8s/llm-servers.yaml` pins `ollama/ollama:0.33.2` instead of `:latest`:
+  ollama gates model support on its own version, so a floating tag silently falls
+  behind the models it is asked to serve.
+- Docs: `schema.md` is current through 0027; `watchdogs.md` documents exit code 2;
+  new `docs/hw_lan_broadcast.md`.
+
 ## [1.1.0] — 2026-08-04
 
 A feature release, 110 commits on from 1.0.6. Everything here is **additive with

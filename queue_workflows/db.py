@@ -38,13 +38,14 @@ import re
 import sqlite3
 import threading
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
 import psycopg
 from psycopg.rows import dict_row
-from psycopg_pool import ConnectionPool
+from psycopg_pool import ConnectionPool, PoolTimeout
 
 from queue_workflows import config as _config
 
@@ -67,6 +68,208 @@ def _engine_migrations_dir() -> Path:
 
 _pool: ConnectionPool | None = None
 _pool_lock = threading.Lock()
+
+
+# ── an unreachable database is something to WAIT for ─────────────────────────
+#
+# A control-host reboot once brought a project's Postgres back with no docker network
+# endpoint, and every worker of that project crash-looped — hundreds of restarts each,
+# heartbeats weeks stale, nothing in any DB or panel showing it. The loop was not the
+# outage — it was `get_pool` installing a pool whose `open(wait=True)` had TIMED OUT.
+# psycopg_pool closes such a pool, a closed pool cannot reopen, so every later call
+# raised `PoolClosed` however healthy the database became, and exit-and-restart was the
+# only recovery. Both lines are in the live logs, from the same containers.
+
+PoolTimeout = PoolTimeout          # re-exported: callers classify it as transient
+
+
+class DbUnreachable(RuntimeError):
+    """The database is not answering — worth waiting for."""
+
+
+class DbMisconfigured(RuntimeError):
+    """The database will never answer THIS configuration — a restart cannot help."""
+
+
+@dataclass(frozen=True)
+class Reachability:
+    """Can we reach the database, and is the failure worth retrying?"""
+
+    ok: bool
+    transient: bool
+    target: str = "?"
+    error: str = ""
+
+
+#: Substrings that mean "wrong configuration", not "not up yet". Everything else is
+#: retried: a DNS failure in particular is exactly how a detached docker network looks
+#: from inside a container, and retrying is what recovers when it is re-attached.
+_FATAL_DB_ERRORS = (
+    "password authentication failed",
+    "authentication failed for user",
+    "no password supplied",
+    "does not exist",                 # database "x" does not exist
+    "invalid connection option",
+    "missing \"=\" after",            # malformed keyword DSN
+    "invalid dsn",
+    # libpq's URI/keyword parse complaints. Waiting these out is pointless: the string
+    # will never become valid on its own, and the wait's per-minute line is the thing
+    # most likely to quote the malformed token back (see scrub_secrets).
+    "unexpected spaces found in",
+    "invalid percent-encoded token",
+    "invalid uri query parameter",
+    "unterminated quoted string",
+    "end of string reached when looking for matching",
+)
+
+#: The pool constructor, behind a seam so the failure paths are testable without a
+#: server (the whole point being that they are the paths nobody could reproduce).
+_pool_factory: Callable[..., ConnectionPool] = ConnectionPool
+
+
+def mask_dsn(dsn: str) -> str:
+    """``host:port/dbname`` — enough for an operator to know which database to fix,
+    and never the password.
+
+    The parse is NOT trusted. An unencoded ``/`` in a URI password makes libpq mis-read
+    the authority — ``postgresql://user:Xk9/2Lm@host:5432/db`` parses as
+    ``host='user' port='Xk9' dbname='2Lm@host:5432/db'`` — and a naive reassembly then
+    prints the very credentials this function exists to remove. So a component that
+    still looks like part of an authority (``@``, ``:``, ``/``) means the parse failed,
+    and a failed parse gets no detail at all. The result is scrubbed regardless."""
+    if not dsn:
+        return "?"
+    try:
+        from psycopg.conninfo import conninfo_to_dict
+        info = conninfo_to_dict(dsn)
+        host = str(info.get("host") or "?")
+        port = str(info.get("port") or "5432")
+        name = str(info.get("dbname") or "?")
+        # The tells of a mis-parse are an authority character left inside a component
+        # and a non-numeric port. A LEADING slash in host is not one of those — that is
+        # a legitimate unix-socket directory, and rejecting it would make every socket
+        # deployment unreadable.
+        socket_host = host.startswith("/")
+        ipv6_host = host.startswith("[") and host.endswith("]") or (
+            ":" in host and "@" not in host and "/" not in host)
+        suspect = (
+            "@" in host or "@" in port or "@" in name
+            or ":" in port or ":" in name
+            or (":" in host and not ipv6_host)
+            or (not socket_host and "/" in host)
+            or not port.isdigit()
+        )
+        if suspect:
+            return "?"          # the parse is not trustworthy — say nothing
+        return scrub_secrets(f"{host}:{port}/{name}")
+    except Exception:
+        return "?"
+
+
+#: `user:password@host` anywhere in a string — with or without a scheme separator.
+#: libpq echoes the connection string back inside its own errors, and the one that
+#: matters most is the MALFORMED case (`postgres//user:pw@host`, no `://` to anchor on),
+#: which is precisely the DSN a human most often gets wrong. An error text is NOT safe
+#: to log just because we never formatted the DSN into it ourselves.
+_DSN_CREDENTIALS_RE = re.compile(r"(?<![\w.-])[^\s:/@]{1,64}:[^\s@]{0,256}@")
+_PASSWORD_KV_RE = re.compile(r"(password\s*=\s*)(\S+)", re.IGNORECASE)
+
+
+#: The shortest run of password characters worth redacting on its own. Below this a
+#: "fragment" is as likely to be an innocent word as part of a secret, and redacting it
+#: would make an error unreadable for no gain.
+_MIN_SECRET_FRAGMENT = 6
+
+
+def _password_of(dsn: str) -> str:
+    """The password inside a DSN, as WRITTEN — not as libpq parses it.
+
+    Deliberately naive and deliberately greedy: everything between the first ``:`` of
+    the userinfo and the LAST ``@`` of the authority. A password containing ``@``, ``/``
+    or a space is exactly the case that breaks libpq's own parser, so a "correct" parse
+    is the one thing that cannot be relied on here."""
+    try:
+        if "password=" in dsn and "?" in dsn:
+            # A URI may carry the password as a query parameter instead of userinfo:
+            # postgresql://u@host/db?password=…&sslmode=require
+            tail = dsn.split("?", 1)[1]
+            for param in tail.replace("&", " ").split():
+                if param.lower().startswith("password="):
+                    return param.split("=", 1)[1]
+        if "://" in dsn:
+            after = dsn.split("://", 1)[1]
+            authority = after.rsplit("@", 1)[0] if "@" in after else ""
+            if ":" in authority:
+                return authority.split(":", 1)[1]
+            return ""
+        for token in dsn.split():
+            if token.lower().startswith("password="):
+                return token.split("=", 1)[1].strip("'\"")
+    except Exception:
+        pass
+    return ""
+
+
+def scrub_secrets(text: str, *, dsn: str | None = None) -> str:
+    """Remove anything password-shaped from an error string.
+
+    Load-bearing: ``classify_db_error`` keeps the driver's message so an operator can
+    see WHY, and that message reaches a log through ``DbMisconfigured`` and through the
+    per-minute ``waiting_db`` line — which repeats for as long as an outage lasts.
+
+    Whole-DSN echoes are the easy half. The hard half, and the one that leaked past two
+    audits, is libpq quoting back only the FRAGMENT it choked on:
+
+        postgresql://qw:p@ssSECRET@host/db
+          -> failed to resolve host 'ssSECRET@127.0.0.1'
+        postgresql://qw:a bSECRET@host/db
+          -> unexpected spaces found in "a bSECRET", use percent-encoded spaces instead
+
+    Neither contains a ``user:pass@`` shape for a pattern to anchor on, and neither
+    contains the whole DSN. So the password is taken from the DSN as WRITTEN and every
+    run of it at least :data:`_MIN_SECRET_FRAGMENT` long is redacted — longest first, so
+    the biggest match wins. Over-redacting an error message is a cost worth paying; the
+    alternative has been demonstrated four times."""
+    out = str(text)
+    if dsn:
+        out = out.replace(dsn, mask_dsn(dsn))
+        secret = _password_of(dsn)
+        if secret:
+            if len(secret) >= _MIN_SECRET_FRAGMENT:
+                out = out.replace(secret, "***")
+            else:
+                # A short password is likely to BE an ordinary word or number that the
+                # message uses for its own purposes ("e" inside "connection", "5432" as
+                # the port, "host"/"user"/"exist" in libpq's own prose), so blanket
+                # replacement destroys the text. Redact it only in CREDENTIAL context:
+                # immediately before an "@", immediately after a ":", or alone inside
+                # quotes — which is exactly how it appears when libpq quotes back the
+                # fragment it choked on, and never how a port or an English word
+                # appears.
+                esc = re.escape(secret)
+                out = re.sub(rf"(?<![A-Za-z0-9]){esc}(?=@)", "***", out)
+                out = re.sub(rf"(?<=:){esc}(?![A-Za-z0-9])", "***", out)
+                out = re.sub(rf"(?<=['\"]){esc}(?=['\"])", "***", out)
+            if len(secret) >= _MIN_SECRET_FRAGMENT:
+                # Every substring of the password, longest first. Bounded work on a
+                # path that runs at most once a minute.
+                for size in range(len(secret) - 1, _MIN_SECRET_FRAGMENT - 1, -1):
+                    for start in range(0, len(secret) - size + 1):
+                        frag = secret[start:start + size]
+                        if frag in out:
+                            out = out.replace(frag, "***")
+    out = _DSN_CREDENTIALS_RE.sub("***:***@", out)
+    return _PASSWORD_KV_RE.sub(r"\1***", out)
+
+
+def classify_db_error(exc: BaseException, *, target: str = "?",
+                      dsn: str | None = None) -> Reachability:
+    """Is this failure worth waiting out? Fatal only for the handful of errors a
+    restart provably cannot fix. The kept message is scrubbed of credentials."""
+    text = str(exc).lower()
+    fatal = any(marker in text for marker in _FATAL_DB_ERRORS)
+    return Reachability(ok=False, transient=not fatal, target=target,
+                        error=scrub_secrets(exc, dsn=dsn))
 
 
 def db_url() -> str:
@@ -100,13 +303,20 @@ def _pool_sizes() -> tuple[int, int]:
 
 
 def get_pool() -> ConnectionPool:
-    """Lazy-init a process-wide pool. Safe across worker threads."""
+    """Lazy-init a process-wide pool. Safe across worker threads.
+
+    The pool is installed process-wide only AFTER a successful ``open``. It used to be
+    assigned first, and psycopg_pool CLOSES a pool whose ``open(wait=True)`` times out —
+    so one slow start left a permanently-closed object as the process's pool and every
+    later call raised ``PoolClosed``, whatever the database did afterwards. Now a failed
+    open raises :class:`DbUnreachable`, leaves ``_pool`` unset, and the next call can
+    build a healthy one."""
     global _pool
     if _pool is None:
         with _pool_lock:
             if _pool is None:
                 min_size, max_size = _pool_sizes()
-                _pool = ConnectionPool(
+                pool = _pool_factory(
                     db_url(),
                     min_size=min_size,
                     max_size=max_size,
@@ -131,8 +341,145 @@ def get_pool() -> ConnectionPool:
                     check=ConnectionPool.check_connection,
                     open=False,
                 )
-                _pool.open(wait=True, timeout=15.0)
+                try:
+                    pool.open(wait=True, timeout=15.0)
+                except Exception as exc:
+                    try:
+                        pool.close()
+                    except Exception:
+                        pass
+                    url = db_url()
+                    raise DbUnreachable(
+                        f"database at {mask_dsn(url)} did not answer: "
+                        f"{scrub_secrets(exc, dsn=url)}") from exc
+                _pool = pool
     return _pool
+
+
+def probe(dsn: str | None = None, *, connect_fn: Callable[..., Any] | None = None,
+          timeout_s: float = 5.0) -> Reachability:
+    """One direct connection attempt, classified. Deliberately NOT via the pool: a
+    pool's ``wait`` hides the underlying error behind a timeout, which is precisely why
+    the network-detach looked like a generic 15-second stall for months."""
+    if dsn is None and _engine_is_sqlite():
+        # A SQLite "database" is a local file: there is no server to wait for, and its
+        # DSN is not parseable as a Postgres one.
+        return Reachability(ok=True, transient=False, target=sqlite_path())
+    try:
+        url = dsn or db_url()
+    except Exception as exc:
+        # The DSN env is not set at all. That is a misconfiguration, not an outage:
+        # classify it as one so the caller exits 2 instead of tracing back.
+        return Reachability(ok=False, transient=False, target="?",
+                            error=scrub_secrets(exc))
+    target = mask_dsn(url)
+    connect = connect_fn or psycopg.connect
+    try:
+        conn = connect(url, connect_timeout=int(max(1, timeout_s)))
+    except Exception as exc:
+        return classify_db_error(exc, target=target, dsn=url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return Reachability(ok=True, transient=False, target=target)
+    except Exception as exc:
+        return classify_db_error(exc, target=target, dsn=url)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def wait_for_db(
+    *,
+    probe_fn: Callable[[], Reachability] | None = None,
+    dsn: str | None = None,
+    stop_event: Any | None = None,
+    now_fn: Callable[[], float] | None = None,
+    sleep_fn: Callable[[float], None] | None = None,
+    base_s: float = 1.0,
+    cap_s: float = 30.0,
+    log_every_s: float = 60.0,
+    max_wait_s: float | None = None,
+) -> bool:
+    """Block until the database answers. ``True`` when it does.
+
+    Waiting IN PROCESS is the point. The alternative — exit and let the supervisor
+    restart — produced hundreds of restarts per worker against one detached database while
+    writing nothing any reader looks at. A worker that waits holds no lease, claims
+    nothing, and resumes the moment the database returns.
+
+    Raises :class:`DbMisconfigured` immediately for a failure a restart cannot fix, so
+    a genuinely broken deployment still fails loudly instead of retrying for ever.
+    ``False`` means the caller asked to stop (``stop_event``) or ``max_wait_s`` elapsed
+    — the escape hatch back to exit-and-restart for a deployment that prefers it."""
+    import time as _time
+
+    if probe_fn is None and dsn is None and _engine_is_sqlite():
+        return True                      # a local file; nothing to wait for
+    now = now_fn or _time.monotonic
+    sleep = sleep_fn or _time.sleep
+    if max_wait_s is None:
+        raw = (env_get("QUEUE_WORKFLOWS_DB_WAIT_MAX_S") or "").strip()
+        try:
+            max_wait_s = float(raw) if raw else 0.0
+        except ValueError:
+            max_wait_s = 0.0
+    started = now()
+    said_at: float | None = None
+    attempt = 0
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            return False
+        result = probe_fn() if probe_fn is not None else probe(dsn)
+        if result.ok:
+            if attempt:
+                log.warning("[queue_workflows.db] database at %s is back after %d "
+                            "attempt(s)", result.target, attempt)
+            return True
+        if not result.transient:
+            where = result.target
+            if where == "?":
+                # The DSN could not be parsed (or could not be trusted — see mask_dsn),
+                # so name the SETTING instead. "database at ?" told an operator nothing
+                # about which of several DSNs to go and fix.
+                try:
+                    where = f"the DSN in ${_config.get_config().db_url_env}"
+                except Exception:
+                    where = "the configured DSN"
+            raise DbMisconfigured(
+                f"database at {where} cannot be used as configured: {result.error}")
+        attempt += 1
+        where = result.target
+        if where == "?":
+            # A DSN we could not parse (or could not trust) tells the operator nothing;
+            # name the SETTING instead so they know which one to go and fix.
+            try:
+                where = f"the DSN in ${_config.get_config().db_url_env}"
+            except Exception:
+                where = "the configured DSN"
+        delay = min(base_s * (2 ** (attempt - 1)), cap_s)
+        t = now()
+        if said_at is None or t - said_at >= log_every_s:
+            said_at = t
+            log.warning(
+                "[queue_workflows.db] waiting_db target=%s attempt=%d next=%.0fs: %s",
+                where, attempt, delay, result.error,
+            )
+        if max_wait_s and (t - started) + delay > max_wait_s:
+            return False
+        # Sleep INTERRUPTIBLY when we have an event: a bare time.sleep resumes after the
+        # handler returns (PEP 475), so a SIGTERM landing early in a 30 s backoff still
+        # cost the full 30 s — past `docker stop`'s 10 s grace, so the process died by
+        # SIGKILL anyway. With the event, the wait ends the moment the flag is set.
+        if stop_event is not None and sleep_fn is None:
+            if stop_event.wait(delay):
+                return False
+        else:
+            sleep(delay)
+        if stop_event is not None and stop_event.is_set():
+            return False
 
 
 def close_pool() -> None:
@@ -809,7 +1156,7 @@ def bootstrap_from_schema(
     proc = subprocess.run(
         ["psql", "-v", "ON_ERROR_STOP=1", "-q", "-f", str(snap)],
         env={**os.environ, **env},
-        capture_output=True, text=True,
+        capture_output=True, text=True, check=False,  # returncode handled below
     )
     if proc.returncode != 0:
         raise RuntimeError(f"psql failed applying {snap}: {proc.stderr.strip()}")

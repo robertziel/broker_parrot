@@ -45,7 +45,7 @@ def test_nvidia_smi_skips_malformed_rows(monkeypatch):
 
 
 def test_nvidia_smi_handles_unified_memory_na(monkeypatch):
-    """box-c (Grace-class) reports ``[N/A]`` for VRAM (shared system
+    """A Grace-class box reports ``[N/A]`` for VRAM (shared system
     memory). Utilisation still parses; don't drop the row."""
     sample = b"0, 35, [N/A], [N/A]\n"
     monkeypatch.setattr(subprocess, "check_output", lambda *a, **kw: sample)

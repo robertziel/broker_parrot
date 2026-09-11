@@ -17,10 +17,16 @@ from __future__ import annotations
 
 import re
 
+import pytest
+
 from queue_workflows.db import connection
 from queue_workflows.node_queue import NODE_EVENT_TYPES
 
 
+# Introspects `pg_constraint` for a CHECK the SQLite chain deliberately rebuilds WITHOUT
+# (see migrations_sqlite/0025). There is no constraint to compare against on SQLite, so the
+# invariant is meaningless there — it must still run, and does, on Postgres.
+@pytest.mark.pg_only
 def test_node_event_types_match_db_check():
     with connection() as conn, conn.cursor() as cur:
         cur.execute(

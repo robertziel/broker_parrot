@@ -4,7 +4,7 @@
 # AI_LEADS_OLLAMA_URL / AI_LEADS_VLLM_URL config knobs in broker-config).
 #
 # TODAY these are static Deployments. The broker CONTROLLER that scales/(re)models the vLLM
-# Deployment from live queue demand is a follow-up — see docs/broker_k8s_llm.md.
+# Deployment from live queue demand is a follow-up — see docs/gpu_and_llm.md §4.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -21,7 +21,19 @@ spec:
     spec:
       containers:
         - name: ollama
-          image: ollama/ollama:latest
+          # PINNED, not `:latest` — an unpinned tag is how a fleet ends up two releases behind
+          # the models it is asked to serve. ollama gates model support on the runtime version
+          # and stamps the floor into the model manifest itself (`ollama show` prints a
+          # `requires` line); a box below that floor downloads the weights happily and then
+          # cannot load them. Observed: a model whose manifest required **0.32.12** was being
+          # served by boxes on 0.32.0 and 0.32.9 — all of them silently short, because nothing
+          # pinned or asserted a version anywhere.
+          #
+          # 0.33.2 is what was actually exercised: a 27B chat model loaded 100% GPU and
+          # generated under it on both CUDA (`ollama/ollama:0.33.2`) and ROCm (the matching
+          # `0.33.2-rocm`) boxes. Bump this deliberately, after checking the new model
+          # floors — never by re-resolving a floating tag.
+          image: ollama/ollama:0.33.2
           ports:
             - containerPort: 11434
           readinessProbe:

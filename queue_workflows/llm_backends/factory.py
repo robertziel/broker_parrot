@@ -497,7 +497,7 @@ def get_backend(
 
 
 #: Server kinds whose START is expensive enough to need amortising. vLLM reloads
-#: its weights on every start (~7 min for a 35 GB model on unified-memory GPU box); ollama swaps a
+#: its weights on every start (~7 min for a 35 GB model on a unified-memory GPU box); ollama swaps a
 #: model in seconds and is never gated.
 COLD_START_KINDS = frozenset({worker_control.SERVER_TYPE_VLLM})
 
@@ -596,7 +596,7 @@ def choose_server_type(
 _PROBE_TTL_S = 5.0
 #: Grace window during which a kind that WAS answering keeps counting as alive
 #: through failed probes (found live: one 5 s cache slot of "vllm dead" routed a
-#: dispatch to ollama, which loaded a second an LLM copy, which fed the eviction
+#: dispatch to ollama, which loaded a second copy of the LLM, which fed the eviction
 #: loop). 3x the TTL mirrors the heartbeat set's 3-miss debounce. A kind that was
 #: never seen alive gets NO grace — a cold server must not soak up dispatches.
 _PROBE_GRACE_S = 15.0
@@ -730,11 +730,11 @@ def resolve_for_job(
         live = _probe_available([worker_control.SERVER_TYPE_OLLAMA,
                                  worker_control.SERVER_TYPE_VLLM])
         if worker_control.SERVER_TYPE_VLLM in live:
-            # THE ACTIVE SERVER WINS THE DEFAULT (found live, box-b at 105/121 GB):
-            # a no-preference LLM caller (compose_region_report — an LLM user with
+            # THE ACTIVE SERVER WINS THE DEFAULT (found live, on a box already short of memory):
+            # a no-preference LLM caller (compose_report — an LLM user with
             # no model field, so no server_types ever gets stamped) resolved to the
             # box default = ollama, whose daemon ALWAYS answers — and its internal
-            # an LLM calls loaded a second 29 GB copy beside the actively-serving
+            # LLM calls loaded a second 29 GB copy beside the actively-serving
             # vLLM, keep-alive-warm for the node's whole 28-minute run. A live
             # vLLM IS the box's active server (it only answers when it holds the
             # weights), and it serves the fleet's one local model — so the default

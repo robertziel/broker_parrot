@@ -4,7 +4,7 @@ keeps its own database for run/DAG state.
 
 WHY this exists
 ---------------
-The feasibility audit (worklog/redis-broker-rearchitecture.md) rejected "one Redis
+A feasibility audit of a Redis re-architecture rejected "one Redis
 as the sole bus for everything" but endorsed a **shared GPU fleet**: pool the GPU
 boxes so any box can serve GPU work from any app, without collapsing the per-app
 Postgres-as-bus design. A normal DAG node-job can't be run by a pooled worker — it

@@ -3,7 +3,7 @@
 # mount path) at it. See docs/gpu_and_llm.md § "Per-box topology".
 #
 # Each entry maps a worker box (its `host_label`, the value that box exports as the
-# engine's host-label env — e.g. LM_HOST_LABEL / QUEUE_WORKFLOWS_HOST_LABEL) to the
+# engine's host-label env — QUEUE_WORKFLOWS_HOST_LABEL by default) to the
 # LLM server ROOT URL that box should DISPATCH to. The DB (worker_controls, migration
 # 0013) still owns WHICH server type each box runs (ollama / vllm); this file only
 # supplies the address.

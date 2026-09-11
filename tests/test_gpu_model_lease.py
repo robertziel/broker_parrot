@@ -133,7 +133,8 @@ def test_file_store_artifacts_are_cross_uid_writable(tmp_path):
     box — whoever creates it first must not lock the others out (the observed failure:
     a root container created it 0644, then a non-root host worker hit EACCES and could
     not participate at all). So the store chmods the lock file 0666 and the lease dir
-    0777 (a coordination lockfile, not data — the classic shared-lock permission)."""
+    0o1777 — world-writable like /tmp, WITH the sticky bit so one uid cannot
+    unlink/squat another's lease file (a coordination lockfile, not data)."""
     import os
     import stat
 
@@ -143,4 +144,18 @@ def test_file_store_artifacts_are_cross_uid_writable(tmp_path):
     dmode = stat.S_IMODE(os.stat(d).st_mode)
     fmode = stat.S_IMODE(os.stat(os.path.join(d, "gpu_model_lease_box-a.json")).st_mode)
     assert fmode == 0o666, f"lease file must be world-writable, got {oct(fmode)}"
-    assert dmode == 0o777, f"lease dir must be world-writable, got {oct(dmode)}"
+    assert dmode == 0o1777, f"lease dir must be sticky world-writable, got {oct(dmode)}"
+
+
+def test_file_store_lease_dir_is_sticky_not_plain_world_writable(tmp_path):
+    """The shared lease dir must stay cross-uid writable (root containers + host
+    procs) but carry the STICKY bit, so one uid cannot unlink/squat another's
+    lease file — 0o1777 (like /tmp), never bare 0o777."""
+    import os
+    import stat
+
+    d = tmp_path / "lease"
+    gml.FileLeaseStore(str(d))
+    mode = stat.S_IMODE(os.stat(d).st_mode)
+    assert mode & stat.S_ISVTX, f"lease dir mode {oct(mode)} lacks the sticky bit"
+    assert mode & 0o777 == 0o777  # cross-uid writability preserved

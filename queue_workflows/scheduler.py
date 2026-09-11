@@ -201,6 +201,21 @@ def main(argv: list[str] | None = None) -> int:
 
     signal.signal(signal.SIGTERM, _handler)
     signal.signal(signal.SIGINT, _handler)
+
+    # The fleet's third process. It had the same crash-loop shape as the worker and the
+    # orchestrator: an unreachable database meant a 15 s pool timeout and an exit, over
+    # and over, writing nothing any reader looks at. Interruptible (stop_event), so a
+    # SIGTERM during the wait is honoured rather than logged and ignored.
+    from queue_workflows import db
+
+    try:
+        if not db.wait_for_db(stop_event=getattr(ticker, "_stop", None)):
+            log.warning("[scheduler] gave up waiting for the database")
+            return 1
+    except db.DbMisconfigured as exc:
+        log.error("[scheduler] %s", exc)
+        return 2
+
     ticker.run_forever()
     return 0
 

@@ -93,6 +93,21 @@ class Dialect:
             "%(host)s || '|' || %(queue)s || '|' || %(project)s))"
         )
 
+    def queue_claim_serializer(self) -> str | None:
+        """Statement that serializes CLAIMS fleet-wide per (queue, project) —
+        the download lane's width cap counts running rows across ALL hosts, so
+        (unlike :meth:`box_claim_serializer`) the key must NOT include the
+        host: two claimants on different boxes must contend for the SAME lock.
+        pg: an advisory xact lock, auto-released at commit; the 'queue-wide|'
+        prefix keeps its hash domain distinct from the box serializer's
+        'host|queue|project' strings. ``None`` ⇒ the store needs no extra
+        serialization (SQLite's single writer already serializes every
+        claim)."""
+        return (
+            "SELECT pg_advisory_xact_lock(hashtext("
+            "'queue-wide|' || %(queue)s || '|' || %(project)s))"
+        )
+
     def not_distinct_from(self, a: str, b: str) -> str:
         """Null-safe equality (``NULL`` equals ``NULL``) — the warm-model
         affinity tiebreak. pg: ``a IS NOT DISTINCT FROM b``."""
@@ -181,6 +196,12 @@ class SqliteDialect(Dialect):
     def box_claim_serializer(self) -> str | None:
         # SQLite has ONE writer at a time — every claim is already serialized by
         # the store itself, so no extra per-box lock statement is needed.
+        return None
+
+    def queue_claim_serializer(self) -> str | None:
+        # Same single-writer argument as box_claim_serializer: the claim
+        # UPDATE (count guard included) is one atomic statement under SQLite's
+        # write lock, so no fleet-wide lock statement is needed either.
         return None
 
     @property

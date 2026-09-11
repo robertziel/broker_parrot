@@ -33,11 +33,30 @@ class ModelSpec:
                           drop-ref + gc + empty_cache + malloc_trim path.
     - ``est_vram_gb``  — scheduler hint (today informational only;
                           future: admission control).
+    - ``served_by``    — the LLM server kinds that serve this id (``('ollama',
+                          'vllm')``), or EMPTY for a model the worker loads
+                          IN-PROCESS. See :func:`server_served_ids`.
+    - ``server_models`` — the ARTIFACT options behind this id, per server kind:
+                          ``{"ollama": ("chat-expert-a-v6-q4km-ollama",),
+                          "vllm": ("chat-expert-a-v6-bf16-vllm",)}``. The id above is a
+                          ROLE tag — stable across promotions, what traffic dials and
+                          what the claim SQL keys on; each artifact tag is immutable
+                          (one tag, one set of bytes) and names its precision and
+                          serving stack. Declaring the options here lets the panel
+                          show what a role CAN resolve to and lets
+                          :func:`model_catalog.resolve_artifact` prefer a declared
+                          option when observation offers several digest-equal tags.
+                          OPTIONAL, and deliberately not required to be current: the
+                          per-box truth comes from digest observation, so a stale
+                          declaration degrades to "no preference", never to a wrong
+                          stamp.
     """
     id: str
     loader: ModelLoader
     unloader: ModelUnloader | None = None
     est_vram_gb: float = 0.0
+    served_by: tuple[str, ...] = ()
+    server_models: dict[str, tuple[str, ...]] | None = None
 
 
 # Populated at import by registry consumers. Keep the dict in one
@@ -63,6 +82,25 @@ def get(model_id: str) -> ModelSpec:
 
 def known_ids() -> list[str]:
     return sorted(MODELS)
+
+
+def server_served_ids() -> set[str]:
+    """The registered ids an LLM SERVER serves — the only ones a probe can observe.
+
+    The claim worker narrows its advertised capability with what its box's servers
+    actually reported (``model_catalog.narrow_to_observed``). That observation comes from
+    ollama ``/api/tags`` and vLLM ``/v1/models``, so a model the worker loads IN-PROCESS
+    can never appear in it — narrowing against it would delete that model from every box
+    permanently, and its node-jobs would be claimable by nobody. Measured on a live fleet:
+    `tts-model-v1` (a TTS engine, loaded in-process via the warm ModelCache) vanished from
+    every box's `known_models` the moment narrowing shipped.
+
+    The default is therefore the SAFE direction: a spec that does not declare
+    ``served_by`` is treated as in-process and is never narrowed away. Only ids that
+    explicitly say a server serves them are subject to the observation — because those
+    are the only ones an empty observation is evidence ABOUT.
+    """
+    return {spec.id for spec in MODELS.values() if spec.served_by}
 
 
 def fits_within(vram_total_mb: int | None, *, headroom: float = 1.0) -> list[str]:
@@ -98,3 +136,14 @@ def fits_within(vram_total_mb: int | None, *, headroom: float = 1.0) -> list[str
 def clear_for_tests() -> None:
     """TEST-ONLY. Drops the registry so a test can populate it freshly."""
     MODELS.clear()
+
+
+def server_model_options(model_id: str) -> dict[str, tuple[str, ...]]:
+    """The declared artifact options per server kind for ``model_id``, or ``{}``.
+
+    Empty for an unregistered id or one declared without options — callers treat that as
+    "no preference" and fall back to observation (digest match / artifact-tag grammar),
+    never as "cannot resolve".
+    """
+    spec = MODELS.get(model_id)
+    return dict(spec.server_models or {}) if spec else {}

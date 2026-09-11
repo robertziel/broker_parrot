@@ -199,9 +199,9 @@ def test_no_cross_project_claim_on_shared_queue():
     runs = {p: _client_enqueue_run(p) for p in PROJECTS}
     # a worker for a project with NO jobs claims nothing (no cross-tenant theft).
     queue_workflows.configure(project="beta")
-    w = ClaimWorker(queue="cpu", host="lm-cpu")
+    w = ClaimWorker(queue="cpu", host="beta-cpu")
     assert w.run_once() is True                       # its own job
     assert w.run_once() is False                      # empty for it now
-    # ai_leads & alpha jobs are still queued — lm's worker never touched them.
+    # ai_leads & alpha jobs are still queued — beta's worker never touched them.
     assert node_queue.list_jobs_for_run(runs["ai_leads"])[0]["status"] == "queued"
     assert node_queue.list_jobs_for_run(runs["alpha"])[0]["status"] == "queued"

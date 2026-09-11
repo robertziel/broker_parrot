@@ -1458,37 +1458,37 @@ def test_budget_for_fetch_and_load():
 
 
 def test_claim_worker_accepts_host_configured_ingest_queue():
-    queue_workflows.configure(ingest_queues=frozenset({"hydro", "hydraulic", "corrdiff"}))
-    w = claim_worker.ClaimWorker(queue="hydraulic", host="host-c")
-    assert w.queue == "hydraulic"
+    queue_workflows.configure(ingest_queues=frozenset({"etl", "sim", "reports"}))
+    w = claim_worker.ClaimWorker(queue="sim", host="host-c")
+    assert w.queue == "sim"
     assert w._is_ingest is True
     assert w._wake_channel == "ingest_job_ready"
 
 
 def test_claim_worker_rejects_queue_not_in_configured_set():
-    queue_workflows.configure(ingest_queues=frozenset({"hydraulic"}))
+    queue_workflows.configure(ingest_queues=frozenset({"sim"}))
     with pytest.raises(ValueError):
         claim_worker.ClaimWorker(queue="fetch", host="h")  # narrowed out
 
 
 def test_configure_rejects_reserved_queue_names():
     with pytest.raises(ValueError):
-        queue_workflows.configure(ingest_queues=frozenset({"hydro", "gpu"}))
+        queue_workflows.configure(ingest_queues=frozenset({"etl", "gpu"}))
 
 
 def test_budget_for_custom_ingest_queue_uses_config_default():
     queue_workflows.configure(ingest_default_budget_s=1234)
-    assert claim_worker.budget_for({"queue": "hydraulic"}) == 1234
+    assert claim_worker.budget_for({"queue": "sim"}) == 1234
 
 
 def test_await_schema_custom_ingest_queue_requires_v8(monkeypatch):
     from queue_workflows import db
-    queue_workflows.configure(ingest_queues=frozenset({"hydro"}))
+    queue_workflows.configure(ingest_queues=frozenset({"etl"}))
     seen: dict = {}
     monkeypatch.setattr(
         db, "wait_for_schema", lambda mv, **kw: seen.update(min_version=mv) or mv,
     )
-    claim_worker.ClaimWorker(queue="hydro", host="h").await_schema()
+    claim_worker.ClaimWorker(queue="etl", host="h").await_schema()
     assert seen["min_version"] == 8
 
 
@@ -1758,7 +1758,7 @@ def test_heartbeat_emit_once_gpu_reports_current_model(_heartbeat_enabled):
     assert _heartbeat_row("host-a", "gpu")["current_model"] is None
 
 
-@pytest.mark.parametrize("queue", ["fetch", "load", "hydro"])
+@pytest.mark.parametrize("queue", ["fetch", "load", "etl"])
 def test_heartbeat_emits_for_ingest_queues(queue, _heartbeat_enabled):
     # G5 + migration 0008: ingest-family workers heartbeat too (the cpu/gpu-only
     # CHECK is gone), with current_model NULL, so a host's queue gauge sees them.

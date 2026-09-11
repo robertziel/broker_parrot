@@ -679,7 +679,9 @@ def main(argv: list[str] | None = None) -> int:
         "--host", default=None,
         help="host_label (default: this host's AI_LEADS_HOST_LABEL / hostname)",
     )
-    parser.add_argument("--queue", required=True, help="cpu | gpu | <ingest queue>")
+    parser.add_argument(
+        "--queue", required=True,
+        help="cpu | gpu | download | <ingest queue>")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--on", action="store_true", help="enable the worker")
     group.add_argument(

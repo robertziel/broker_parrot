@@ -82,6 +82,35 @@ def _default_db_backend() -> str:
     return norm
 
 
+def _env_flag(name: str) -> bool:
+    """Truthiness for a ``QUEUE_WORKFLOWS_*`` boolean knob, read through
+    ``envcompat`` so the legacy ``AI_LEADS_*`` twin resolves for free. Anything
+    in ``{1,true,yes,on}`` (case-insensitive) is on; unset or anything else is
+    off, so a typo fails safe rather than silently enabling a feature."""
+    from queue_workflows.envcompat import env_get
+    raw = env_get(name)
+    return bool(raw) and raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _default_broadcast_hw_stats() -> bool:
+    """Default ``broadcast_hw_stats``, from ``QUEUE_WORKFLOWS_BROADCAST_HW_STATS``
+    — the env knob that reaches the standalone console scripts, which have no
+    host ``configure()``. Unset ⇒ ``False`` (off, the safe default: a host must
+    opt in before its telemetry goes on the wire)."""
+    return _env_flag("QUEUE_WORKFLOWS_BROADCAST_HW_STATS")
+
+
+def _default_hw_broadcast_port() -> int:
+    """Default ``hw_broadcast_port``, from ``QUEUE_WORKFLOWS_HW_BROADCAST_PORT``.
+    Unset or unparseable ⇒ :data:`queue_workflows.hw_lan.DEFAULT_PORT`."""
+    from queue_workflows.envcompat import env_get
+    raw = env_get("QUEUE_WORKFLOWS_HW_BROADCAST_PORT")
+    try:
+        return int(raw) if raw else 48291
+    except (TypeError, ValueError):
+        return 48291
+
+
 def _default_project() -> str:
     """Default ``project``, read from ``QUEUE_WORKFLOWS_PROJECT`` (the env knob that
     reaches entrypoints which don't go through a host ``configure(project=...)`` —
@@ -280,7 +309,13 @@ class EngineConfig:
     #: ``VLLMBackend`` by the backend factory; ``None`` passes through to the
     #: backend's own default (``kill_fn or _default_kill_fn``).
     vllm_stop_fn: Callable[[], bool] | None = None
-    vllm_start_fn: Callable[[str], None] | None = None
+    #: Start the box's vLLM server. MAY return what it did — a
+    #: ``server_switch.StartOutcome``, a plain ``{"status": ..., "reason": ...}`` dict
+    #: (so a host file can report outcomes while still deployed against an older engine
+    #: wheel), a bool, or ``None``. ``None`` means "no verdict" and behaves exactly as
+    #: before; a ``permanent`` verdict ends the switch's out-of-service window on the
+    #: spot instead of at the warm timeout. See ServerSwitch.report_start_outcome.
+    vllm_start_fn: Callable[..., Any] | None = None
 
     # ── inference-server ON/OFF, tied to the GPU worker toggle (host-provided) ─
     #: The operator GPU ON/OFF toggle (worker_controls, migration 0012) governs the
@@ -305,7 +340,7 @@ class EngineConfig:
     #: :func:`queue_workflows.comfyui.acquire_box_for_comfyui` clears every rival
     #: serving kind off the card and then calls ``comfyui_start_fn()`` to ensure
     #: ComfyUI holds the box. The host wires these to whatever it runs (e.g.
-    #: ``docker start/stop vg-comfy`` over the UDS). Both default ``None`` ⇒ no-op
+    #: ``docker start/stop comfyui`` over the UDS). Both default ``None`` ⇒ no-op
     #: (a deployment that never wires them keeps ComfyUI as an already-running,
     #: externally-managed server). See :func:`queue_workflows.set_comfyui_lifecycle`.
     comfyui_start_fn: Callable[[], None] | None = None
@@ -399,6 +434,23 @@ class EngineConfig:
     #: Set via ``configure(disable_gpu_worker_hw_sampler=True)``.
     disable_gpu_worker_hw_sampler: bool = False
 
+    # ── LAN broadcast of hw-metrics (opt-in) ─────────────────────────────────
+    #: When ``True``, the host's hw-metrics sampler ALSO emits each sample as a
+    #: UDP broadcast on the local network, alongside the Postgres NOTIFY it
+    #: already fires. This exists so a LAN appliance (a display panel, say) can
+    #: consume telemetry with zero configuration — no DSN, no credentials, no
+    #: sidecar re-probing a box the engine already probes — and keeps working
+    #: across DHCP changes on either side. It adds no sampling: the very sample
+    #: handed to the NOTIFY path is what goes on the wire, in the same envelope.
+    #: Default ``False`` — a host must opt in before its telemetry is broadcast.
+    #: Set via ``configure(broadcast_hw_stats=True)`` or
+    #: ``QUEUE_WORKFLOWS_BROADCAST_HW_STATS=1``. See :mod:`queue_workflows.hw_lan`.
+    broadcast_hw_stats: bool = field(default_factory=_default_broadcast_hw_stats)
+
+    #: UDP port the above broadcasts to. Consumers must agree with it.
+    #: ``QUEUE_WORKFLOWS_HW_BROADCAST_PORT`` overrides; default 48291.
+    hw_broadcast_port: int = field(default_factory=_default_hw_broadcast_port)
+
     # ── cpu lane width (opt-in in-process concurrency) ────────────────────────
     #: How many node-jobs ONE cpu claim-worker process may run at a time. ``1``
     #: (the default) is the historical concurrency-1 worker: claim, run the body
@@ -420,11 +472,22 @@ class EngineConfig:
     #: PAR budget.
     cpu_worker_threads: int = 1
 
+    # ── download lane width (fleet-wide per-project cap; migration 0025) ──────
+    #: How many ``download`` node-jobs may be RUNNING at once — counted across
+    #: the WHOLE fleet for this project, not per host. Downloads are network
+    #: WAIT, and the uplink they contend for is shared by every box, so the cap
+    #: is claim-side and host-independent (``node_queue.claim_next_download_job``
+    #: refuses while the count is at the cap; an advisory lock serializes the
+    #: racing claimants). Default **1** = one downloader at a time — the lane's
+    #: whole point. Floored at 1 (a 0 cap would be a permanently dead lane).
+    #: Env twin ``QUEUE_WORKFLOWS_DOWNLOAD_MAX_CONCURRENT`` overrides (envcompat).
+    download_max_concurrent: int = 1
+
     # ── ingest queue names + budget (host-configurable; G1) ────────────────────
     #: Ingest-family queue names. Migration 0008 dropped the fetch/load DB CHECK;
     #: the host validates ``queue`` against THIS set before enqueue (mirroring the
     #: task_name gate). Default {'fetch','load'} keeps ai_leads byte-compat; a
-    #: different project (e.g. a forecast service) sets {'ingest','hydro','hydraulic','gpu'}.
+    #: different project (e.g. a forecast service) sets {'ingest','etl','sim','reports'}.
     ingest_queues: frozenset[str] = frozenset({"fetch", "load"})
     #: Wall-clock budget (s) the claim worker applies to ingest queues OTHER than
     #: the built-in fetch/load (``claim_worker.budget_for``). Host-tunable.

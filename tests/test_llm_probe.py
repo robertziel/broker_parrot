@@ -252,3 +252,37 @@ def test_gpu_usable_false_on_cpu_or_no_server():
     assert llm_probe.gpu_usable(["ollama"], "cpu") is False      # the fault we skip
     assert llm_probe.gpu_usable([], "unknown") is False          # no server at all
     assert llm_probe.gpu_usable([], "gpu") is False
+
+
+# ── scheme guard: probe URLs come from operator config / the DB (0013), so the
+#    fetch helpers must refuse non-HTTP schemes — a file:// URL must never turn
+#    an LLM probe into a local file read ─────────────────────────────────────
+
+
+def test_probe_get_helpers_refuse_non_http_schemes(tmp_path, caplog):
+    import logging
+
+    secret = tmp_path / "secret.txt"
+    secret.write_text("s3cret-bytes")
+    url = secret.as_uri()  # file://…
+    from queue_workflows.llm_probe import _default_get, _default_get_text
+
+    # The GUARD must refuse (logged), not merely happen to fail — a vacuous pass
+    # here would leave file:// one .status quirk away from a local file read.
+    with caplog.at_level(logging.WARNING, logger="queue_workflows.llm_probe"):
+        assert _default_get(url, 1.0) is None        # "unreachable", not a read
+        assert _default_get_text(url, 1.0) == ""
+    assert caplog.text.count("scheme") >= 2
+
+
+def test_probe_json_helpers_refuse_non_http_schemes(tmp_path):
+    import pytest as _pytest
+
+    from queue_workflows.llm_probe import _default_get_json, _default_post_json
+
+    f = tmp_path / "x.json"
+    f.write_text("{}")
+    with _pytest.raises(ValueError, match="scheme"):
+        _default_get_json(f.as_uri(), 1.0)
+    with _pytest.raises(ValueError, match="scheme"):
+        _default_post_json(f.as_uri(), {"a": 1}, 1.0)

@@ -63,15 +63,37 @@ _LOCAL_HOSTS = frozenset({
 })
 
 
+#: The only URL schemes a probe will fetch. Base URLs come from operator config —
+#: the topology file, env, and the DB (``worker_controls``, 0013) — so any process
+#: that can write those must still not be able to point a probe at ``file://`` (a
+#: local file read into probe results) or another non-HTTP scheme.
+_ALLOWED_URL_SCHEMES = ("http", "https")
+
+
+def _refuse_non_http(url: str) -> bool:
+    """True (and a WARNING log) when ``url`` is not plain http(s) — callers treat
+    it as unreachable / raise, per their own contract."""
+    import urllib.parse
+
+    scheme = urllib.parse.urlparse(url).scheme.lower()
+    if scheme in _ALLOWED_URL_SCHEMES:
+        return False
+    log.warning("[llm-probe] refusing non-HTTP url scheme %r (%s)", scheme, url)
+    return True
+
+
 def _default_get(url: str, timeout_s: float) -> int | None:
     """GET ``url``, return its HTTP status, or ``None`` when it cannot be reached.
 
     stdlib only (see module docstring). A 4xx/5xx is still an ANSWER — something is
     listening and speaking HTTP — so it comes back as a status, not ``None``; only a
-    connection failure / timeout / DNS miss is ``None``."""
+    connection failure / timeout / DNS miss — or a refused non-HTTP scheme — is
+    ``None``."""
     import urllib.error
     import urllib.request
 
+    if _refuse_non_http(url):
+        return None
     try:
         with urllib.request.urlopen(url, timeout=timeout_s) as resp:  # noqa: S310
             return int(resp.status)
@@ -87,6 +109,8 @@ def _default_get_json(url: str, timeout_s: float):
     import json
     import urllib.request
 
+    if _refuse_non_http(url):
+        raise ValueError(f"refusing non-HTTP url scheme: {url!r}")
     with urllib.request.urlopen(url, timeout=timeout_s) as resp:  # noqa: S310
         return json.loads(resp.read().decode("utf-8"))
 
@@ -284,6 +308,9 @@ def _default_get_text(url: str, timeout_s: float) -> str:
     """GET a URL and return its body, or "" on any failure. stdlib-only (urllib) —
     :mod:`llm_probe` must never grow an HTTP dependency."""
     import urllib.request
+
+    if _refuse_non_http(url):
+        return ""
     try:
         with urllib.request.urlopen(url, timeout=timeout_s) as resp:
             if getattr(resp, "status", 200) != 200:
@@ -314,11 +341,117 @@ def vllm_served_models(
         return []
 
 
+def ollama_available_models(
+    base_url: str | None,
+    *,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+    get_json_fn=None,
+) -> list[str]:
+    """Every model INSTALLED on an ollama at ``base_url`` (``/api/tags``).
+
+    Deliberately a different question from :func:`vllm_served_models`, and both answers
+    are right: ollama swaps models on demand, so everything installed is servable; a vLLM
+    pins ONE model for its process lifetime, so only that one is. Conflating them would
+    advertise capability a vLLM cannot honour without a restart, and the claim gate would
+    then send it work it must refuse.
+
+    Never raises; ``[]`` on any failure — absence is a real state (see the module
+    docstring), not a reason to guess."""
+    if not base_url:
+        return []
+    get_json = get_json_fn or _default_get_json
+    try:
+        data = get_json(f"{str(base_url).rstrip('/')}/api/tags", timeout_s)
+        rows = data.get("models") if isinstance(data, dict) else None
+        return [str(m["name"]) for m in (rows or [])
+                if isinstance(m, dict) and m.get("name")]
+    except Exception:
+        return []
+
+
+def ollama_available_models_with_digests(
+    base_url: str | None,
+    *,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+    get_json_fn=None,
+) -> list[tuple[str, str]]:
+    """``(name, digest)`` for every model an ollama at ``base_url`` holds.
+
+    The digest is what ties a stable ROLE tag to the immutable ARTIFACT tag behind it:
+    ollama reports one content hash per tag, and two tags with one hash are one set of
+    bytes. Kept as a SECOND function rather than widening the return of
+    :func:`ollama_available_models` because that one's ``list[str]`` shape is consumed by
+    the observed-narrowing path in several projects — changing it is a flag-day; adding
+    beside it is not.
+
+    Same failure contract: never raises, ``[]`` on anything — absence is a real state.
+    """
+    if not base_url:
+        return []
+    get_json = get_json_fn or _default_get_json
+    try:
+        data = get_json(f"{str(base_url).rstrip('/')}/api/tags", timeout_s)
+        rows = data.get("models") if isinstance(data, dict) else None
+        return [(str(m["name"]), str(m.get("digest") or ""))
+                for m in (rows or []) if isinstance(m, dict) and m.get("name")]
+    except Exception:
+        return []
+
+
+def observe_box_models(
+    host_label: str,
+    *,
+    # ── WHERE THIS MUST RUN ──────────────────────────────────────────────────────
+    # In the CLAIM WORKER, not the orchestrator. Measured on a live fleet:
+    # the claim container resolves `host.docker.internal` and saw 4 models; the
+    # orchestrator container on the SAME box got
+    #     URLError [Errno -2] Name or service not known
+    # because it is not launched with extra_hosts host-gateway. Publishing from there
+    # would write an EMPTY catalog for a box that is serving perfectly well — and since
+    # `best_match` treats unknown as cannot-serve (deliberately, the conservative
+    # direction), an empty catalog does not degrade gracefully: it stops every LLM claim
+    # on that box. The conservative default is only safe if the observer is the process
+    # that can actually see the server.
+    urls_by_kind: dict,
+    ollama_fn=None,
+    vllm_fn=None,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+) -> list:
+    """What THIS box's servers can actually serve, as catalog entries.
+
+    One entry per (kind, model). A kind with no URL contributes nothing rather than an
+    empty claim, and a box whose servers all answer nothing publishes NOTHING — which is
+    the visible-absence property this module exists to preserve."""
+    from queue_workflows.model_catalog import CatalogEntry
+
+    # ollama contributes (name, digest) pairs — the digest is what lets the catalog tie a
+    # role tag to the artifact behind it (model_catalog.resolve_artifact). vLLM reports no
+    # digest, so its entries carry "" and resolution falls back to the served id itself
+    # being an artifact tag. Injected fns may return either shape; normalise here.
+    ask = {"ollama": ollama_fn or ollama_available_models_with_digests,
+           "vllm": vllm_fn or vllm_served_models}
+    out: list = []
+    for kind, url in (urls_by_kind or {}).items():
+        if not url or kind not in ask:
+            continue
+        for item in ask[kind](url, timeout_s=timeout_s):
+            if isinstance(item, tuple):
+                model_id, digest = item
+            else:
+                model_id, digest = item, ""
+            entry = CatalogEntry(host_label, kind, str(model_id), digest=str(digest))
+            if entry not in out:
+                out.append(entry)
+    return out
+
+
 def _default_post_json(url: str, payload, timeout_s: float) -> int:
     """POST ``payload`` as JSON, return the HTTP status. stdlib only."""
     import json
     import urllib.request
 
+    if _refuse_non_http(url):
+        raise ValueError(f"refusing non-HTTP url scheme: {url!r}")
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"}, method="POST",

@@ -72,7 +72,14 @@ def register_worker(worker_id: str, *, project: str, resource: str) -> None:
             "ON CONFLICT (worker_id) DO UPDATE SET "
             "project = excluded.project, resource = excluded.resource, "
             f"last_seen = {d.now}, "
-            "state = CASE WHEN state = 'dead' THEN 'waiting' ELSE state END",
+            # QUALIFIED, not bare. Inside ON CONFLICT DO UPDATE, a bare `state` is
+            # ambiguous on Postgres — it could mean the target column or excluded.state —
+            # and pg refuses with AmbiguousColumn. SQLite silently resolves it to the
+            # target, which is why this only ever failed on pg and passed the SQLite run.
+            # The intent is the EXISTING row's state ("revive a dead worker, otherwise
+            # leave it alone"), so name the table.
+            "state = CASE WHEN bw_workers.state = 'dead' "
+            "THEN 'waiting' ELSE bw_workers.state END",
             {"w": worker_id, "p": project, "r": resource},
         )
         conn.commit()
@@ -364,14 +371,34 @@ def list_jobs(*, project: str | None = None, status: str | None = None, limit: i
         return [_row_to_job(r) for r in cur.fetchall()]
 
 
-def list_workers():
-    """All registered workers, ordered by resource then id. Read-only."""
+def list_workers(*, project: str | None = None):
+    """All registered workers (optionally one project's), ordered by resource then
+    id. Read-only. The ``project`` filter matches the panel's ``?project=`` scope —
+    a filtered view must scope the FLEET too, not just the jobs."""
+    params, clause = {}, ""
+    if project is not None:
+        clause = "WHERE project = %(project)s"
+        params["project"] = project
     with db.connection() as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT worker_id, project, resource, state, last_seen "
-            "FROM bw_workers ORDER BY resource ASC, worker_id ASC"
+            f"FROM bw_workers {clause} ORDER BY resource ASC, worker_id ASC",
+            params or None,
         )
         return cur.fetchall()
+
+
+def list_projects() -> list[str]:
+    """Every project label present on the queue or in the worker registry, sorted.
+    Powers the panel's filter chips — a DISTINCT view, deliberately NOT derived
+    from a recent-jobs window: a project whose only job is old must still get a
+    chip (its jobs still count in the KPIs, so a missing chip would be an
+    unreachable filter). ``UNION`` dedups across both tables on pg and sqlite."""
+    with db.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT project FROM bw_jobs UNION SELECT project FROM bw_workers ORDER BY project"
+        )
+        return [r["project"] for r in cur.fetchall()]
 
 
 def queue_counts(*, project: str | None = None):

@@ -101,7 +101,7 @@ The `$from` ref pulls `name` out of the run's `context` at execute time — late
 
 ## 3. Wire the host (`configure` + seams) and bootstrap
 
-One startup module does the wiring. `configure()` only mutates the keys you pass; `db.bootstrap()` applies the engine's migration chain idempotently. The full hook reference is [`docs/configuration.md`](docs/configuration.md).
+One startup module does the wiring. `configure()` only mutates the keys you pass; `db.bootstrap()` applies the engine's migration chain idempotently. The full hook reference is [`docs/configuration.md`](configuration.md).
 
 ```python
 # myapp/engine.py
@@ -143,7 +143,7 @@ def init() -> None:
 
 ## 4. Launch the processes (console scripts)
 
-Independent processes run against the one database. You run a **claim worker per queue per host**; the **orchestrator** drives DAG fan-out + lease reclaim; the **scheduler** fires periodic ingest jobs (skip it if you have none). Each process calls `myapp.engine.init()` at startup, then hands off. See [`docs/deployment.md`](docs/deployment.md).
+Independent processes run against the one database. You run a **claim worker per queue per host**; the **orchestrator** drives DAG fan-out + lease reclaim; the **scheduler** fires periodic ingest jobs (skip it if you have none). Each process calls `myapp.engine.init()` at startup, then hands off. See [`docs/deployment.md`](deployment.md).
 
 ```bash
 queue-orchestrator                 # DAG dispatch loop + dead-worker lease reclaim (bootstraps migrations)

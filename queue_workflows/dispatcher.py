@@ -172,6 +172,26 @@ def _nodes_of(
                 # Per-node LLM server preference (migration 0022) — same whitelist
                 # rule: not copied here means silently dropped.
                 "server_types": sn.get("server_types"),
+                # The ORDERED acceptable-model array (migration 0026). Copied HERE or it
+                # never reaches `_enqueue` at all: this is an explicit per-field bridge,
+                # not a passthrough, so a schema key absent from this list is silently
+                # dropped. Verified live — a node declared required_models, the
+                # schema loaded with it, and every row still landed with NULL.
+                "required_models": sn.get("required_models"),
+                # Queue routing to the download lane (migration 0025) — the
+                # whitelist rule again: without this line a schema's
+                # ``download: true`` would silently route to cpu.
+                "download": bool(sn.get("download")),
+                # Output-identity dedup (0025). May be a literal string or a
+                # ``$ref`` (a release-dependent key needs run params) —
+                # resolved at enqueue in ``_enqueue_node``.
+                "dedup_key": sn.get("dedup_key"),
+                # Per-node CPU width (migration 0024). This line was MISSING at
+                # 0024: a schema's ``cpu_slots`` was whitelisted away right
+                # here, so every pipeline-expanded row stamped NULL and a wide
+                # node reserved 1 slot — precisely the silent drop the comment
+                # above warns about. Threaded through like its siblings now.
+                "cpu_slots": sn.get("cpu_slots"),
             })
     return out
 
@@ -233,6 +253,20 @@ def _queue_of(node: dict[str, Any]) -> str:
     # Every ``gpu: true`` node lands on the GPU queue. Nodes without a declared
     # ``model`` aren't cache-managed — the GPU claim worker skips
     # ``require_model`` for them and invokes the node directly.
+    #
+    # ``download: true`` (migration 0025) routes to the width-capped download
+    # lane — network WAIT, not compute, so it must hold neither a cpu slot nor
+    # a GPU. The two flags on one node are a contradiction, and a silent
+    # winner would mis-route real work — so it is a LOUD error at expansion
+    # (the ``_assert_gpu_nodes_declare_model`` precedent).
+    if node.get("download"):
+        if node.get("gpu"):
+            raise ValueError(
+                f"node {node.get('id')!r}: 'download' and 'gpu' are mutually "
+                "exclusive — a download node is network-bound and runs on the "
+                "download lane, never on the GPU"
+            )
+        return "download"
     return "gpu" if node.get("gpu") else "cpu"
 
 
@@ -1356,6 +1390,12 @@ def _enqueue(run_id: str, node: dict[str, Any], run: dict[str, Any]) -> str:
         node_module=node.get("node") or node["id"],
         queue=queue,
         required_model=_required_model(node),
+        # Per-node ORDERED list of ACCEPTABLE models (migration 0026): each entry names a
+        # model and, optionally, the server kinds it may be served by. Absent ⇒ NULL ⇒ the
+        # scalar `model` path, byte-identical to before. Threaded HERE and nowhere else —
+        # a schema field the dispatcher does not read is a dark seam: it validates, it
+        # documents, and it never reaches a row.
+        required_models=node.get("required_models"),
         inputs=resolved,
         priority=int(run.get("priority", 100)),
         pipeline_name=node.get("pipeline_name"),
@@ -1374,4 +1414,12 @@ def _enqueue(run_id: str, node: dict[str, Any], run: dict[str, Any]) -> str:
         # lane this node needs, for a body that runs its own threads. Absent ⇒
         # NULL ⇒ an ordinary 1-slot job, and a serial worker ignores it entirely.
         cpu_slots=_node_cpu_slots(node),
+        # Output-identity dedup (migration 0025): resolved through the same ref
+        # machinery as inputs so a schema can build a release-dependent key
+        # (e.g. ``{"$from": "params.release_key"}``); a plain string passes
+        # through unchanged. Absent ⇒ NULL ⇒ no dedup.
+        dedup_key=(
+            str(_resolve_ref(node.get("dedup_key"), context) or "") or None
+            if node.get("dedup_key") is not None else None
+        ),
     )

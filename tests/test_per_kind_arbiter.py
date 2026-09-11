@@ -3,12 +3,12 @@
 History. Migration 0023 added per-kind slot caps ("ollama allows 1!! vllm allows 3!!")
 but exempted any row with no ``server_types``: stamped NULL, it bypassed the caps
 entirely — rationalised as "not LLM-served work". On the operator's panel
-showed where that leads: box-a ran ``comfyui_video`` BESIDE ``compose_region_report``
-(96 % GPU, 81.9/121 GB) — BOTH rows undeclared, both exempt, and the second one is an
+showed where that leads: box-a ran ``comfyui_video`` BESIDE ``compose_report``
+(96 % GPU) — BOTH rows undeclared, both exempt, and the second one is an
 ollama LLM user by the dispatch layer's own documentation (``llm_backends/factory.py``
-names compose_region_report as *"an LLM user with no model field, so no server_types
-ever gets stamped"*). Undeclared ≠ not LLM-served: 1530 ``locate_x_posts`` rows sat in
-the same class in one 2-day window.
+names compose_report as *"an LLM user with no model field, so no server_types
+ever gets stamped"*). Undeclared ≠ not LLM-served: 1530 rows of another LLM-calling node
+sat in the same class in one 2-day window.
 
 THE LAW (operator decision — "it's not vllm: ollama, comfyui and any
 custom should allow 1 only"):
@@ -47,8 +47,8 @@ def _q(prefs, model="chat-model-a:latest", module="llm_chat"):
 
 
 def _plain(node_id, module="llm_chat"):
-    """An UNDECLARED no-model gpu row — the ``compose_region_report`` /
-    ``locate_x_posts`` / ``comfyui_video`` class this law exists for."""
+    """An UNDECLARED no-model gpu row — the ``compose_report`` /
+    ``comfyui_video`` class this law exists for."""
     return node_queue.enqueue_node_job(
         run_id=make_run(), node_id=node_id, node_module=module, queue="gpu")
 
@@ -115,7 +115,7 @@ def test_a_refused_row_spills_to_another_box():
 def test_an_undeclared_no_model_row_is_stamped_the_default_kind():
     """FLIPS ``test_an_unconstrained_row_is_NOT_dragged_under_the_llm_caps``. The old
     exemption reasoned "a no-model pool job is not LLM-served"; the dispatch layer's
-    own docs name compose_region_report as an LLM user with exactly this row shape.
+    own docs name compose_report as an LLM user with exactly this row shape.
     Undeclared work IS served by something — count it where it will run."""
     _plain("plain")
     got = _claim(["ollama", "vllm"], default_server="ollama")
@@ -125,11 +125,11 @@ def test_an_undeclared_no_model_row_is_stamped_the_default_kind():
 def test_undeclared_rows_are_capped_not_exempt():
     """FLIPS ``test_unconstrained_rows_run_beside_a_full_ollama_cap`` — THE SCREENSHOT
     TEST. box-a: comfyui_video (undeclared → predicted ollama) ran beside
-    compose_region_report (undeclared ollama user). Same predicted kind, width 1 ⇒
+    compose_report (undeclared ollama user). Same predicted kind, width 1 ⇒
     the second claim must be refused."""
     _plain("comfyui_video_like", module="llm_chat")
     assert _claim(["ollama", "vllm"], default_server="ollama") is not None
-    _plain("compose_region_report_like", module="llm_chat")
+    _plain("compose_report_like", module="llm_chat")
     assert _claim(["ollama", "vllm"], default_server="ollama") is None, (
         "the pair: two undeclared rows must not run beside each other")
 

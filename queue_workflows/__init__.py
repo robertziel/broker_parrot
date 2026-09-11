@@ -37,7 +37,7 @@ from typing import Any, Callable
 
 from queue_workflows.config import EngineConfig, get_config
 
-__version__ = "1.1.0"
+__version__ = "1.4.0"
 
 __all__ = [
     "configure",
@@ -83,6 +83,8 @@ def configure(
     cancel_orphan_queued_jobs: bool | None = None,
     gpu_requires_local_device: bool | None = None,
     disable_gpu_worker_hw_sampler: bool | None = None,
+    broadcast_hw_stats: bool | None = None,
+    hw_broadcast_port: int | None = None,
     vlm_pool_node_modules: frozenset[str] | None = None,
     gpu_self_load_node_modules: frozenset[str] | None = None,
     gpu_pool_backend: str | None = None,
@@ -90,6 +92,7 @@ def configure(
     gpu_pool_namespace: str | None = None,
     llm_server_idle_ttl_s: float | None = None,
     cpu_worker_threads: int | None = None,
+    download_max_concurrent: int | None = None,
 ) -> EngineConfig:
     """Set engine configuration values. Only the passed keyword args are
     mutated; the rest keep their (ai_leads-byte-compatible) defaults. Returns
@@ -120,12 +123,13 @@ def configure(
             cfg.project = str(project)
         if ingest_queues is not None:
             iq = frozenset(ingest_queues)
-            reserved = iq & {"cpu", "gpu"}
+            reserved = iq & {"cpu", "gpu", "download"}
             if reserved:
                 raise ValueError(
                     f"ingest_queues must not reuse the reserved DAG queue names "
-                    f"{sorted(reserved)} (cpu/gpu draw from workflow_node_jobs); "
-                    "use distinct names for non-DAG ingest queues."
+                    f"{sorted(reserved)} (cpu/gpu/download draw from "
+                    "workflow_node_jobs); use distinct names for non-DAG "
+                    "ingest queues."
                 )
             cfg.ingest_queues = iq
         if ingest_default_budget_s is not None:
@@ -152,6 +156,10 @@ def configure(
             cfg.gpu_requires_local_device = bool(gpu_requires_local_device)
         if disable_gpu_worker_hw_sampler is not None:
             cfg.disable_gpu_worker_hw_sampler = bool(disable_gpu_worker_hw_sampler)
+        if broadcast_hw_stats is not None:
+            cfg.broadcast_hw_stats = bool(broadcast_hw_stats)
+        if hw_broadcast_port is not None:
+            cfg.hw_broadcast_port = int(hw_broadcast_port)
         if vlm_pool_node_modules is not None:
             cfg.vlm_pool_node_modules = frozenset(vlm_pool_node_modules)
         if gpu_self_load_node_modules is not None:
@@ -170,6 +178,10 @@ def configure(
             # Floored here as well as at the read site: a host that configures 0
             # gets the serial worker, never a lane that claims nothing.
             cfg.cpu_worker_threads = max(1, int(cpu_worker_threads))
+        if download_max_concurrent is not None:
+            # Same double floor as cpu_worker_threads: a 0 cap would be a
+            # download lane that admits nothing, silently, forever.
+            cfg.download_max_concurrent = max(1, int(download_max_concurrent))
     return cfg
 
 
@@ -310,7 +322,7 @@ def set_comfyui_lifecycle(
     tenant (not just an evict-only loser).
 
     ``start_fn() -> None`` brings up this box's ComfyUI server (e.g. ``docker start
-    vg-comfy`` over the UDS); ``stop_fn() -> None`` takes it down. When a node_job
+    comfyui`` over the UDS); ``stop_fn() -> None`` takes it down. When a node_job
     requests comfyui, :func:`queue_workflows.comfyui.acquire_box_for_comfyui` clears
     the box of rival serving kinds and calls ``start_fn`` to ensure ComfyUI holds the
     card. Either ``None`` ⇒ that direction is a no-op, so a deployment that manages

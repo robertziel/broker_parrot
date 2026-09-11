@@ -28,8 +28,8 @@ JSONB payload from `hw_watch.deep_sample()`:
   SM clock, utilisation, pstate, and the **throttle-reason mask** — the
   smoking-gun field (`0x20` SW-thermal, `0x40` HW-thermal, `0x08` HW-brake,
   `0x04` SW-power-cap).
-- **tz** — every `/sys/class/thermal` zone (`type` + milli-°C). On the unified-memory GPU box
-  incident box the killer sensor was an `acpitz` zone reading ~94 °C while
+- **tz** — every `/sys/class/thermal` zone (`type` + milli-°C). On the box in the
+  motivating incident (a unified-memory GPU box) the killer sensor was an `acpitz` zone reading ~94 °C while
   the GPU core showed a harmless 78–84 °C.
 - **hwmon** — every hwmon temp input (NVMe, NIC, SoC…).
 - **mem** — `/proc/meminfo` totals (unified-memory boxes live and die by
@@ -109,7 +109,7 @@ for a, b in zip(rows, rows[1:]):
     r = hw_watch.net_rates(a["data"], b["data"], dt)   # {"rx_bytes_per_s", "tx_bytes_per_s"}
 ```
 
-The **cluster-panel** (separate repo — reads the DB directly, no engine import)
+An operator panel (a separate app — reads the DB directly, no engine import)
 does the same two-line derivation in JS: sort a box's rows by `created_at`, then
 per adjacent pair plot `(row[i].data.net_rx_bytes - row[i-1].data.net_rx_bytes) /
 Δseconds` as the rx line (and `net_tx_bytes` for tx), drawing the

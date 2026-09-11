@@ -122,9 +122,9 @@ Every claim in that prompt is backed by a doc the agent can read: the engine nev
 
 > **There's no bundled dashboard — the engine emits what a dashboard needs.** Live per-host CPU/GPU/RAM over `pg_notify('hw_metrics', …)`, `worker_heartbeats`, the `node_queue.*_snapshot()` read models, and the `worker_controls` ON/OFF toggles are all there. Bring your own front-end — it's a great task to hand a coding agent. A newer **broker web service + operator panel** ([`docs/broker.md`](docs/broker.md), [screenshot](#-one-broker-for-many-projects)) also ships as a pure-stdlib, server-rendered option.
 
-Here's a real example built directly on that telemetry — a live fleet **hardware + queue** operator panel. It reads the engine's `hw_watch_samples` flight recorder (migration 0021), `worker_heartbeats`, and `worker_controls` straight from the DB and draws a 1-hour trail per box: GPU **and** CPU temperature, power, **clock speed**, and throttle, plus per-box worker ON/OFF control. This is an actual 3-box fleet under load — an AMD control hub and two NVIDIA unified-memory GPU box GPU workers. The middle box is mid-render at 96% GPU with its board zone pinned near the thermal limit, so the recorder catches it hitting the **power brake** (⚡) and stacking up throttle seconds; the box on the right just finished a render and is cooling off. That's the operational story the engine's raw telemetry makes visible — and it's exactly the kind of front-end you can hand a coding agent to build:
+Here's a real example built directly on that telemetry — one GPU box's panel from a live **hardware + queue** operator front-end. It reads the engine's `hw_watch_samples` flight recorder (migration 0021) straight from the DB and draws a 1-hour trail per box: GPU **and** CPU temperature, power, **clock speed**, and throttle (the full panel adds `worker_heartbeats` and per-box `worker_controls` ON/OFF). This box is mid-render at 96% GPU with its board zone pinned near the thermal limit, so the recorder catches it hitting the **power brake** (⚡ ×4) and stacking up throttle seconds — you can watch the GPU clock step down when the power draw does. That's the operational story the engine's raw telemetry makes visible — and it's exactly the kind of front-end you can hand a coding agent to build:
 
-![A live fleet hardware + queue operator panel built on the engine's telemetry — per-box GPU/CPU temperature, power, clock, and throttle over the last hour, with worker ON/OFF control](docs/images/flight-deck-panel.png)
+![One GPU box's 1-hour hardware flight recorder, drawn from the engine's hw_watch_samples — GPU/CPU temperature, board-zone max, GPU power, throttle index, GPU/CPU clock and CPU utilisation, with four power-brake events flagged](docs/images/hw-flight-recorder.png)
 
 ---
 
@@ -201,6 +201,9 @@ People often ask how this relates to [NVIDIA Triton Inference Server](https://do
 - 🗄️ **Pluggable store** — SQLite (default), Postgres, Redis, or MongoDB, behind one durable-queue contract.
 - 🧵 **Widen the cpu lane, per job** — one worker process can run N node-jobs (`--threads N`), and a job that needs more of the box declares `cpu_slots` so the claim reserves that much *before* its body starts. Defaults keep the classic one-job-per-process worker.
 - 🔀 **One LLM server at a time** — a box switching between ollama and vLLM drains the outgoing server before starting the incoming one, and concurrency follows the serving kind (ollama 1, vLLM its batch size) instead of one global number.
+- 📥 **A download lane** — mark a node `download: true` and it runs on its own queue with a fleet-wide cap (one downloader at a time by default), so network waits never hold a cpu/gpu slot; an optional `dedup_key` means one file is never downloaded twice.
+- 🗂️ **An observed model catalog** — each GPU box publishes which models its servers can actually serve, a job may list an ordered set of acceptable models, and every claim records which model — and which exact weights — it ran.
+- 📡 **LAN telemetry broadcast** (opt-in) — the same hardware sample, also sent as a UDP broadcast, so a display panel on the local network needs no database credentials.
 
 ---
 
@@ -347,13 +350,13 @@ A worker **absent** from `worker_controls` is treated as **ON** (default-on), an
 
 ## 🏷️ Host-defined queues + parametrised ingest jobs
 
-Two job families share the engine: DAG **node-jobs** (`workflow_node_jobs`, the reserved `cpu`/`gpu` queues, fanned out by the dispatcher) and standalone **ingest jobs** (`ingest_jobs`, **your own** queue names, no DAG). The ingest path isn't limited to one app's vocabulary — a second consumer can route its **own** queues and carry **per-job arguments**, enqueued **atomically with its own domain row** (the `NOTIFY` rides the caller's transaction):
+Two job families share the engine: DAG **node-jobs** (`workflow_node_jobs`, the reserved `cpu`/`gpu`/`download` queues, fanned out by the dispatcher) and standalone **ingest jobs** (`ingest_jobs`, **your own** queue names, no DAG). The ingest path isn't limited to one app's vocabulary — a second consumer can route its **own** queues and carry **per-job arguments**, enqueued **atomically with its own domain row** (the `NOTIFY` rides the caller's transaction):
 
 ```python
 queue_workflows.configure(
     db_backend="pg",
     db_url_env="MY_DB_URL",
-    ingest_queues=frozenset({"ingest", "hydro", "hydraulic", "corrdiff"}),  # NOT cpu/gpu (reserved for the DAG path)
+    ingest_queues=frozenset({"ingest", "etl", "sim", "reports"}),           # NOT cpu/gpu/download (reserved for the DAG path)
     ingest_default_budget_s=3600,                                           # watchdog budget for these queues
 )
 queue_workflows.register_ingest_task("run_scenario", run_scenario)         # fn(reason) OR fn(reason, args) -> dict
@@ -362,12 +365,12 @@ queue_workflows.register_ingest_task("run_scenario", run_scenario)         # fn(
 with my_pool.connection() as conn:
     my_create_scenario(conn, scenario_id)
     node_queue.enqueue_ingest_job(
-        task_name="run_scenario", queue="hydraulic",
+        task_name="run_scenario", queue="sim",
         args={"scenario_id": scenario_id}, conn=conn,
     )
 ```
 
-A registered callable may be `fn(reason)` or `fn(reason, args)`. Ingest workers emit `worker_heartbeats`, so the snapshot reflects live workers per queue. `cpu`/`gpu` stay **reserved** for the DAG path.
+A registered callable may be `fn(reason)` or `fn(reason, args)`. Ingest workers emit `worker_heartbeats`, so the snapshot reflects live workers per queue. `cpu`/`gpu`/`download` stay **reserved** for the DAG path.
 
 ---
 

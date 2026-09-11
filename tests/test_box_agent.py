@@ -155,16 +155,16 @@ def test_load_manifest_parses_lanes_and_control_dsns(tmp_path):
     p.write_text(json.dumps({"lanes": [
         {"key": "app_a:gpu", "project": "app_a", "queue": "gpu",
          "argv": ["python", "-m", "queue_workflows.claim_worker", "--queue=gpu"],
-         "env": {"QUEUE_WORKFLOWS_DB_URL": "postgresql://x/lm"},
-         "control_dsn": "postgresql://x/lm"},
+         "env": {"QUEUE_WORKFLOWS_DB_URL": "postgresql://x/app_a"},
+         "control_dsn": "postgresql://x/app_a"},
         {"key": "app_b:gpu", "project": "app_b", "queue": "gpu",
-         "argv": ["python", "-m", "gen_workflows.run_worker", "--queue", "gpu"],
+         "argv": ["python", "-m", "app_b.run_worker", "--queue", "gpu"],
          "control_dsn": "postgresql://x/broker"},
     ]}))
     lanes, dsns = box_agent.load_manifest(str(p))
     assert [l.key for l in lanes] == ["app_a:gpu", "app_b:gpu"]
     assert lanes[0].argv[-1] == "--queue=gpu"
-    assert lanes[0].env["QUEUE_WORKFLOWS_DB_URL"].endswith("/lm")
+    assert lanes[0].env["QUEUE_WORKFLOWS_DB_URL"].endswith("/app_a")
     assert dsns["app_b:gpu"].endswith("/broker")
 
 

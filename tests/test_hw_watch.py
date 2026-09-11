@@ -588,7 +588,7 @@ def _fake_sysfs(monkeypatch, tmp_path, *, hwmon=None, zones=None):
     monkeypatch.setattr(hw_watch.glob, "glob", fake)
 
 
-def test_cpu_temp_gb10_falls_back_to_hottest_acpitz(monkeypatch, tmp_path):
+def test_cpu_temp_arm_soc_falls_back_to_hottest_acpitz(monkeypatch, tmp_path):
     # ARM unified-memory GPU box: no CPU hwmon, only generic acpitz zones.
     _fake_sysfs(monkeypatch, tmp_path,
                 hwmon=[("acpi_fan", [])],

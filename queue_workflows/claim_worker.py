@@ -52,6 +52,8 @@ so a killed worker doesn't keep inflating the GPU-busy gauge.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 import inspect
 import logging
 import os
@@ -75,6 +77,20 @@ log = logging.getLogger(__name__)
 #: and from LLM_SERVER_SLOT/COMFYUI_SERVER_SLOT on purpose: a distinct value means a
 #: peer asking for ANY model is denied (spills to another box) while the switch runs.
 SWITCH_SLOT = "__server_switch__"
+
+#: How long a gpu worker stops claiming after its own box denied it the card, and the
+#: ceiling that hold doubles up to. A denied acquire re-queues the job to the FRONT
+#: (it is a resume, not a fault), so without a brake the very next claim returns the
+#: same row and is denied again: 71 and 79 spills of ONE job within ~6 s were observed
+#: after a lane restart left a dead process's SWITCH_SLOT holder in the box lease, and
+#: an earlier incident recorded "68 spills / 5 min" of the same shape. The
+#: ceiling stays at or under the lease TTL so a box whose stale holder simply expired
+#: resumes promptly rather than sitting out a brake that outlives the cause.
+SPILL_PAUSE_S = 1.0
+SPILL_PAUSE_MAX_S = 30.0
+#: How often the same spill verdict is restated at WARNING (a different job is always
+#: reported).
+SPILL_REPORT_EVERY_S = 60.0
 
 
 def _switch_timeouts() -> tuple[float, float]:
@@ -108,6 +124,9 @@ GPU_DEFAULT_BUDGET_S = 8100      # 2.25 h hard — default GPU job
 VIDEO_BUDGET_S = 1800            # 30 min — video render (config.video_model_ids)
 CPU_BUDGET_S = 2100              # 35 min hard — default CPU job
 INPUT_BUDGET_S = 120             # input (park-and-return) node
+DOWNLOAD_BUDGET_S = 3600         # 1 h — network-bound download node (a big
+                                 # dataset/tile warm on a slow feed; a trip
+                                 # re-queues + retries like any node job)
 # Ingest: the PG run_fetch_all / run_load_all run the whole per-(source,scope)
 # sweep INLINE, so the budget must cover the slowest full sweep.
 FETCH_BUDGET_S = 2 * 3600        # 2 h — full network sweep across all sources
@@ -246,6 +265,10 @@ HEARTBEAT_INTERVAL_S = 10.0
 # no advisory lock), the workers must not race it.
 _NODE_REQUIRED_VERSION = 6
 _INGEST_REQUIRED_VERSION = 8
+# The download lane needs the 0025 CHECK drop: before it, a download row cannot
+# even be INSERTed (the cpu/gpu CHECK rejects it), so a download worker on an
+# older schema would poll a queue that can never hold work.
+_DOWNLOAD_REQUIRED_VERSION = 25
 
 
 def _host_label() -> str:
@@ -262,7 +285,7 @@ def _host_priority() -> int:
 
 
 def predict_default_kind(
-    warm_servers: "Iterable[str] | None", host_label: str, queue: str,
+    warm_servers: Iterable[str] | None, host_label: str, queue: str,
 ) -> str:
     """The serving kind an UNDECLARED gpu row will actually land on — the claim's
     ``default_server`` prediction (the law: a row's stamp is never NULL).
@@ -291,6 +314,7 @@ def budget_for(job: dict) -> int:
 
       * GPU job whose ``required_model`` is in the host's video set → 1800 s;
       * any other GPU job → 8100 s;
+      * a download node-job (migration 0025) → 3600 s;
       * built-in fetch / load ingest jobs → their generous sweep budgets;
       * any other (host-defined, G1) ingest queue → ``config.ingest_default_budget_s``;
       * an input node (``node_module`` starts ``__input__``) → 120 s;
@@ -301,6 +325,8 @@ def budget_for(job: dict) -> int:
         if (job.get("required_model") or "") in get_config().video_model_ids:
             return VIDEO_BUDGET_S
         return GPU_DEFAULT_BUDGET_S
+    if queue == "download":
+        return DOWNLOAD_BUDGET_S
     if queue == "fetch":
         return FETCH_BUDGET_S
     if queue == "load":
@@ -1253,7 +1279,12 @@ class HeartbeatEmitter:
         llm_servers_fn: Callable[[], list[str]] | None = None,
         on_tick: Callable[[], None] | None = None,
         occupant_fn: Callable[[], str | None] | None = None,
+        known_models_fn: Callable[[list[str]], list[str]] | None = None,
     ) -> None:
+        # Narrows the DECLARED registry to what this box was OBSERVED to hold. The
+        # gpu worker supplies one; default is identity, so a standalone emitter (and
+        # every cpu/ingest worker, which observes no models) behaves exactly as before.
+        self._known_models_fn = known_models_fn or (lambda declared: list(declared))
         # Extra per-tick hook (gpu worker: renew/release the box-wide model lease
         # by observed residency). Best-effort; a failure never stops the heartbeat.
         self._on_tick = on_tick
@@ -1386,6 +1417,11 @@ class HeartbeatEmitter:
             # served list. That skew is what the panel showed as "NODE JOBS 3/1
             # while vLLM was serving". One row must describe one observation.
             servers = self._llm_servers()
+            # ...and narrow AFTER it, for the same reason. The probe is what observes
+            # this box's models, so narrowing before it would advertise tick N-1's
+            # observation next to tick N's server list — the identical skew the comment
+            # above records, one field over.
+            known = self._known_models_fn(known)
             concurrency = self._concurrency()
             node_queue.upsert_worker_heartbeat(
                 host_label=self._host_label,
@@ -1452,7 +1488,9 @@ class HeartbeatEmitter:
 
 
 #: Queues whose claim worker draws DAG node-jobs from ``workflow_node_jobs``.
-_NODE_QUEUES = frozenset({"cpu", "gpu"})
+#: ``download`` (migration 0025) is the width-capped network-WAIT lane — node
+#: family (lease/watchdog/outbox, ``node_job_ready`` wake), never ingest.
+_NODE_QUEUES = frozenset({"cpu", "gpu", "download"})
 #: Default ingest queues (ai_leads byte-compat). The LIVE ingest set is
 #: ``config.ingest_queues`` (host-configurable, G1); any queue NOT in
 #: ``_NODE_QUEUES`` is treated as ingest-family (draws from ``ingest_jobs``).
@@ -1581,14 +1619,19 @@ class _CpuLanePool:
 
 
 class ClaimWorker:
-    """One Postgres-as-queue worker. ``queue`` ∈ {cpu, gpu, fetch, load}.
+    """One Postgres-as-queue worker. ``queue`` ∈ {cpu, gpu, download} ∪
+    ``config.ingest_queues`` (default fetch/load).
 
     A GPU worker holds a single :class:`ModelCache` (concurrency-1 structural)
-    and runs DAG node-jobs. A fetch/load worker runs standalone ingest jobs from
-    ``ingest_jobs`` — no model cache, no run-cancel watcher (there's no parent
-    run), no ``$from`` resolution. ``run_once`` claims + executes one ready job;
-    ``run_forever`` is the LISTEN/poll loop. The two queue families share the
-    lease / reclaim / watchdog machinery."""
+    and runs DAG node-jobs. A ``download`` worker (migration 0025) is the
+    node-family network-WAIT lane: concurrency-1 like gpu, no model cache; the
+    fleet-wide width cap lives in its CLAIM (``claim_next_download_job``), so
+    running N download workers is safe — at most ``download_max_concurrent``
+    of them hold a job at once. A fetch/load worker runs standalone ingest
+    jobs from ``ingest_jobs`` — no model cache, no run-cancel watcher (there's
+    no parent run), no ``$from`` resolution. ``run_once`` claims + executes one
+    ready job; ``run_forever`` is the LISTEN/poll loop. The queue families
+    share the lease / reclaim / watchdog machinery."""
 
     def __init__(
         self, *, queue: str, host: str | None = None,
@@ -1732,6 +1775,12 @@ class ClaimWorker:
         self.heartbeat = HeartbeatEmitter(
             queue=self.queue, host_label=self.host,
             model_cache=self.model_cache,
+            # Advertise what this box HOLDS, not what the software knows about. The
+            # registry is populated identically on every box at import, so an
+            # un-narrowed heartbeat says "box-b knows chat-expert-a" on a box that has
+            # never pulled it — and `fits_models` is derived from this list, so the
+            # dishonesty propagates into every capacity view.
+            known_models_fn=self._known_models,
             # The heartbeat must advertise the SAME number the claim enforces —
             # _gpu_slot_budget (PAR capped by what the serving kind can absorb),
             # not the raw operator PAR. Advertising 3 while the claim takes 1
@@ -1812,6 +1861,115 @@ class ClaimWorker:
 
     # ── claim ────────────────────────────────────────────────────────────
 
+    def _publish_model_catalog(self, advertised, base_url, factory) -> None:
+        """Publish WHICH MODELS this box's servers can serve (migration 0026).
+
+        Rides the existing GPU heartbeat probe rather than adding a second loop: the probe
+        already resolved this box's per-kind endpoints and just decided which ones answer,
+        so asking each of them for its model list is one more HTTP call on a path that is
+        already awake. A separate poller would drift out of step with `advertised` and
+        publish capability for a server the heartbeat had already written off.
+
+        Runs HERE, in the claim worker, and that is not incidental: measured on a live box,
+        the claim container resolves the LLM endpoint while the orchestrator container on
+        the SAME box cannot (no host-gateway), so publishing from there would write an
+        EMPTY catalog for a healthy box — and `best_match` treats unknown as cannot-serve,
+        so an empty catalog does not degrade, it stops every LLM claim on that box.
+
+        Best-effort by construction: any failure is swallowed. A heartbeat that dies
+        because a model list was slow is worse than a catalog that is one tick stale.
+        """
+        if not advertised:
+            return
+        try:
+            from queue_workflows import llm_probe, node_queue
+
+            urls = {}
+            for kind in advertised:
+                url = factory.resolve_base_url(kind) or base_url
+                if url:
+                    urls[kind] = url
+            entries = llm_probe.observe_box_models(self.host, urls_by_kind=urls)
+            if entries:
+                node_queue.upsert_model_catalog(entries)
+                # ...and keep it for OUR OWN claim gate. This box's live probe is a
+                # better answer than the table it just wrote — same data, no read-back,
+                # no staleness window. `_known_models()` narrows the declared registry
+                # with it; see model_catalog.narrow_to_observed for why an empty
+                # observation must leave the declaration alone.
+                self._observed_model_ids = sorted({e.model_id for e in entries})
+                # ...and the FULL entries, digests included. The id list above feeds the
+                # claim gate's narrowing; the entries feed per-claim ARTIFACT resolution
+                # (which immutable tag the role currently serves on THIS box) — that
+                # needs the digests, and re-probing per claim would put an HTTP call in
+                # the claim hot path for data this probe just fetched.
+                self._observed_entries = list(entries)
+        except Exception:
+            log.debug("[model-catalog] publish skipped", exc_info=True)
+
+    def _stamp_resolved_artifact(self, job) -> None:
+        """Record WHICH BYTES this claim will run — the artifact tag behind the role.
+
+        ``resolved_model`` answers "which role" and is deliberately a stable tag
+        (promotions re-point it), so it can never answer "which weights". Measured in a
+        consumer deployment: the `chat-expert-a` role served a GGUF built
+        from a void merge — the untuned base — for eight days, and every job row
+        truthfully recorded the role name throughout. This stamp is the per-job antidote:
+        the immutable artifact tag, derived from THIS box's own digest observation at the
+        moment of the claim (migration 0027).
+
+        Best-effort and absent-not-guessed: no observation, no digest, or no matching
+        artifact tag leaves the column NULL. A wrong stamp here would be worse than none —
+        it would carry exactly the false authority the role name already has. Failures are
+        swallowed: a claim that runs the job beats a claim that dies labelling it.
+        """
+        try:
+            role = job.get("resolved_model") or job.get("required_model")
+            if not role:
+                return
+            entries = getattr(self, "_observed_entries", None)
+            if not entries:
+                return
+            from queue_workflows import model_registry, node_queue
+            from queue_workflows.model_catalog import resolve_artifact
+
+            server = job.get("resolved_server") or None
+            options = (model_registry.server_model_options(
+                str(role).split(":")[0]).get(server or "", ()) if server else ())
+            artifact = resolve_artifact(str(role), server, entries, options)
+            if not artifact:
+                return
+            node_queue.set_resolved_artifact(job.get("id"), artifact)
+            job["resolved_artifact"] = artifact
+        except Exception:
+            log.debug("[artifact-stamp] skipped", exc_info=True)
+
+    def _known_models(self, declared) -> list[str]:
+        """What this worker advertises as claimable — DECLARED, narrowed by OBSERVED.
+
+        ``model_registry.known_ids()`` is a process-level dict every box populates
+        identically at import, so on its own it answers "which models does this software
+        know about", not "which weights are on this disk". Before this, an expert pinned
+        with ``force_box`` was the only thing keeping its rows off a box that had never
+        pulled the tag. Narrowing here is what makes that pin redundant rather than
+        load-bearing.
+
+        Best-effort and fail-open: no observation yet ⇒ the declared list, unchanged.
+        """
+        try:
+            from queue_workflows import model_registry
+            from queue_workflows.model_catalog import narrow_to_observed
+
+            # ONLY server-served ids are narrowed. The observation comes from ollama
+            # /api/tags + vLLM /v1/models, so an in-process model can never appear in it
+            # and filtering against it would delete that model from every box at once.
+            return narrow_to_observed(
+                declared, getattr(self, "_observed_model_ids", ()) or (),
+                narrowable=model_registry.server_served_ids())
+        except Exception:
+            log.debug("[model-catalog] narrowing skipped", exc_info=True)
+            return list(declared or [])
+
     def _probe_llm_servers(self) -> list[str]:
         """OBSERVED, GPU-verified llm capability for THIS gpu box's heartbeat.
 
@@ -1886,6 +2044,7 @@ class ClaimWorker:
         # heartbeat advertises, so "what this box says it serves" and "what it will
         # claim" can never disagree. Empty ⇒ gate off (claim-any), by design.
         self._box_served = list(advertised)
+        self._publish_model_catalog(advertised, base_url, _llm_factory)
 
         if not servers:
             log.error("%s", llm_probe.describe_endpoint(self.host, base_url, servers))
@@ -2013,8 +2172,8 @@ class ClaimWorker:
     # and never read, at the cost of an UNCACHED ``worker_controls`` SELECT on
     # every single claim. The law gave the parameter its reader — an
     # UNDECLARED row's stamp IS this prediction (the old "unconstrained rows are
-    # not LLM-served" premise was false: compose_region_report is an LLM user with
-    # exactly that row shape) — so it is back, via ``predict_default_kind`` below,
+    # not LLM-served" premise was false: a real LLM-calling node had exactly
+    # that row shape) — so it is back, via ``predict_default_kind`` below,
     # which keeps D2's actual lesson: no per-claim DB read (a warm hint the worker
     # already holds, else the factory's TTL cache) and no exception path into the
     # claim loop.
@@ -2077,9 +2236,23 @@ class ClaimWorker:
             # exactly what reloaded the outgoing server and produced the two-resident
             # state; a peer takes it instead.
             return None
+        if self.queue == "gpu" and self._spill_paused():
+            # Our own box just denied us the card. Claiming again right now returns the
+            # row we just spilled (it goes back to the FRONT) and spills it again —
+            # see SPILL_PAUSE_S.
+            return None
         if self._is_ingest:
             return ingest_store.claim_next_ingest_job(
                 self.queue, host=self.host, lease_s=self.lease_s,
+            )
+        if self.queue == "download":
+            # The width cap (default 1, fleet-wide per project) lives INSIDE
+            # the claim — resolved there too (env → config → 1), so this
+            # worker needs no knob plumbing of its own.
+            return node_queue.claim_next_download_job(
+                0, host=self.host, lease_s=self.lease_s,
+                host_priority=self.host_priority,
+                box=self._physical_box(),
             )
         if self.queue == "gpu":
             current_model = getattr(self.model_cache, "current_model", None)
@@ -2100,7 +2273,7 @@ class ClaimWorker:
                 0, current_model,
                 host=self.host, lease_s=self.lease_s,
                 host_priority=self.host_priority,
-                known_models=fits,
+                known_models=self._known_models(fits),
                 require_model=True,
                 pool_modules=get_config().vlm_pool_node_modules,
                 max_running=self._gpu_slot_budget(),
@@ -2112,6 +2285,8 @@ class ClaimWorker:
                 default_server=predict_default_kind(
                     warm_servers, self.host, self.queue),
             )
+            if job:
+                self._stamp_resolved_artifact(job)
             return job
         return node_queue.claim_next_cpu_job(
             0, host=self.host, lease_s=self.lease_s,
@@ -2176,6 +2351,8 @@ class ClaimWorker:
         from queue_workflows import model_registry
         if self._switch.blocks_claims():
             return None
+        if self._spill_paused():
+            return None
         if not self._pool_gpu_serving_ok():
             return None
         warm_servers, warm_models = self._warm_state()
@@ -2183,7 +2360,7 @@ class ClaimWorker:
             0, None,
             host=self.host, lease_s=self.lease_s,
             host_priority=self.host_priority,
-            known_models=model_registry.known_ids(),
+            known_models=self._known_models(model_registry.known_ids()),
             require_model=False,
             pool_modules=get_config().vlm_pool_node_modules,
             max_running=self._gpu_slot_budget(),
@@ -3091,16 +3268,39 @@ class ClaimWorker:
         queue name as payload."""
         return "ingest_job_ready" if self._is_ingest else "node_job_ready"
 
+    @property
+    def _min_schema_version(self) -> int:
+        """The migration this queue's claim path depends on: ``download`` needs
+        the 0025 CHECK drop (its rows can't exist before it), ingest needs 0008
+        (host-defined queue names + ``args``), cpu/gpu the 0006 lease columns."""
+        if self.queue == "download":
+            return _DOWNLOAD_REQUIRED_VERSION
+        return (
+            _NODE_REQUIRED_VERSION if self.queue in _NODE_QUEUES
+            else _INGEST_REQUIRED_VERSION
+        )
+
     def await_schema(self) -> None:
         """Block until the migrations this queue's claim loop depends on are
         applied. The orchestrator owns the migration run (``db.bootstrap``,
         which takes no advisory lock); a claim worker WAITS for the schema
         before it starts polling."""
         from queue_workflows import db
-        min_version = (
-            _NODE_REQUIRED_VERSION if self.queue in _NODE_QUEUES
-            else _INGEST_REQUIRED_VERSION
-        )
+        # WAIT FOR THE DATABASE FIRST. `wait_for_schema` needs a connection, so an
+        # unreachable DB used to surface here as a 15 s pool timeout and a process
+        # exit — the crash-loop that ran hundreds of restarts deep against a Postgres
+        # whose docker network endpoint had gone, while nothing durable recorded it.
+        # Waiting in process holds no lease and claims nothing; a MISCONFIGURED DSN
+        # still raises (a restart cannot fix a wrong password) and `main` exits 2.
+        if not db.wait_for_db(stop_event=getattr(self, "_stop", None)):
+            # Asked to stop (SIGTERM), or QUEUE_WORKFLOWS_DB_WAIT_MAX_S elapsed and the
+            # deployment wants exit-and-restart. Either way the DB is still unreachable,
+            # so falling through to wait_for_schema would just re-enter the pool timeout
+            # and surface as a traceback instead of the clean stop that was asked for.
+            raise db.DbUnreachable(
+                "gave up waiting for the database (stop requested or "
+                "QUEUE_WORKFLOWS_DB_WAIT_MAX_S elapsed)")
+        min_version = self._min_schema_version
         log.info(
             "[claim-worker:%s] waiting for queue_schema_version >= %d",
             self.queue, min_version,
@@ -3214,6 +3414,16 @@ class ClaimWorker:
                 _llm_factory.resolve_base_url()),
             ollama_unload_fn=lambda models: llm_probe.unload_ollama_models(
                 _llm_factory.resolve_base_url(), models),
+            # A drain-park KEEPS the job it already had (that is what drain means), so
+            # the watchdog must not evict the model that job is streaming from — see
+            # ParkQuiesce's "THE ONE EXEMPTION". Only OUR work exempts the box; a peer's
+            # remote traffic still gets nothing (rule #3).
+            #
+            # The POOL lane only, deliberately, NOT `_gpu_active_count`: that also
+            # counts the inline diffusion lane, and a render does not touch the LLM at
+            # all. Exempting on one would let a peer's traffic keep a parked box's vLLM
+            # at 96 % — the precise rule #2 failure rule #3 was written to end.
+            in_flight_fn=lambda: self._pool_inflight,
             label=self.host,
         )
         return quiesce.tick
@@ -3382,6 +3592,16 @@ class ClaimWorker:
             log.debug("[gpu-lease] %s: could not reclaim LLM RAM (retried on the "
                       "next acquire)", self.host, exc_info=True)
 
+    def _spill_clock(self) -> float:
+        """Monotonic now, injectable for tests (the bare workers claim-path tests build
+        skip ``__init__``, so every spill field is read with a default)."""
+        fn = getattr(self, "_spill_now", None)
+        return fn() if fn is not None else time.monotonic()
+
+    def _spill_paused(self) -> bool:
+        """Is this worker briefly holding off gpu claims after its own box denied it?"""
+        return self._spill_clock() < getattr(self, "_spill_pause_until", 0.0)
+
     def _acquire_box_or_spill(self, job: dict) -> bool:
         """ONE-MODEL-PER-BOX admission, across ALL projects on this physical GPU.
         Acquire the box-wide model lease for this job's effective model BEFORE it
@@ -3394,17 +3614,40 @@ class ClaimWorker:
         model = self._effective_gpu_model(job)
         if not self._get_box_lease().acquire(model):
             held = self._get_box_lease().current().model
-            log.warning(
-                "[claim-worker:gpu] host=%s: box already holds %r — SPILLING job %s "
-                "(node=%s, model=%s) to a free/matching box (one model per GPU box "
-                "across all projects)",
-                self.host, held, job.get("id"), job.get("node_id"), model,
-            )
+            now = self._spill_clock()
+            streak = getattr(self, "_spill_streak", 0)
+            pause = min(SPILL_PAUSE_S * (2 ** min(streak, 8)), SPILL_PAUSE_MAX_S)
+            self._spill_streak = streak + 1
+            # THE BRAKE. The re-queue puts this row at the FRONT, so without a pause
+            # this worker simply claims it again on the next loop and is denied again
+            # — a 12 Hz claim/requeue storm against the queue until the holder's TTL
+            # expires. Pausing THIS box's gpu claiming lets a free/matching peer take
+            # the row, which is what the spill is for.
+            self._spill_pause_until = now + pause
+            job_id = job.get("id")
+            last = getattr(self, "_spill_said", None)
+            if last is None or last[0] != job_id or now - last[1] >= SPILL_REPORT_EVERY_S:
+                self._spill_said = (job_id, now)
+                log.warning(
+                    "[claim-worker:gpu] host=%s: box already holds %r — SPILLING job "
+                    "%s (node=%s, model=%s) to a free/matching box (one model per GPU "
+                    "box across all projects); pausing gpu claims here for %.0fs",
+                    self.host, held, job_id, job.get("node_id"), model, pause,
+                )
+            else:
+                log.debug(
+                    "[claim-worker:gpu] host=%s: still denied by %r — spilling %s "
+                    "again (pause %.0fs)", self.host, held, job_id, pause,
+                )
             try:
                 node_queue.requeue_job_for_retry(job["id"])
             except Exception:
                 log.exception("[claim-worker:gpu] spill re-queue failed for %s", job.get("id"))
             return False
+        # Granted: the box is ours, so whatever was denying us is gone. Clear the brake
+        # or a box that spilled once would stay slowed down after it got the card.
+        self._spill_streak = 0
+        self._spill_pause_until = 0.0
         self._box_held_model = model
         self._box_active_jobs += 1     # hold the box for this job's whole lifetime
         self._release_llm_ram_unless_llm_owns_the_card(model)
@@ -3619,6 +3862,7 @@ class ClaimWorker:
                 except Exception:
                     log.debug("[server-switch] %s: box-lease release failed "
                               "(TTL will expire it)", self.host, exc_info=True)
+            followups: list[str] = []
             for action in actions:
                 if action == server_switch.UNLOAD_OUTGOING:
                     if target == "vllm":
@@ -3629,11 +3873,38 @@ class ClaimWorker:
                         if stop is not None:
                             stop()
                 elif action == server_switch.START_INCOMING:
+                    # THE SEAM. Whatever the lever tells us goes straight back into the
+                    # machine, in THIS tick — a definitive failure (no such container,
+                    # an OCI error, no lever at all) then ends the out-of-service window
+                    # now instead of at the warm timeout 1800 s later. A lever that
+                    # returns None says nothing, which is UNKNOWN and behaves exactly as
+                    # before, so an un-upgraded host is unaffected.
                     if target == "vllm":
                         start = get_config().vllm_start_fn
-                        if start is not None:
-                            start(None)
+                        if start is None:
+                            outcome: Any = server_switch.StartOutcome.permanent(
+                                "no vllm start lever wired "
+                                "(set_vllm_lifecycle(stop_fn, start_fn))")
+                        else:
+                            try:
+                                outcome = start(None)
+                            except Exception as exc:
+                                # A raising lever performed no start. Transient, so a
+                                # flaky socket retries; the ack budget bounds it.
+                                outcome = server_switch.StartOutcome.transient(
+                                    f"{type(exc).__name__}: {exc}")
+                        followups.extend(self._switch.report_start_outcome(outcome))
                     # switching TO ollama needs no start: it is an always-on daemon.
+            if server_switch.ABORT in followups:
+                # The switch resolved inside this tick, so the box lease it was holding
+                # must be released here too — the release above only saw `actions`.
+                try:
+                    lease = self._get_box_lease()
+                    if lease is not None:
+                        lease.release()
+                except Exception:
+                    log.debug("[server-switch] %s: box-lease release failed "
+                              "(TTL will expire it)", self.host, exc_info=True)
         except Exception:
             log.exception("[server-switch] %s: tick failed (will retry)", self.host)
 
@@ -3891,6 +4162,8 @@ def main(argv: list[str] | None = None) -> int:
     import argparse
     import signal
 
+    from queue_workflows import db
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -3939,7 +4212,21 @@ def main(argv: list[str] | None = None) -> int:
 
     signal.signal(signal.SIGTERM, _handler)
     signal.signal(signal.SIGINT, _handler)
-    worker.run_forever()
+    try:
+        worker.run_forever()
+    except db.DbUnreachable as exc:
+        # Not a misconfiguration: the database may well come back. Exit cleanly (no
+        # traceback) so the supervisor restarts us, which is what asking for a bounded
+        # wait means.
+        log.warning("[claim-worker:%s] %s", args.queue, exc)
+        return 1
+    except db.DbMisconfigured as exc:
+        # DISTINCT from every other exit: a restart cannot fix a wrong DSN, so say so
+        # once and stop rather than joining the supervisor's restart loop. 2 is the
+        # usage-error code — "fix your configuration", next to the watchdog codes
+        # 75-79 in docs/watchdogs.md.
+        log.error("[claim-worker:%s] %s", args.queue, exc)
+        return 2
     return 0
 
 

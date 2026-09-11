@@ -126,7 +126,7 @@ def enqueue_ingest_job(
 
     ``project`` (migration 0017) is the tenant tag on the pg path (``None`` ⇒
     ``config.project``); ignored on the SPI path, whose tenancy is ``db_namespace``
-    (see docs/multitenant_broker.md)."""
+    (see docs/broker.md, Part A)."""
     if not _use_spi():
         from queue_workflows import node_queue
 

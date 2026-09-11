@@ -135,7 +135,7 @@ def test_acquire_times_out_if_never_ready():
 
 def test_acquire_start_failure_propagates():
     def boom():
-        raise RuntimeError("docker start vg-comfy failed")
+        raise RuntimeError("docker start comfyui failed")
 
     with pytest.raises(RuntimeError):
         comfyui.acquire_box_for_comfyui([], start_fn=boom, ready_probe=lambda: True)

@@ -51,4 +51,4 @@ kubeconform -strict -summary deploy/k8s/*.yaml
 
 The **broker controller** that reconciles LLM capacity from live queue demand — scaling /
 (re)modeling the `vllm` Deployment instead of running it statically — is **not built**. See
-[`docs/broker_k8s_llm.md`](../../docs/broker_k8s_llm.md).
+[`docs/gpu_and_llm.md` §4](../../docs/gpu_and_llm.md#4-broker-managed-llm-on-kubernetes-design).

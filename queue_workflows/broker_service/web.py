@@ -11,8 +11,10 @@ server-rendered, no JS, ``Cache-Control: no-store``, ``ThreadingHTTPServer``):
   form of the pull→grant control model.
 * **read-only operator panel** — ``GET /``: the shared, project-labelled CPU/GPU
   queue, the worker fleet + liveness, and a per-resource KPI strip, with a
-  ``?project=`` filter. Also ``GET /api/{jobs,workers,snapshot}`` (JSON),
-  ``GET /healthz``, and ``GET /favicon.svg`` (the brand mark, served pre-auth).
+  ``?project=`` filter and a ``?refresh=`` cadence control (seconds; ``0`` pauses
+  — the WCAG 2.2.1 "user can stop the timed reload" affordance, still no-JS).
+  Also ``GET /api/{jobs,workers,snapshot}`` (JSON), ``GET /healthz``, and
+  ``GET /favicon.svg`` (the brand mark, served pre-auth).
 
 **Auth is opt-in but fail-closed for a public bind.** Set
 ``QUEUE_WORKFLOWS_BROKER_WEB_TOKEN`` to require ``Authorization: Bearer <token>``
@@ -29,6 +31,7 @@ server shares it safely.
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import hmac
 import html
 import json
@@ -90,9 +93,22 @@ _PLACEHOLDER_TOKENS = frozenset({"replace_me", "changeme", "change_me", "changme
 #: Hosts treated as loopback — a bind to one of these stays open with no token.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", ""})
 
+#: Panel auto-refresh cadence (seconds): the default, and the clamp ceiling for the
+#: ``?refresh=`` override. ``0`` pauses the reload entirely — the panel is the only
+#: page, and an operator reading a row must be able to stop it moving (WCAG 2.2.1).
+_DEFAULT_REFRESH_S = 5
+_MAX_REFRESH_S = 3600
+
 #: Max request body we read into memory. A bounded cap turns a hostile / buggy
 #: Content-Length into a 413 instead of an OOM (the panel/API payloads are tiny).
 _MAX_BODY_BYTES = 1_048_576  # 1 MiB
+
+#: How much of an oversized body we discard (chunked, never buffered) before the
+#: 413 goes out. Without the drain, the client can still be mid-``send()`` when the
+#: response + close land, and naive clients (urllib included) die on EPIPE instead
+#: of ever reading the 413. The cap keeps a hostile Content-Length from turning
+#: that courtesy into unbounded work.
+_MAX_DRAIN_BYTES = 8 * 1_048_576  # 8 MiB
 
 #: Ceiling on concurrent request-handling threads. The stdlib ThreadingMixIn spawns
 #: one thread per connection with no cap; a bounded pool is the thread-exhaustion
@@ -167,14 +183,16 @@ def _check_bind_security(host: str) -> None:
 #: The panel's design tokens — warm amber primary on a soft neutral page, ink
 #: text, hairline borders, pill badges, carded tables with a tinted row hover.
 #: Pure CSS on the handler's own class names; light theme (dashboards embedding
-#: this can theme around it).
+#: this can theme around it). Text-role tokens (muted/success/danger/pending) are
+#: AA-dark: every chip text/background pair holds WCAG 4.5:1 — enforced by
+#: ``test_panel_contrast_meets_aa``, which parses this stylesheet.
 _CSS = """
 :root{color-scheme:light;
 --primary:#f7a825;--primary-dark:#e0941a;--primary-soft:#fdebcb;--primary-tint:#fff6e7;
---ink:#313131;--ink-soft:#4d4d4d;--muted:#7e7e7e;
+--ink:#313131;--ink-soft:#4d4d4d;--muted:#717171;
 --border:#dadada;--border-soft:#ececec;--page:#f9f9f9;--card:#fff;
---success:#1f9d6b;--success-bg:#d8f0e6;--danger:#d64545;--danger-bg:#fbe0e0;
---pending:#b9740c;--pending-bg:#fdebcb;
+--success:#187751;--success-bg:#d8f0e6;--danger:#b43a3a;--danger-bg:#fbe0e0;
+--pending:#945d0a;--pending-bg:#fdebcb;
 --radius:12px;--radius-sm:8px;--radius-pill:100px;--topbar-h:64px;
 --shadow-card:0 1px 2px rgba(49,49,49,.05),0 1px 3px rgba(49,49,49,.06);
 --ring:0 0 0 3px rgba(247,168,37,.25)}
@@ -189,6 +207,8 @@ header{min-height:var(--topbar-h);padding:12px 24px;background:var(--card);
 h1{font-size:19px;margin:0;font-weight:600;letter-spacing:.1px}
 h1 .v{color:var(--muted);font-weight:500;font-size:13px}
 .sub{color:var(--muted);font-size:12.5px;margin-left:auto}
+.sub a{color:var(--ink-soft)}
+.sub b{color:var(--ink);font-weight:600}
 main{padding:22px 24px;max-width:1120px;margin:0 auto}
 section{margin-bottom:28px}
 h2{font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin:0 0 10px;font-weight:600}
@@ -206,29 +226,33 @@ h2{font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted
 .kpi .row b{color:var(--ink)}
 .kpi .row b.n-done{color:var(--success)}.kpi .row b.n-failed{color:var(--danger)}
 .kpi .row b.n-running{color:var(--pending)}
+.tablewrap{overflow-x:auto}
 table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--border);
       border-radius:var(--radius);overflow:hidden;box-shadow:var(--shadow-card)}
 th,td{text-align:left;padding:12px;font-size:13.5px}
 th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px;
    border-bottom:1px solid var(--border);background:var(--card);white-space:nowrap}
-td{border-bottom:1px solid var(--border-soft);color:var(--ink)}
+td{border-bottom:1px solid var(--border-soft);color:var(--ink);white-space:nowrap}
 tbody tr{transition:background-color .12s ease}
 tbody tr:hover{background:var(--primary-tint)}
 tr:last-child td{border-bottom:none}
 td.mono,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
 .chip{display:inline-flex;align-items:center;padding:3px 12px;border-radius:var(--radius-pill);
       font-size:12px;font-weight:600;line-height:1.5;border:1px solid transparent;white-space:nowrap;letter-spacing:.1px}
-.s-queued{background:#eee;color:var(--muted);border-color:var(--border)}
+.s-queued{background:#eee;color:var(--ink-soft);border-color:var(--border)}
 .s-granted{background:var(--primary-tint);color:var(--pending);border-color:rgba(247,168,37,.35)}
 .s-running{background:var(--pending-bg);color:var(--pending);border-color:rgba(247,168,37,.35)}
-.s-done{background:var(--success-bg);color:var(--success);border-color:rgba(31,157,107,.2)}
-.s-failed{background:var(--danger-bg);color:var(--danger);border-color:rgba(214,69,69,.2)}
-.s-killed{background:#eee;color:var(--danger);border-color:rgba(214,69,69,.2)}
-.w-waiting{background:#eee;color:var(--muted);border-color:var(--border)}
-.w-running{background:var(--success-bg);color:var(--success);border-color:rgba(31,157,107,.2)}
-.w-dead{background:var(--danger-bg);color:var(--danger);border-color:rgba(214,69,69,.2)}
+.s-done{background:var(--success-bg);color:var(--success);border-color:rgba(24,119,81,.25)}
+.s-failed{background:var(--danger-bg);color:var(--danger);border-color:rgba(180,58,58,.25)}
+.s-killed{background:#eee;color:var(--danger);border-color:rgba(180,58,58,.25)}
+.w-waiting{background:#eee;color:var(--ink-soft);border-color:var(--border)}
+.w-running{background:var(--success-bg);color:var(--success);border-color:rgba(24,119,81,.25)}
+.w-dead{background:var(--danger-bg);color:var(--danger);border-color:rgba(180,58,58,.25)}
 .empty{color:var(--muted);font-size:13px;padding:16px;background:var(--card);
        border:1px dashed var(--border);border-radius:var(--radius)}
+h2 .count{color:var(--muted);font-weight:500;text-transform:none;letter-spacing:0;margin-left:4px}
+.vh{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+    clip:rect(0 0 0 0);white-space:nowrap;border:0}
 """
 
 
@@ -236,17 +260,62 @@ def _esc(v: Any) -> str:
     return html.escape("" if v is None else str(v))
 
 
-def _fmt_ts(v: Any) -> str:
-    """Render a timestamp cell across both backends: a datetime formats directly;
-    the sqlite TEXT / ISO-8601 form is trimmed to the same ``YYYY-MM-DD HH:MM:SS``
-    shape (no microseconds/offset noise); missing → an em-dash, never a blank cell."""
+def _age(v: Any) -> tuple[str, str]:
+    """A timestamp as ``(relative age, absolute title)`` across both backends: pg
+    hands back aware datetimes, sqlite ISO-8601 UTC TEXT. The cell shows
+    "3s/5m/2h/4d ago" — staleness at a glance, which is what an operator actually
+    reads off a liveness column — and keeps the exact ``YYYY-MM-DD HH:MM:SS UTC``
+    in ``title`` for hover. Missing → an em-dash; clock skew clamps at 0 rather
+    than going negative; an unparseable value falls through verbatim (never a 500)."""
     if v is None or v == "":
-        return "—"
+        return "—", ""
+    if isinstance(v, _dt.datetime):
+        dt = v if v.tzinfo else v.replace(tzinfo=_dt.timezone.utc)
+    else:
+        try:
+            dt = _dt.datetime.strptime(str(v).replace("T", " ")[:19], "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return _esc(str(v)), ""
+        dt = dt.replace(tzinfo=_dt.timezone.utc)
+    secs = max(0, int((_dt.datetime.now(_dt.timezone.utc) - dt).total_seconds()))
+    if secs < 60:
+        rel = f"{secs}s ago"
+    elif secs < 3600:
+        rel = f"{secs // 60}m ago"
+    elif secs < 86400:
+        rel = f"{secs // 3600}h ago"
+    else:
+        rel = f"{secs // 86400}d ago"
+    return rel, dt.astimezone(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _age_cell(v: Any) -> str:
+    rel, abs_ = _age(v)
+    title = f' title="{abs_}"' if abs_ else ""
+    return f"<td class='mono'{title}>{rel}</td>"
+
+
+def _parse_refresh(q: dict[str, list[str]]) -> int:
+    """The ``?refresh=`` cadence in seconds, clamped to ``[0, _MAX_REFRESH_S]``;
+    ``0`` pauses. Malformed input falls back to the default (never a 500)."""
+    raw = (q.get("refresh") or [None])[0]
+    if raw is None:
+        return _DEFAULT_REFRESH_S
     try:
-        return v.strftime("%Y-%m-%d %H:%M:%S")
-    except AttributeError:
-        s = str(v).replace("T", " ")
-        return _esc(s[:19]) if len(s) >= 19 else _esc(s)
+        return max(0, min(int(raw), _MAX_REFRESH_S))
+    except ValueError:
+        return _DEFAULT_REFRESH_S
+
+
+def _href(project: str | None, refresh: int) -> str:
+    """A panel link carrying both view knobs. Defaults are omitted so the canonical
+    view keeps the bare URL; ``&`` is written pre-escaped for the href attribute."""
+    parts = []
+    if project is not None:
+        parts.append("project=" + urllib.parse.quote(project))
+    if refresh != _DEFAULT_REFRESH_S:
+        parts.append(f"refresh={refresh}")
+    return "/?" + "&amp;".join(parts) if parts else "/"
 
 
 def _status_chip(status: str) -> str:
@@ -257,14 +326,15 @@ def _worker_chip(state: str) -> str:
     return f'<span class="chip w-{_esc(state)}">{_esc(state)}</span>'
 
 
-def render_panel(project: str | None = None) -> str:
-    """Server-render the read-only operator panel for the shared queue + fleet."""
+def render_panel(project: str | None = None, refresh: int = _DEFAULT_REFRESH_S) -> str:
+    """Server-render the read-only operator panel for the shared queue + fleet.
+
+    ``project`` scopes ALL three sections (KPIs, jobs, workers); ``refresh`` is the
+    meta-refresh cadence in seconds (``0`` = paused, no meta tag at all)."""
     counts = _o.queue_counts(project=project)
-    workers = _o.list_workers()
+    workers = _o.list_workers(project=project)
     jobs = _o.list_jobs(project=project, limit=50)
-    all_projects = sorted(
-        {j["project"] for j in _o.list_jobs(limit=500)} | {w["project"] for w in workers}
-    )
+    all_projects = _o.list_projects()
 
     # counts[resource][status] -> n
     by_res: dict[str, dict[str, int]] = {r: {s: 0 for s in _JOB_STATUSES} for r in sorted(RESOURCES)}
@@ -285,8 +355,9 @@ def render_panel(project: str | None = None) -> str:
     )
 
     def _chip_link(label: str, value: str | None, on: bool) -> str:
-        href = "/" if value is None else "/?project=" + urllib.parse.quote(value)
-        return f'<a href="{href}" class="{"on" if on else ""}">{_esc(label)}</a>'
+        current = ' aria-current="page"' if on else ""
+        return (f'<a href="{_href(value, refresh)}" class="{"on" if on else ""}"'
+                f'{current}>{_esc(label)}</a>')
 
     filters = _chip_link("all", None, project is None) + "".join(
         _chip_link(p, p, project == p) for p in all_projects
@@ -294,50 +365,80 @@ def render_panel(project: str | None = None) -> str:
 
     if workers:
         worker_rows = "".join(
-            "<tr><td class='mono'>{w}</td><td>{p}</td><td>{r}</td><td>{st}</td><td class='mono'>{ls}</td></tr>".format(
+            "<tr><td class='mono'>{w}</td><td>{p}</td><td>{r}</td><td>{st}</td>{ls}</tr>".format(
                 w=_esc(x["worker_id"]), p=_esc(x["project"]), r=_esc(x["resource"]),
-                st=_worker_chip(x["state"]), ls=_fmt_ts(x["last_seen"]),
+                st=_worker_chip(x["state"]), ls=_age_cell(x["last_seen"]),
             )
             for x in workers
         )
         workers_html = (
-            "<table><thead><tr><th>worker</th><th>project</th><th>resource</th>"
-            f"<th>state</th><th>last seen</th></tr></thead><tbody>{worker_rows}</tbody></table>"
+            '<div class="tablewrap"><table>'
+            '<caption class="vh">Registered workers and their liveness</caption>'
+            '<thead><tr><th scope="col">worker</th><th scope="col">project</th>'
+            '<th scope="col">resource</th><th scope="col">state</th>'
+            f'<th scope="col">last seen</th></tr></thead><tbody>{worker_rows}</tbody></table></div>'
         )
     else:
-        workers_html = '<div class="empty">No workers registered.</div>'
+        workers_html = (
+            '<div class="empty">No workers registered — a worker appears here on its '
+            'first <span class="mono">/api/ask</span>.</div>'
+        )
 
     if jobs:
         job_rows = "".join(
-            "<tr><td class='mono'>{id}</td><td>{p}</td><td>{r}</td><td>{st}</td>"
-            "<td class='mono'>{pri}</td><td class='mono'>{w}</td>"
-            "<td class='mono'>{c}</td><td class='mono'>{u}</td></tr>".format(
-                id=_esc(j["job_id"][:8]), p=_esc(j["project"]), r=_esc(j["resource"]),
-                st=_status_chip(j["status"]), pri=_esc(j["priority"]),
+            "<tr><td class='mono' title=\"{full}\">{id}</td><td>{p}</td><td>{r}</td><td>{st}</td>"
+            "<td class='mono'>{pri}</td><td class='mono'>{w}</td>{c}{u}</tr>".format(
+                full=_esc(j["job_id"]), id=_esc(j["job_id"][:8]), p=_esc(j["project"]),
+                r=_esc(j["resource"]), st=_status_chip(j["status"]), pri=_esc(j["priority"]),
                 w=_esc(j["granted_worker"] or "—"),
-                c=_fmt_ts(j.get("created_at")), u=_fmt_ts(j.get("updated_at")),
+                c=_age_cell(j.get("created_at")), u=_age_cell(j.get("updated_at")),
             )
             for j in jobs
         )
         jobs_html = (
-            "<table><thead><tr><th>job</th><th>project</th><th>resource</th><th>status</th>"
-            f"<th>prio</th><th>worker</th><th>created</th><th>updated</th></tr></thead><tbody>{job_rows}</tbody></table>"
+            '<div class="tablewrap"><table>'
+            '<caption class="vh">Jobs on the shared queue, newest first</caption>'
+            '<thead><tr><th scope="col">job</th><th scope="col">project</th>'
+            '<th scope="col">resource</th><th scope="col">status</th>'
+            '<th scope="col">prio</th><th scope="col">worker</th>'
+            '<th scope="col">created</th><th scope="col">updated</th></tr></thead>'
+            f'<tbody>{job_rows}</tbody></table></div>'
         )
     else:
-        jobs_html = '<div class="empty">No jobs on the queue.</div>'
+        jobs_html = (
+            '<div class="empty">No jobs on the queue — enqueue one with '
+            '<span class="mono">POST /api/submit</span>.</div>'
+        )
 
+    # The jobs table is capped at 50 — say so, instead of silently truncating.
+    total = sum(c["n"] for c in counts)
+    jobs_count = (f"newest {len(jobs)} of {total}" if total > len(jobs) else f"{total}")
+
+    # Refresh cadence control: the current choice is bold text, the others are
+    # links. An off-list ``?refresh=`` value is shown as-is ahead of the presets.
+    cadence = []
+    for val, lab, on_lab in ((5, "5s", "5s"), (30, "30s", "30s"), (0, "off", "paused")):
+        cadence.append(
+            f"<b>{on_lab}</b>" if val == refresh
+            else f'<a href="{_href(project, val)}">{lab}</a>'
+        )
+    if refresh not in (0, 5, 30):
+        cadence.insert(0, f"<b>{refresh}s</b>")
     scope = f"project: {_esc(project)}" if project else "all projects"
+    sub = f"{scope} · refresh: " + " · ".join(cadence)
+    meta_refresh = (
+        f'\n<meta http-equiv="refresh" content="{refresh}">' if refresh > 0 else ""
+    )
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="5">
+<meta name="viewport" content="width=device-width, initial-scale=1">{meta_refresh}
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <title>broker_parrot — broker</title><style>{_CSS}</style></head>
 <body>
 <header>
   <span class="logo">{_BRAND_SVG}</span>
   <h1>broker <span class="v">— shared CPU/GPU queue · orchestrated</span></h1>
-  <span class="sub">{scope} · auto-refresh 5s</span>
+  <span class="sub">{sub}</span>
 </header>
 <main>
   <section>
@@ -346,11 +447,11 @@ def render_panel(project: str | None = None) -> str:
   </section>
   <section>
     <div class="filters">{filters}</div>
-    <h2>Jobs</h2>
+    <h2>Jobs <span class="count">{jobs_count}</span></h2>
     {jobs_html}
   </section>
   <section>
-    <h2>Workers</h2>
+    <h2>Workers <span class="count">{len(workers)}</span></h2>
     {workers_html}
   </section>
 </main>
@@ -388,6 +489,17 @@ class BrokerWebHandler(BaseHTTPRequestHandler):
         except ValueError:
             return 0
 
+    def _drain_body(self, n: int) -> None:
+        """Discard up to :data:`_MAX_DRAIN_BYTES` of a rejected request body in
+        64 KiB chunks — nothing is buffered, so the OOM guard holds — letting a
+        well-meaning client finish its ``send()`` and actually read the 413."""
+        remaining = min(n, _MAX_DRAIN_BYTES)
+        while remaining > 0:
+            chunk = self.rfile.read(min(65536, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+
     def _read_json(self) -> dict[str, Any]:
         n = self._content_length()
         if n <= 0:
@@ -423,6 +535,7 @@ class BrokerWebHandler(BaseHTTPRequestHandler):
         u = urllib.parse.urlparse(self.path)
         q = urllib.parse.parse_qs(u.query)
         project = (q.get("project") or [None])[0]
+        refresh = _parse_refresh(q)
         if u.path == "/healthz":
             return self._send(200, "text/plain; charset=utf-8", "ok")
         if u.path == "/favicon.svg":
@@ -434,15 +547,17 @@ class BrokerWebHandler(BaseHTTPRequestHandler):
         if u.path == "/api/jobs":
             return self._json(200, {"jobs": _o.list_jobs(project=project)})
         if u.path == "/api/workers":
-            return self._json(200, {"workers": _o.list_workers()})
+            return self._json(200, {"workers": _o.list_workers(project=project)})
         if u.path == "/api/snapshot":
             return self._json(200, {
                 "counts": _o.queue_counts(project=project),
-                "workers": _o.list_workers(),
+                "workers": _o.list_workers(project=project),
                 "jobs": _o.list_jobs(project=project),
             })
         if u.path == "/":
-            return self._send(200, "text/html; charset=utf-8", render_panel(project))
+            return self._send(
+                200, "text/html; charset=utf-8", render_panel(project, refresh=refresh)
+            )
         return self._json(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
@@ -451,6 +566,11 @@ class BrokerWebHandler(BaseHTTPRequestHandler):
             return self._unauthorized()
         if self._content_length() > _MAX_BODY_BYTES:
             # Reject oversized bodies before reading them into memory (DoS guard).
+            # Drain (bounded) so the client's send() completes and it reads the 413
+            # instead of dying on EPIPE; then drop the connection — any undrained
+            # remainder must not be parsed as a next keep-alive request.
+            self._drain_body(self._content_length())
+            self.close_connection = True
             return self._json(413, {"error": "request body too large"})
         b = self._read_json()
         try:
