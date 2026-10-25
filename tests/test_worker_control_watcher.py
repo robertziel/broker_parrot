@@ -5,7 +5,7 @@ Covers (the worker-read side of the feature):
   absent ⇒ no-op; an OFF row with an unimplemented stop_policy falls back to hard;
 - the watcher THREAD trips on an OFF flip (driven by the NOTIFY), with an injected
   on_exit so the test process survives;
-- AI_LEADS_DISABLE_WORKER_CONTROL keeps the watcher inert (tests);
+- QUEUE_WORKFLOWS_DISABLE_WORKER_CONTROL keeps the watcher inert (tests);
 - ClaimWorker.requeue_inflight_for_control re-queues this worker's rows and clears
   its busy-ghost (resume-style, no retry bump);
 - ClaimWorker._park_until_enabled: returns at once when ON, and resumes when an
@@ -120,7 +120,7 @@ def test_check_once_scoped_to_this_workers_queue():
 
 
 def test_watcher_thread_trips_on_off_flip(monkeypatch):
-    monkeypatch.setenv("AI_LEADS_WORKER_CONTROL_POLL_S", "0.2")
+    monkeypatch.setenv("QUEUE_WORKFLOWS_WORKER_CONTROL_POLL_S", "0.2")
     worker = _worker("box-t")
     _running_node_job("box-t", queue="cpu")
 
@@ -144,7 +144,7 @@ def test_watcher_thread_trips_on_off_flip(monkeypatch):
 
 
 def test_watcher_disabled_via_env(monkeypatch):
-    monkeypatch.setenv("AI_LEADS_DISABLE_WORKER_CONTROL", "1")
+    monkeypatch.setenv("QUEUE_WORKFLOWS_DISABLE_WORKER_CONTROL", "1")
     worker = _worker("dis")
     w = worker_control.WorkerControlWatcher(worker=worker, on_exit=lambda c: None)
     w.start()
@@ -188,7 +188,7 @@ def test_park_gate_returns_immediately_when_on():
 def test_park_gate_resumes_when_enabled(monkeypatch):
     """An OFF worker parks (no claim) and resumes the instant it's turned back ON
     — the full park→NOTIFY→resume path."""
-    monkeypatch.setenv("AI_LEADS_WORKER_CONTROL_POLL_S", "0.2")
+    monkeypatch.setenv("QUEUE_WORKFLOWS_WORKER_CONTROL_POLL_S", "0.2")
     worker = _worker("parkhost2")
     worker_control.disable_worker("parkhost2", "cpu")  # OFF ⇒ would park
 
@@ -207,11 +207,11 @@ def test_park_gate_resumes_when_enabled(monkeypatch):
 def test_parked_worker_ticks_the_card_quiesce(monkeypatch):
     """PARK RELEASES THE CARD: while parked, the gate must tick
     the LLM quiesce so the box's servers are stopped and STAY stopped (a
-    `restart: unless-stopped` sidecar resurrects itself; found live on box-a —
-    65 GB re-loaded 53 min into a park with nothing able to stop it). The
+    `restart: unless-stopped` sidecar resurrects itself; found live —
+    a multi-GB model re-loaded long into a park with nothing able to stop it). The
     builder decides WHAT to tick (gpu-only, kill-switch); the gate's contract
     is that it ticks whatever the builder returns, every wait iteration."""
-    monkeypatch.setenv("AI_LEADS_WORKER_CONTROL_POLL_S", "0.2")
+    monkeypatch.setenv("QUEUE_WORKFLOWS_WORKER_CONTROL_POLL_S", "0.2")
     worker = _worker("parkhost4")
     ticks: list[int] = []
     monkeypatch.setattr(worker, "_build_park_quiesce",
@@ -279,8 +279,8 @@ def test_check_once_swallows_db_error_returns_false(monkeypatch):
 
 # ── stop_policy="drain": park after the in-flight job, never kill it ──────────
 #
-# The operator ask: parking a box must stop NEW claims but KEEP the
-# running job ("if already running and changed, keep last job"). hard remains the
+# The requirement: parking a box must stop NEW claims but KEEP the
+# running job (a job already running when the control changes is kept). hard remains the
 # escalation (the panel's force-kill). Drain: the watcher FLAGS the worker and
 # stays alive (escalation to hard still works); the claim loop parks at its next
 # iteration boundary — after the in-flight job finishes — via the existing

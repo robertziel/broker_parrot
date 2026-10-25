@@ -263,7 +263,7 @@ _ARTIFACT_RE = re.compile(r"^(?P<role>.+)-v\d+-[a-z0-9_]+-(?P<server>[a-z0-9]+)$
 def artifact_role(tag: str) -> str | None:
     """The role an ARTIFACT tag names, or None for a tag that is not one.
 
-    `chat-expert-a-v6-q4km-ollama` → `chat-expert-a`; `chat-expert-a` → None (a role
+    `chat-expert-a-v1-q4-ollama` → `chat-expert-a`; `chat-expert-a` → None (a role
     tag is not an artifact tag — that distinction is the whole convention)."""
     m = _ARTIFACT_RE.match(canonical_tag(tag))
     return m.group("role") if m else None
@@ -277,11 +277,10 @@ def resolve_artifact(
 ) -> str | None:
     """WHICH artifact tag the role currently serves on this box — observed, not declared.
 
-    The question this answers existed because of an eight-day incident: `chat-expert-a`
-    resolved to a GGUF built from a void merge (the untuned base) and every job row
-    truthfully recorded the role name. A promotion is re-pointing a role tag, so the role
-    name can never answer "which bytes"; the artifact tag can, and this derives it from
-    the same observation the claim gate already trusts.
+    A role tag can point at the wrong build while every job row truthfully records the
+    role name. A promotion is re-pointing a role tag, so the role name can never answer
+    "which bytes"; the artifact tag can, and this derives it from the same observation
+    the claim gate already trusts.
 
     Resolution order, most evidence first:
 

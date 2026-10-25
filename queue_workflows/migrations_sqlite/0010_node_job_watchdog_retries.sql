@@ -14,7 +14,7 @@
 -- NO dispatch event (the run stays ``running``), and hard-exits the worker so a
 -- fresh worker re-claims and retries the node. To stop a node that wedges EVERY
 -- time from looping forever, each re-queue increments THIS counter; once it
--- reaches ``AI_LEADS_WATCHDOG_MAX_RETRIES`` (default 3) the watchdog falls back
+-- reaches ``QUEUE_WORKFLOWS_WATCHDOG_MAX_RETRIES`` (default 3) the watchdog falls back
 -- to the old mark-failed path so the run finally fails.
 --
 -- WHY A DEDICATED COLUMN (not ``attempts``). ``workflow_dispatch_events`` already

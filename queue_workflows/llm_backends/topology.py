@@ -7,7 +7,7 @@ its ROOT *URL* from a single per-process env (``ollama_url_env`` / ``vllm_url_en
 One env is fine when every box talks to the same server — but a real fleet wants
 DIFFERENT addresses per box: the GPU host runs ollama locally
 (``http://127.0.0.1:11434``) while a CPU/client box must reach it across the fast
-interconnect (``http://box-b-fast:11434``). This module lets a deployment express
+interconnect (``http://box-b:11434``). This module lets a deployment express
 that as a small YAML; broker_parrot then hands each box the address that is BEST
 *for that box*, keyed by the box's own ``host_label`` — "broker_parrot knows what
 to send to a given box as its LLM address".
@@ -30,7 +30,7 @@ fields can be added without a schema break)::
     boxes:
       box-a-gpu:  http://127.0.0.1:11434       # runs its own ollama locally
       box-b-gpu:  http://127.0.0.1:11434       # runs its own ollama locally
-      box-c-gpu:  http://box-b-fast:11434      # no local server → reach box-b's
+      box-c-gpu:  http://box-b:11434           # no local server → reach box-b's
       default:    http://127.0.0.1:11434       # any other box → its own local server
 
 A ``default:`` entry is the catch-all for a box with no explicit row.

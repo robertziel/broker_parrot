@@ -1,12 +1,12 @@
 """Start a stopped vLLM when the queue justifies it — the other half of the rule.
 
-The idle stopper frees a vLLM's ~35 GB after 5 unused minutes. On its own that is a
+The idle stopper frees a vLLM's memory after 5 unused minutes. On its own that is a
 one-way door, and it closed one: stopped ⇒ not advertised ⇒ no job can prefer it ⇒
-never used ⇒ stays stopped. Observed live — box-a sat with vLLM `exited` and 0
-requests served while 2403 jobs preferring it queued behind ollama.
+never used ⇒ stays stopped. A box can sit with vLLM `exited` and 0
+requests served while thousands of jobs preferring it queue behind ollama.
 
 The amortisation rule already says when a cold start is worth paying for: at least
-``min_queue`` jobs waiting. The pair is deliberately ASYMMETRIC (operator rule) —
+``min_queue`` jobs waiting. The pair is deliberately ASYMMETRIC (a design rule) —
 
     unused for the TTL AND the queue is EMPTY  -> stop  (reclaim the VRAM)
     >= min_queue jobs waiting                  -> start (the cold start amortises)
@@ -156,9 +156,9 @@ def _worker():
 
 
 def test_the_start_is_a_HANDOVER_ollama_freed_BEFORE_vllm_starts(monkeypatch):
-    """ONE SERVER AT A TIME. Each server holds its own full copy (~34 GB here), so
-    starting vLLM while ollama was still resident took box-a to 117.7/121 GB — about
-    3 GB from OOM on a box that has already died of OOM once. Order is the contract."""
+    """ONE SERVER AT A TIME. Each server holds its own full copy of the model, so
+    starting vLLM while ollama is still resident takes a unified-memory box to nearly
+    all of its memory — a few GB from OOM. Order is the contract."""
     from queue_workflows import claim_worker, model_residency
     from queue_workflows.config import get_config
 
@@ -202,12 +202,12 @@ def test_no_start_hook_means_no_handover(monkeypatch):
     assert _worker()._handover_to_vllm() is False
 
 
-# ── analysis #5: hysteresis + backoff ────────────────────────────────────────
+# ── hysteresis + backoff ─────────────────────────────────────────────────────
 
 
 def test_idle_stop_refuses_while_the_queue_would_immediately_restart_it():
     """The stop side must be symmetric with the start side: a 5-min traffic stall
-    under a 2000-deep queue must not unload 35 GB the next tick pays ~8 min for."""
+    under a 2000-deep queue must not unload a model the next tick pays minutes to reload."""
     act = [{"served": True, "running": 0, "finished": 7}]
     m, clock, started, stopped = _mgr(act, [2000])
     m.tick()                                # first sighting
@@ -225,7 +225,7 @@ def test_idle_stop_still_fires_when_the_queue_is_EMPTY():
     assert len(stopped) == 1
 
 
-# ── sticky stop (operator rule): don't hand back mid-stream ──────
+# ── sticky stop (design rule): don't hand back mid-stream ────────
 
 
 def test_sticky_stop_ONE_waiting_job_keeps_the_warm_server():
@@ -282,8 +282,8 @@ def test_a_raising_gate_fails_OPEN():
 
 
 def test_a_target_that_never_comes_up_is_backed_off_exponentially():
-    """Analysis #5b: a permanently-broken vLLM was re-requested every cooldown —
-    ~88 % of the box's time out of service. Each failed start doubles the wait; a
+    """A permanently-broken vLLM, re-requested every cooldown, keeps the box
+    out of service most of the time. Each failed start doubles the wait; a
     server observed serving resets it."""
     act = [{"served": False, "running": 0, "finished": 0}]
     m, clock, started, stopped = _mgr(act, [2403], cooldown=100.0)

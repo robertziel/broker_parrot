@@ -3,12 +3,13 @@
 ## Why it exists
 
 `hw_metrics` is push-only: every sample is a `NOTIFY` and gone. When a GPU box
-hard-dies there is **no hardware trail to autopsy**. The motivating incident: a unified-memory GPU box's firmware thermal protection killed the machine on
-every `sdxl` render — **zero kernel trace** (no Xid, no thermal event,
-journal stops mid-write), because the trigger was a board-level sensor the OS
-exposes no trip points for. The GPU asserted a hardware slowdown (throttle
-mask `0x48`) **7 seconds before the power cut**; only an ad-hoc sync-per-line
-shell recorder caught it. `hw_watch` is that recorder, engine-owned.
+hard-dies there is **no hardware trail to autopsy**. The failure mode it targets: a
+unified-memory GPU box's firmware thermal protection can kill the machine under
+sustained GPU load with **zero kernel trace** (no Xid, no thermal event,
+journal stops mid-write), because the trigger is a board-level sensor the OS
+exposes no trip points for. The GPU asserts a hardware slowdown (a throttle
+mask such as `0x48`) **seconds before the power cut**; only a sync-per-line
+recorder catches it. `hw_watch` is that recorder, engine-owned.
 
 ## What it stores
 
@@ -28,9 +29,9 @@ JSONB payload from `hw_watch.deep_sample()`:
   SM clock, utilisation, pstate, and the **throttle-reason mask** — the
   smoking-gun field (`0x20` SW-thermal, `0x40` HW-thermal, `0x08` HW-brake,
   `0x04` SW-power-cap).
-- **tz** — every `/sys/class/thermal` zone (`type` + milli-°C). On the box in the
-  motivating incident (a unified-memory GPU box) the killer sensor was an `acpitz` zone reading ~94 °C while
-  the GPU core showed a harmless 78–84 °C.
+- **tz** — every `/sys/class/thermal` zone (`type` + milli-°C). On a unified-memory
+  GPU box the killer sensor can be an `acpitz` zone running hot while the GPU core
+  temperature still reads normal.
 - **hwmon** — every hwmon temp input (NVMe, NIC, SoC…).
 - **mem** — `/proc/meminfo` totals (unified-memory boxes live and die by
   host RAM); **load1**; **disk_root_used_mb**.
@@ -50,8 +51,7 @@ never an exception.
 ## Contracts
 
 - **Off by default.** `QUEUE_WORKFLOWS_HW_WATCH=1` enables persistence —
-  existing deploys are byte-compatible. Knobs (canonical spelling; legacy
-  `AI_LEADS_*` twins resolve for free):
+  existing deploys are byte-compatible. Knobs:
   `QUEUE_WORKFLOWS_HW_WATCH_DETAIL_INTERVAL_S` (2),
   `…_HISTORY_INTERVAL_S` (60), `…_DETAIL_RETENTION_S` (3600),
   `…_HISTORY_RETENTION_S` (86400), `…_PRUNE_INTERVAL_S` (300, orchestrator).
@@ -80,8 +80,8 @@ QUEUE_WORKFLOWS_DB_BACKEND=pg QUEUE_WORKFLOWS_DB_URL=postgresql://… \
 queue-hw-watch --once               # one sample per tier, then exit
 ```
 
-The CLI bootstraps the engine chain idempotently (the `queue-broker`
-standalone precedent), so it works against a fresh DB.
+The CLI bootstraps the engine chain idempotently (as the orchestrator does on
+boot), so it works against a fresh DB.
 
 ## Reading it back
 

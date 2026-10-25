@@ -2,8 +2,8 @@
 ``cancelled`` or ``failed`` to ``cancelled``.
 
 The contract this closes: the host's cancel handler typically just flips
-``workflow_runs.status='cancelled'`` and stops there (Rails' ``DELETE
-/workflow/:id`` does exactly that). The claim SQL refuses such jobs (run-cancel
+``workflow_runs.status='cancelled'`` and stops there (a host app's
+``DELETE /workflow/:id`` may do exactly that). The claim SQL refuses such jobs (run-cancel
 guard, ``test_invariant_cancel``), so they're never executed — but they linger
 in ``queued`` forever, polluting the queue gauges and confusing operators into
 thinking workers are stuck.
@@ -179,8 +179,8 @@ def test_cancel_orphaned_queued_jobs_sweeps_across_multiple_runs():
 
 
 def test_cancel_orphan_queued_jobs_default_is_TRUE():
-    """Default flipped ON by the ghost audit: a 'full' gpu queue turned
-    out to be 82 % ghosts (queued jobs of terminal runs), which poisoned every
+    """Default ON: a 'full' gpu queue can turn out to be mostly ghosts
+    (queued jobs of terminal runs), which poisons every
     queue-depth-driven signal. Semantically safe — a terminal run's job can never
     be claimed — so the engine now cleans them up by default; hosts opt back out
     via configure(cancel_orphan_queued_jobs=False)."""
@@ -198,7 +198,7 @@ def test_configure_cancel_orphan_queued_jobs_roundtrips_true():
 
 def test_node_pool_tick_sweeps_orphans_when_flag_enabled():
     """With the flag on, NodePool's per-tick sweep flips queued jobs of
-    cancelled/failed runs to cancelled — closing the audit gap."""
+    cancelled/failed runs to cancelled — closing the ghost-job gap."""
     queue_workflows.configure(cancel_orphan_queued_jobs=True)
     run_id = make_run()
     job_id = node_queue.enqueue_node_job(

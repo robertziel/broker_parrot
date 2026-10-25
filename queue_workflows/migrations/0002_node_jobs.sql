@@ -4,12 +4,12 @@
 -- node-job lives on either the `cpu` queue (short-lived subprocess workers) or
 -- the `gpu` queue (long-lived workers with a model cache).
 --
--- CONSOLIDATED final shape (plan §7 step 6 — discrete column-add migrations
--- folded into the base table): this table is created in the same shape the
--- ai_leads chain reached after migrations 002/005/006/009/016/019/030/038.
+-- CONSOLIDATED final shape (discrete column-add migrations folded into the
+-- base table): this table is created in the same shape the origin host app's
+-- chain reached after its migrations 002/005/006/009/016/019/030/038.
 -- Columns folded in:
 --   * pipeline_name (old 005)        — parent pipeline ref
---   * celery_task_id (old 009)       — legacy, unused post-Phase-5; kept for
+--   * celery_task_id (old 009)       — legacy, unused today; kept for
 --                                      fidelity (a separate cleanup drops it)
 --   * resolved_inputs (old 016)      — execute-time $from snapshot
 --   * host_label (old 030)           — claiming host
@@ -22,7 +22,7 @@
 -- The `mode` column on workflow_runs (old 002) lives in 0001.
 --
 -- Idempotent: `CREATE TABLE IF NOT EXISTS` so re-running on an already-migrated
--- ai_leads DB is a no-op. The named CHECK constraints match what the ai_leads
+-- DB is a no-op. The named CHECK constraints match what the origin host app's
 -- chain auto-named, so the existing live table satisfies them identically.
 
 CREATE TABLE IF NOT EXISTS workflow_node_jobs (

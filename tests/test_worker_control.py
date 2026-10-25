@@ -189,7 +189,7 @@ def test_get_worker_control_table_absent_returns_none(monkeypatch):
 @pytest.mark.pg_only
 def test_set_worker_control_fires_notify():
     """The migration-0012 trigger NOTIFYs ``worker_control`` with ``host:queue``
-    on write, so a plain INSERT/UPDATE (Python or Rails) wakes the worker."""
+    on write, so a plain INSERT/UPDATE (Python or any SQL client) wakes the worker."""
     import psycopg
 
     with psycopg.connect(db_url(), autocommit=True) as conn:

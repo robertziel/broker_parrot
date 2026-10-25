@@ -4,7 +4,7 @@ node body when its parent run flips to ``cancelled`` / ``failed``.
 The claim SQL already refuses jobs of a cancelled run; this catches a cancel
 that lands MID-execution so a long-running GPU node can unwind early instead of
 running to completion. Reads run status through the engine's
-:mod:`queue_workflows.run_store` (the ``repo`` inversion, plan §1d).
+:mod:`queue_workflows.run_store` (the ``repo`` inversion).
 """
 
 from __future__ import annotations

@@ -60,8 +60,8 @@ _DISABLE_ENV = "QUEUE_WORKFLOWS_DISABLE_MODEL_RESIDENCY_ENFORCER"
 class ModelResidencyViolation(RuntimeError):
     """Raised — after the hard-kill — whenever a box held more models than the cap.
 
-    Deliberately an exception, not a return flag: the operator asked for this state
-    to be an ERROR every time it occurs, and an exception is the one shape that is
+    Deliberately an exception, not a return flag: this state must
+    be an ERROR every time it occurs, and an exception is the one shape that is
     loud in a log (``log.exception`` in the daemon), fatal in a script, and
     assertable in a test."""
 
@@ -87,7 +87,7 @@ def assert_can_load(model_id: str, residents: list["Resident"], *, label: str = 
     # CANONICAL TAGS. ollama reports a resident as `chat-model-a:latest` while a load asks for
     # `chat-model-a` — the same model, and comparing the raw strings makes it look foreign, so the
     # box "already holds" the model it is being asked to load and the load is refused. That
-    # produced 482 failures on one fleet before it was traced. `canonical_tag`
+    # produced hundreds of failures before it was traced. `canonical_tag`
     # is the same normaliser the claim gate's capability narrowing uses, so "is this the same
     # model?" has ONE answer everywhere.
     from queue_workflows.model_catalog import canonical_tag
@@ -265,7 +265,7 @@ def decide_evictions(
     whole point of the cap: each server loads its OWN weights, so ollama and vLLM
     both holding ``chat-model-a:latest`` is TWO copies — ~68 GB, not 34. Grouping by model
     id made that read as one, so the enforcer waved through a genuine double-load and
-    box-a reached 117.7/121 GB with both servers holding the same model. On a box
+    a box reached nearly all of its memory with both servers holding the same model. On a box
     that has died of OOM before, that is the failure this guard exists to prevent.
 
     Keeper ranking, best first: the desired server type (operator-set,
@@ -284,7 +284,7 @@ def decide_evictions(
     # EVICTION COST RULE (found live, the ollama↔vLLM eviction loop): when the SAME
     # model is resident on ollama AND vLLM, the victim is ALWAYS the ollama copy.
     # Restoring it is a per-request reload measured in seconds; restoring the vLLM
-    # is a full server start measured in minutes (~15 over NFS). The old ranking
+    # is a full server start measured in minutes. The old ranking
     # picked by (busy, desired, mru) — ollama residents never read busy, and the
     # desired default IS ollama — so one stray ollama-resolved job made the enforcer
     # kill the expensive server to save the cheap copy, every time, forever.

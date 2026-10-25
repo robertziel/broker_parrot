@@ -231,7 +231,7 @@ def test_NO_observation_keeps_the_full_declared_list_rather_than_wedging():
 
 
 def test_an_observation_that_matches_nothing_falls_back_to_DECLARED():
-    """This asserted `== []` until an audit showed the fallback was backwards.
+    """This asserted `== []` until a review showed the fallback was backwards.
 
     Downstream (`node_queue`) gates on `if known:` — an EMPTY capability list means "no
     gate", i.e. claim-ANY, which is strictly WIDER than not narrowing at all. So the

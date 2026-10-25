@@ -1,6 +1,6 @@
 """Don't pay a cold start for one job — the vLLM amortisation rule.
 
-vLLM reloads its weights on every start (~7 min for a 35 GB model on a unified-memory GPU box); ollama
+vLLM reloads its weights on every start (minutes for a large model on a unified-memory GPU box); ollama
 swaps a model in seconds. So "prefer vLLM" cannot mean "start vLLM for whatever
 turns up next" — a single job would wait longer for the server than the work takes.
 
@@ -121,7 +121,7 @@ def test_box_level_demand_is_an_ALLOW_set_not_a_preference_order():
     a row that RESTRICTS to ollama, or carries no ``server_types`` at all (NULL =
     an in-process model load, a different execution family entirely), never does.
     This is the "check if it allows vllm, not whether it prefers it" contract the
-    ollama→vLLM switch trigger stands on (operator rule)."""
+    ollama→vLLM switch trigger stands on (a deliberate policy)."""
     from queue_workflows import node_queue
     from tests._helpers import make_run
 
@@ -168,7 +168,7 @@ def test_pending_count_is_zero_on_failure_not_an_exception():
 
 
 def test_resolve_for_job_never_dispatches_at_a_dead_server(monkeypatch):
-    """REGRESSION (live, 33 failed jobs in 10 min). `resolve_for_job(job, host, queue)`
+    """REGRESSION (live, many failed jobs in a short window). `resolve_for_job(job, host, queue)`
     is a per-dispatch hook with no capability list to pass, so `available` arrives as
     None. choose_server_type reads an EMPTY availability as "unprobed box — honour
     the preference blindly", which is right for a cold worker and catastrophic here:
@@ -204,7 +204,7 @@ def test_a_model_less_job_treats_a_LIVE_vllm_as_warm(monkeypatch):
     no model) must not be amortisation-gated away from a vLLM that is ALREADY
     serving: the server being up means the weights are resident, so there is
     nothing to amortise — and routing its calls to ollama instead summons a SECOND
-    copy of the very weights vLLM is serving (the 105/121 GB incident, through the
+    copy of the very weights vLLM is serving (the memory-exhaustion incident, through the
     preference door this time)."""
     from queue_workflows import llm_probe
     from queue_workflows.llm_backends import factory
@@ -272,7 +272,7 @@ def _budget(served, par):
 def test_an_ollama_only_box_gets_one_slot_however_high_PAR_is():
     """ollama SERIALISES per model: a second concurrent request queues behind the
     first, so extra node-job slots buy nothing and hold work hostage on one box.
-    Observed live on box-b — NODE JOBS 3/1, three llm_chat jobs stacked inside one
+    Observed live: three llm_chat jobs stacked inside one
     ollama. This is the pre-vLLM behaviour, restored."""
     assert _budget(["ollama"], 3) == 1
     assert _budget(["ollama"], 8) == 1
@@ -455,7 +455,7 @@ def test_a_recently_alive_kind_survives_one_probe_blip(monkeypatch):
 def test_a_no_preference_job_uses_the_LIVE_vllm_not_the_ollama_default(monkeypatch):
     """Found live, on a box already short of memory: compose_report — an LLM caller with
     no model field, so nothing ever stamps server_types on it — resolved to the box
-    default ollama (whose daemon ALWAYS answers) and loaded a second 29 GB copy of the LLM
+    default ollama (whose daemon ALWAYS answers) and loaded a second copy of the LLM
     beside the actively-serving vLLM. A live vLLM only answers when it holds the
     weights: it IS the active server, and the default path must route to it."""
     from queue_workflows.llm_backends import factory

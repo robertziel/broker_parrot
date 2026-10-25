@@ -35,7 +35,7 @@ DESIGN CONTRACTS (match the repo's existing shapes):
 * Retention pruning (:func:`prune_hw_watch`) is dialect-portable (pg +
   sqlite) and runs on a NodePool sweep; the standalone CLI prunes for itself.
 * Env knobs read through :func:`queue_workflows.envcompat.env_get` with
-  canonical ``QUEUE_WORKFLOWS_*`` names (legacy ``AI_LEADS_*`` twins free).
+  canonical ``QUEUE_WORKFLOWS_*`` names.
   **Persistence is OFF by default** (``QUEUE_WORKFLOWS_HW_WATCH=1`` enables)
   so existing deploys are byte-compatible.
 
@@ -118,7 +118,7 @@ def history_retention_s() -> int:
 
 # ── throttle index (mask → 0-100 severity) ────────────────────────────────
 #
-# The NVML throttle-reason mask is the smoking-gun field (the unified-memory GPU box incident
+# The NVML throttle-reason mask is the smoking-gun field (in the motivating incident the
 # box died seconds after asserting 0x48) but a hex string doesn't graph.
 # ``throttle_index`` collapses it to a 0-100 severity — max over active bits,
 # because ONE hw-thermal bit already means "at the wall"; summing would
@@ -307,7 +307,7 @@ def _gpu_violations() -> dict[str, int]:
     PERFORMANCE`` → the ``Violations`` block. The ``us`` suffix distinguishes
     these counters from the same-named Active/Not-Active clock-event lines.
     Best-effort: ``{}`` on any failure (non-nvidia box, parse miss). Single
-    GPU on this fleet, so the counters are box-wide."""
+    GPU per box assumed, so the counters are box-wide."""
     raw = subprocess.check_output(
         ["nvidia-smi", "-q", "-d", "PERFORMANCE"],
         stderr=subprocess.DEVNULL, timeout=3,
@@ -778,7 +778,7 @@ def deep_sample() -> dict[str, Any]:
     sample["throttle_index"] = max(indices) if indices else None
     # Accumulated throttle-time counters (µs, monotonic) — the exact
     # power-vs-thermal throttle breakdown; attached to the first GPU (single
-    # GPU per box on this fleet). Own guard so a parse miss can't drop the rest.
+    # GPU per box assumed). Own guard so a parse miss can't drop the rest.
     if sample["gpu"]:
         try:
             vio = _gpu_violations()
@@ -998,11 +998,12 @@ class HwWatchRecorder:
 def main(argv: list[str] | None = None) -> None:
     """Standalone flight recorder for one box — no claim worker needed (e.g.
     a machine under investigation with its workers parked). Bootstraps the
-    engine chain idempotently (the ``queue-broker`` standalone precedent),
+    engine chain idempotently (like the orchestrator does on boot),
     then records forever and prunes its own retention every 5 min."""
     parser = argparse.ArgumentParser(description=main.__doc__)
-    parser.add_argument("--db-backend", choices=("pg", "sqlite"), default=None,
-                        help="override QUEUE_WORKFLOWS_DB_BACKEND")
+    # Validated by configure() (canonical_db_backend): aliases fold, junk raises.
+    parser.add_argument("--db-backend", default=None,
+                        help="sqlite or pg; overrides QUEUE_WORKFLOWS_DB_BACKEND")
     parser.add_argument("--host-label", default=None,
                         help="override the emitting label (default: hw_metrics host label)")
     parser.add_argument("--detail-interval", type=float, default=None)

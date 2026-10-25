@@ -36,7 +36,7 @@ DESIGN — a process-singleton with injected side effects, the same idiom as
     probe on build). A test injects a fake.
   * ``supervisor_factory`` builds the :class:`LLMSupervisor` for a vllm backend —
     default ``LLMSupervisor(backend=backend)``; ``.start()`` is idempotent and
-    env-gated (``AI_LEADS_DISABLE_LLM_SUPERVISOR``), so it is INERT in tests.
+    env-gated (``QUEUE_WORKFLOWS_DISABLE_LLM_SUPERVISOR``), so it is INERT in tests.
   * the URL per server type is resolved from the env NAMES on
     :class:`~queue_workflows.config.EngineConfig` (``ollama_url_env`` /
     ``vllm_url_env``) — the DB owns WHICH server + tunables, the URL is deployment
@@ -87,11 +87,11 @@ DEFAULT_OLLAMA_URL = "http://host.docker.internal:11434"
 DEFAULT_VLLM_URL = "http://host.docker.internal:8000"
 
 #: Env kill-switch for the LISTEN invalidator thread. DISTINCT from the
-#: supervisor's ``AI_LEADS_DISABLE_LLM_SUPERVISOR`` — a host may want the idle
+#: supervisor's ``QUEUE_WORKFLOWS_DISABLE_LLM_SUPERVISOR`` — a host may want the idle
 #: supervisor inert (e.g. a test) while still keeping config-change LISTEN, or
 #: vice-versa, so the two gates are independent. Added to the engine conftest's
 #: ``setdefault`` block so tests don't spawn the thread.
-DISABLE_LISTENER_ENV = "AI_LEADS_DISABLE_LLM_CONFIG_LISTENER"
+DISABLE_LISTENER_ENV = "QUEUE_WORKFLOWS_DISABLE_LLM_CONFIG_LISTENER"
 
 #: Default TTL (s) between DB re-reads of a key's config when no NOTIFY fired —
 #: the dropped-NOTIFY safety net behind the instant LISTEN invalidation.
@@ -146,7 +146,7 @@ def _default_build_backend(
     the factory never calls those at construction — so building one here does no
     network I/O and keeps the host-import guard green."""
     if server_type == worker_control.SERVER_TYPE_VLLM:
-        # Thread the host's vllm lifecycle hooks (ai_leads wires docker-over-UDS
+        # Thread the host's vllm lifecycle hooks (e.g. docker-over-UDS
         # stop/start so the in-worker supervisor can control the SIBLING sidecar
         # container). Each is None unless a host wired it via set_vllm_lifecycle;
         # the backend treats None as "use my built-in default" (``kill_fn or
@@ -268,7 +268,7 @@ class BackendFactory:
     @staticmethod
     def _normalize_vllm(url: str) -> str:
         """Normalize the vllm URL to the server ROOT. ``VLLMBackend`` appends
-        ``/v1/chat/completions`` itself, but the deployed ai_leads env value is the
+        ``/v1/chat/completions`` itself, but a typical deployed env value is the
         OpenAI base (``http://host:8000/v1``) — so strip a trailing ``/v1`` (after
         any trailing slash) to avoid a doubled ``/v1/v1``. Idempotent for a value
         already at the root."""
@@ -374,7 +374,7 @@ class BackendFactory:
         backend = self._build_backend(
             snapshot.server_type, base_url, snapshot.parallelism, idle_ttl_s,
         )
-        # NO in-process idle supervisor — DELIBERATELY (found live, the "unstable
+        # NO in-process idle supervisor — DELIBERATELY (the "unstable
         # server" oscillation). LLMSupervisor's idle clock is the backend's
         # in-process request bracket, and on this fleet the nodes are handed a URL
         # and POST it themselves — so the clock NEVER ticks, reads "idle >= TTL"
@@ -497,7 +497,7 @@ def get_backend(
 
 
 #: Server kinds whose START is expensive enough to need amortising. vLLM reloads
-#: its weights on every start (~7 min for a 35 GB model on a unified-memory GPU box); ollama swaps a
+#: its weights on every start (minutes for a large model on a unified-memory GPU box); ollama swaps a
 #: model in seconds and is never gated.
 COLD_START_KINDS = frozenset({worker_control.SERVER_TYPE_VLLM})
 
@@ -551,7 +551,7 @@ def choose_server_type(
 
     THE AMORTISATION GATE. A preferred kind in :data:`COLD_START_KINDS` is skipped
     when it is neither already ``warm`` nor backed by at least ``min_queue`` waiting
-    jobs — one job must not wait ~7 min for a server that the next preference can
+    jobs — one job must not wait minutes for a server that the next preference can
     serve now. It is skipped only if a LATER preference is actually available:
     gating away the sole option would strand the job, so a slow start beats no start.
     ``min_queue=0`` (the default, and every pre-rule caller) disables the gate.
@@ -589,13 +589,13 @@ def choose_server_type(
 
 #: Availability-probe cache TTL (s). resolve_for_job runs PER DISPATCH, and a
 #: PAR-wide pool dispatches concurrently — probing two endpoints every time was pure
-#: cost (analysis #4) and hammered the servers it was checking. 5 s is far fresher
+#: cost and hammered the servers it was checking. 5 s is far fresher
 #: than the failure modes it guards against (a server start takes minutes, a stop is
 #: followed by minutes of not-running) while collapsing per-dispatch probes to ~one
 #: per server per window.
 _PROBE_TTL_S = 5.0
 #: Grace window during which a kind that WAS answering keeps counting as alive
-#: through failed probes (found live: one 5 s cache slot of "vllm dead" routed a
+#: through failed probes (the failure mode: one 5 s cache slot of "vllm dead" routed a
 #: dispatch to ollama, which loaded a second copy of the LLM, which fed the eviction
 #: loop). 3x the TTL mirrors the heartbeat set's 3-miss debounce. A kind that was
 #: never seen alive gets NO grace — a cold server must not soak up dispatches.
@@ -609,7 +609,7 @@ _default_kind_cache: dict[tuple[str, str], tuple[float, str]] = {}
 
 
 def cached_default_kind(host_label: str, queue: str) -> str:
-    """The box-default server kind with a short TTL (round-3 audit, LOW): the
+    """The box-default server kind with a short TTL: the
     liveness fix added an UNCACHED worker_controls read per no-preference dispatch —
     50 dispatches, 50 DB reads — undoing the probe cache's point on that path. Same
     TTL as the probe; a default flip still lands within one window (and the panel
@@ -694,7 +694,7 @@ def resolve_for_job(
 
     def _serve(kind: str | None):
         """Return the backend for ``kind`` — and, when that is NOT the kind the
-        claim counted this job against, correct the row first (AUDIT DELTA D4).
+        claim counted this job against, correct the row first (the re-stamp).
 
         The per-kind arbiter counts running rows by ``resolved_server``. Leaving a
         stale stamp behind makes the dead kind look busy (its cap consumed by a job
@@ -718,24 +718,24 @@ def resolve_for_job(
     if stamped and stamped in _probe_available([stamped]):
         return _serve(stamped)
     if not prefs:
-        # THE DEFAULT PATH MUST NOT DISPATCH BLIND (analysis #2). The box default
+        # THE DEFAULT PATH MUST NOT DISPATCH BLIND. The box default
         # (worker_controls.llm_server_type — also what the panel's "default →" lever
         # writes) used to be dispatched at without a liveness check, so flipping the
         # default to a server that was not running routed every no-preference job at
-        # a dead port — the same failure class as the 33-job Connection-refused
-        # incident, resurfaced via config. Probe the default; if it is down but the
+        # a dead port — the same failure class as a mass Connection-refused
+        # failure, resurfaced via config. Probe the default; if it is down but the
         # other kind answers, serve there. If NOTHING answers, fall through to the
         # default anyway — there is no better choice, and the error should name the
         # configured server.
         live = _probe_available([worker_control.SERVER_TYPE_OLLAMA,
                                  worker_control.SERVER_TYPE_VLLM])
         if worker_control.SERVER_TYPE_VLLM in live:
-            # THE ACTIVE SERVER WINS THE DEFAULT (found live, on a box already short of memory):
-            # a no-preference LLM caller (compose_report — an LLM user with
+            # THE ACTIVE SERVER WINS THE DEFAULT (a box already short of memory):
+            # a no-preference LLM caller (e.g. a report composer — an LLM user with
             # no model field, so no server_types ever gets stamped) resolved to the
             # box default = ollama, whose daemon ALWAYS answers — and its internal
-            # LLM calls loaded a second 29 GB copy beside the actively-serving
-            # vLLM, keep-alive-warm for the node's whole 28-minute run. A live
+            # LLM calls loaded a second copy of the model beside the actively-serving
+            # vLLM, keep-alive-warm for the node's whole run. A live
             # vLLM IS the box's active server (it only answers when it holds the
             # weights), and it serves the fleet's one local model — so the default
             # path must route there rather than force a second serving copy into
@@ -745,7 +745,7 @@ def resolve_for_job(
         if default_kind in live or not live:
             # Pass the RESOLVED kind, not None: with never-NULL stamps (the
             # law) a claim can predict 'vllm' (warm at claim time) and
-            # land here because vLLM died in between — _serve(None) skipped the D4
+            # land here because vLLM died in between — _serve(None) skipped the
             # re-stamp on exactly that path, leaving the arbiter counting a vllm
             # job that the default kind is serving.
             return _serve(default_kind)
@@ -763,11 +763,11 @@ def resolve_for_job(
         # advertised yet — honour the preference blindly", which is right for a cold
         # worker but catastrophic here: with available=None every job resolved to the
         # FIRST preference (vllm) whether or not vLLM was running, so once the idle
-        # stopper stopped it, 33 live jobs died on `[Errno 111] Connection refused`
-        # in ten minutes. The caller is a per-dispatch hook that has no capability
+        # stopper stopped it, every live job died on `[Errno 111] Connection refused`
+        # within minutes. The caller is a per-dispatch hook that has no capability
         # list to pass, so the default must be to look, not to guess.
         #
-        # Probe EVERY kind, not just the preferred ones (round-3 audit, MED):
+        # Probe EVERY kind, not just the preferred ones:
         # probing only the prefs could not tell "box unprobed" from "all prefs
         # dead" — both read as available=[], and the blind-honour rule then
         # dispatched a ['vllm']-only job at a dead vLLM while a healthy ollama sat
@@ -800,7 +800,7 @@ def resolve_for_job(
                     # report composer): the server being LIVE is the whole test —
                     # its weights are resident, and amortisation-gating the row
                     # onto a cheaper kind would load a SECOND copy of the very
-                    # weights it is serving (the 105/121 GB incident, through the
+                    # weights it is serving (the memory-exhaustion failure, through the
                     # preference door). Mirrors the no-preference path's
                     # ACTIVE-SERVER-WINS rule above.
                     if url:
@@ -825,7 +825,7 @@ def resolve_for_job(
         # deliberately claim-any for unprobed workers, so this row can legally land
         # on a box that serves none of its preference). Running it on the box
         # default keeps liveness — the model is the same — but it IS a violated
-        # preference and must be loud, not silent (analysis #7).
+        # preference and must be loud, not silent.
         log.warning(
             "[llm] %s/%s: job %s prefers %s but none is live on this box — running "
             "on the box default instead", host_label, queue,

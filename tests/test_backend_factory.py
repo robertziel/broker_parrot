@@ -127,7 +127,7 @@ def test_reads_vllm_config_from_db_and_builds_vllm_backend():
     assert backend.parallelism == 128
     assert backend.idle_ttl_s == 30                 # vllm gets the configured TTL
     assert len(built) == 1
-    # SINGLE OWNER (found live): the factory arms NO in-process supervisor — its
+    # SINGLE OWNER: the factory arms NO in-process supervisor — its
     # blind bracket-clock killed the sidecar mid-request every TTL. The
     # server-observed VLLMIdleStopper owns vllm idle lifecycle.
     assert supervisors == []
@@ -235,7 +235,7 @@ def test_switch_to_vllm_builds_NO_supervisor():
     vllm = f.get_backend("h", "gpu")
     assert vllm.server_type == "vllm"
     assert vllm is not ollama
-    # CONTRACT FLIP (found live): the factory no longer arms the in-process
+    # CONTRACT FLIP: the factory no longer arms the in-process
     # LLMSupervisor. Its idle clock is the backend's request bracket, which this
     # fleet's nodes never touch (they POST the URL directly) — so it read
     # "idle >= TTL" while the server was flat out and killed the sidecar
@@ -295,7 +295,7 @@ def test_stop_tears_down_every_co_resident_kind():
 
 
 def test_vllm_url_normalized_to_root():
-    """The deployed ai_leads env value is the OpenAI base (…/8000/v1/); the backend
+    """A typical deployed env value is the OpenAI base (…/8000/v1/); the backend
     appends /v1/chat/completions itself, so the factory strips a trailing /v1 (+
     slash) to the server root."""
     worker_control.set_llm_config("h", "gpu", server_type="vllm")
@@ -354,7 +354,7 @@ def test_stop_shuts_down_all_cached_backends_and_supervisors():
 def test_listener_disabled_by_env_spawns_no_thread():
     """With the session-wide test gate set (conftest default), start() spawns no
     daemon — tests never open a LISTEN connection."""
-    # conftest sets AI_LEADS_DISABLE_LLM_CONFIG_LISTENER=1; assert the gate holds.
+    # conftest sets QUEUE_WORKFLOWS_DISABLE_LLM_CONFIG_LISTENER=1; assert the gate holds.
     f, _, _ = _make_factory()
     assert f._listener_enabled is False
     f.start()
@@ -384,7 +384,7 @@ def test_real_listener_invalidates_on_notify(monkeypatch):
     invalidates the keyed entry so the next get_backend re-reads. Kept fast +
     robust: a short poll loop, and the entry is pre-built so 'invalidated' is the
     only thing under test."""
-    monkeypatch.delenv("AI_LEADS_DISABLE_LLM_CONFIG_LISTENER", raising=False)
+    monkeypatch.delenv("QUEUE_WORKFLOWS_DISABLE_LLM_CONFIG_LISTENER", raising=False)
     worker_control.set_llm_config("smoke", "gpu", server_type="ollama")
     f, built, _ = _make_factory(ttl_s=999.0)          # huge TTL: only NOTIFY can refresh
     assert f._listener_enabled is True
@@ -429,7 +429,7 @@ def test_real_listener_invalidates_on_notify(monkeypatch):
 def test_default_build_threads_vllm_lifecycle_hooks():
     """The DEFAULT build wires ``config.vllm_stop_fn`` / ``vllm_start_fn`` into the
     real VLLMBackend's kill / ensure_up seams, so a host that called
-    ``set_vllm_lifecycle`` (ai_leads → docker-over-UDS) controls the SIBLING
+    ``set_vllm_lifecycle`` (e.g. → docker-over-UDS) controls the SIBLING
     sidecar. Uses the real ``_default_build_backend`` (not a fake)."""
     import queue_workflows
 
@@ -464,51 +464,54 @@ def test_default_build_vllm_without_hooks_uses_builtin_defaults():
     assert backend._kill_fn is vllm_mod._default_kill_fn
 
 
-# ── STORAGE-backend name gate (queue_workflows.backends) ───────────────────────
+# ── STORAGE-backend name gate (config.canonical_db_backend) ─────────────────
 #
-# A DIFFERENT factory than the LLM one above: the pluggable *storage* backend
-# (db_backend="pg"|"redis"|"mongodb"). configure(db_backend=X) routes through
-# ``canonical_backend_name`` to fail fast at configure() time and to collapse
-# aliases (postgres/postgresql → pg, mongo → mongodb). The ValueError raise + the
-# normalization are otherwise uncovered: a regression that silently accepted an
-# unknown name — or stopped folding "mongo" — would surface much later as a
-# confusing lazy-import/connection error instead of a crisp configure() failure.
+# A DIFFERENT gate than the LLM factory above: the engine's relational store
+# (db_backend="sqlite"|"pg"). configure(db_backend=X) routes through
+# ``canonical_db_backend`` to fail fast at configure() time and to collapse
+# aliases (postgres/postgresql → pg). A regression that silently accepted an
+# unknown or removed name would surface much later as a confusing connection
+# error (or a pg DSN read as a sqlite path) instead of a crisp configure() failure.
 
 
-def test_canonical_backend_name_normalizes_aliases_and_rejects_unknown():
-    """``canonical_backend_name`` folds every alias to a canonical provider name,
-    is case/whitespace-insensitive, and raises a *helpful* ValueError (naming both
-    the offending value and the valid set) for anything unknown."""
+@pytest.mark.parametrize("bad", ["redis", "mongodb", "mongo", "nope", ""])
+def test_configure_rejects_unknown_and_removed_backends(bad):
+    """No backend other than sqlite/pg exists: the removed redis/mongodb names
+    raise a ValueError naming the bad value and the valid set — never a quiet
+    substitution — and the live config is left untouched."""
     import queue_workflows
-    from queue_workflows.backends import (
-        canonical_backend_name,
-        is_known_backend,
-        known_backends,
-    )
     from queue_workflows.config import get_config
 
-    # Aliases collapse to the three canonical providers.
-    assert canonical_backend_name("postgres") == "pg"
-    assert canonical_backend_name("postgresql") == "pg"
-    assert canonical_backend_name("PG") == "pg"            # case-insensitive
-    assert canonical_backend_name("  pg  ") == "pg"        # whitespace-trimmed
-    assert canonical_backend_name("mongo") == "mongodb"
-    assert canonical_backend_name("redis") == "redis"
-
-    # The canonical set is exactly the three providers.
-    assert known_backends() == frozenset({"pg", "redis", "mongodb"})
-    assert is_known_backend("mongo") is True              # an alias still "known"
-    assert is_known_backend("sqlite") is False
-
-    # The fail-fast raise names the bad value AND points at the valid names.
+    before = get_config().db_backend
     with pytest.raises(ValueError) as ei:
-        canonical_backend_name("sqlite")
+        queue_workflows.configure(db_backend=bad)
     msg = str(ei.value)
-    assert "sqlite" in msg and "pg" in msg
+    assert repr(bad) in msg and "pg" in msg and "sqlite" in msg
+    assert get_config().db_backend == before
 
-    # Drive the REAL gate: configure() rejects an unknown backend up front …
+
+def test_configure_folds_backend_aliases():
+    """Aliases collapse to the canonical names, case/whitespace-insensitively."""
+    import queue_workflows
+    from queue_workflows.config import get_config
+
+    before = get_config().db_backend
+    try:
+        for spelling, canon in [("postgres", "pg"), ("postgresql", "pg"),
+                                ("PG", "pg"), ("  pg  ", "pg"),
+                                ("sqlite", "sqlite"), ("SQLite", "sqlite")]:
+            queue_workflows.configure(db_backend=spelling)
+            assert get_config().db_backend == canon, spelling
+    finally:
+        # Restore before conftest's teardown truncates through the live store.
+        queue_workflows.configure(db_backend=before)
+
+
+def test_hw_watch_db_backend_flag_uses_the_same_gate():
+    """The ``--db-backend`` flag of the one console script that has it routes
+    through configure()'s validator: a removed backend raises before any DB
+    work."""
+    from queue_workflows import hw_watch
+
     with pytest.raises(ValueError):
-        queue_workflows.configure(db_backend="nope")
-    # … and stores the canonical form for a forgiving alias (conftest resets cfg).
-    queue_workflows.configure(db_backend="postgres")
-    assert get_config().db_backend == "pg"
+        hw_watch.main(["--db-backend", "redis", "--once"])

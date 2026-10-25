@@ -1,7 +1,7 @@
 """END-TO-END proof of stop_policy="drain" — a REAL run_forever worker.
 
 The unit contracts (test_worker_control_watcher) pin the handler/boundary pieces;
-this proves the integrated behavior the operator asked for, against a live worker
+this proves the integrated behavior, against a live worker
 thread and the real DB:
 
   1. a job is IN FLIGHT when the operator parks the box with drain
@@ -84,7 +84,7 @@ def test_drain_end_to_end_keeps_inflight_blocks_new_claims_and_resumes(monkeypat
     # fast watcher/park polling so the test converges in seconds
     monkeypatch.setenv("QUEUE_WORKFLOWS_WORKER_CONTROL_POLL_S", "0.5")
     monkeypatch.delenv("QUEUE_WORKFLOWS_DISABLE_WORKER_CONTROL", raising=False)
-    monkeypatch.delenv("AI_LEADS_DISABLE_WORKER_CONTROL", raising=False)
+    monkeypatch.delenv("QUEUE_WORKFLOWS_DISABLE_WORKER_CONTROL", raising=False)
 
     queue_workflows.set_node_module_package("qwf_drain_nodes")
     started = threading.Event()   # the in-flight node signals it's executing

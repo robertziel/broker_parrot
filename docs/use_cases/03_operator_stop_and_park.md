@@ -15,9 +15,9 @@ queue-worker-control --queue gpu --off --host box-b     # CLI helper
 
 ```sql
 -- …or plain SQL from any app sharing the DB; the trigger wakes the worker.
-INSERT INTO worker_controls (host_label, queue, desired_state, stop_policy, requested_by)
-VALUES ('box-b', 'gpu', 'off', 'hard', 'ops')
-ON CONFLICT (host_label, queue) DO UPDATE
+INSERT INTO worker_controls (host_label, queue, project, desired_state, stop_policy, requested_by)
+VALUES ('box-b', 'gpu', '', 'off', 'hard', 'ops')            -- project '' = single tenant
+ON CONFLICT (host_label, queue, project) DO UPDATE
   SET desired_state = EXCLUDED.desired_state, updated_at = now();
 ```
 
@@ -34,8 +34,8 @@ safety poll) reacts immediately.
    the worker's main thread, so process exit is the only thing that reliably
    stops a wedged CUDA kernel and *actually frees the VRAM*.
 3. The supervisor (systemd/docker) restarts the worker; on boot it re-reads
-   `worker_controls`, sees OFF, and **parks** — up and heartbeating, claiming
-   nothing — until you flip it back:
+   `worker_controls`, sees OFF, and **parks** — process up, claiming nothing
+   and not heartbeating (so it ages out of capacity) — until you flip it back:
 
 ```bash
 queue-worker-control --queue gpu --on --host box-b      # resumes in place
@@ -46,9 +46,9 @@ queue-worker-control --queue gpu --on --host box-b      # resumes in place
 - **Desired vs observed** are deliberately separate tables: `worker_controls`
   is what you *want*; `worker_heartbeats` is what *is*. An OFF must persist
   precisely while the worker isn't beating.
-- `stop_policy` is free-form TEXT with a registry (`STOP_POLICIES`) — only
-  `"hard"` exists today; `"drain"`/`"pause"` are reserved names that slot in
-  with no schema change.
+- `stop_policy` is free-form TEXT with a registry (`STOP_POLICIES`) — `"hard"`
+  (kill now) and `"drain"` (finish the in-flight job, then park) are
+  implemented; `"pause"` is a reserved name that slots in with no schema change.
 - A missing row = ON, and a pre-`0012` database is treated as all-ON — the
   control plane is strictly opt-in.
 - Scope: per `(host_label, queue)` — parking box-b's `gpu` worker leaves its

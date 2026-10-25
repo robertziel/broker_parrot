@@ -3,11 +3,11 @@
 -- WHY. Serving traffic dials ROLE tags (`chat-expert-a`) on purpose — they are stable across
 -- promotions, the claim SQL / warm-affinity / GPU lease all key on them, and re-pointing
 -- one is what a promotion IS. But that means `resolved_model` answers "which role" and
--- nothing anywhere answers "which BYTES": measured in a consumer deployment, `chat-expert-a`
--- resolved to a GGUF built from a void merge (the untuned base) for eight days, and every job row
--- truthfully said `chat-expert-a` the whole time. A name is an assertion nobody verifies.
+-- nothing anywhere answers "which BYTES": a role tag like `chat-expert-a` can resolve to a
+-- GGUF built from a bad merge (the untuned base) for days, while every job row
+-- truthfully says `chat-expert-a` the whole time. A name is an assertion nobody verifies.
 --
--- The artifact tag (`chat-expert-a-v6-q4km-ollama`) is the checkable name: immutable, one tag
+-- The artifact tag (`chat-expert-a-v2-q4km-ollama`) is the checkable name: immutable, one tag
 -- one set of bytes, `-<server>` suffix stating the serving stack. This migration gives the
 -- fleet the two columns needed to OBSERVE it rather than declare it:
 --

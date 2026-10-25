@@ -3,14 +3,14 @@
 -- Runs are the queue's substrate — workers claim from `workflow_runs` via
 -- `FOR UPDATE SKIP LOCKED` on (status='queued', priority, queued_at).
 --
--- ENGINE-OWNED + parcel-agnostic: the original ai_leads migration 001 also
+-- ENGINE-OWNED + parcel-agnostic: the original host-app migration 001 also
 -- created `parcels` and FK'd `workflow_runs.parcel_id` to it. The engine drops
--- that FK (plan §5b) — `parcel_id` is a plain nullable TEXT here so the queue
+-- that FK — `parcel_id` is a plain nullable TEXT here so the queue
 -- schema stands alone on a parcel-less DB. A host that wants the FK adds it in
 -- a domain migration that runs after both `parcels` and `workflow_runs` exist.
 --
--- Idempotent (plan §5b): every CREATE uses `IF NOT EXISTS` so re-running this
--- chain on an already-populated DB (the ai_leads cutover) is a no-op. The
+-- Idempotent: every CREATE uses `IF NOT EXISTS` so re-running this
+-- chain on an already-populated DB (a host-app cutover) is a no-op. The
 -- vestigial `current_step_idx` column (dropped by old migration 007) is
 -- omitted entirely — fresh engine DBs never had it.
 

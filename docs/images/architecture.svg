@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="404" viewBox="0 0 760 404" role="img" aria-labelledby="arch-title"><style>
+svg{--bg:#f6f4f3;--ink:#191416;--soft:#453e40;--faint:#6d6567;--accent:#7a2733;--tint:rgba(122,39,51,.1);--warn:#a06c14;--rule:#ded7d6;font-family:-apple-system,"Segoe UI",Helvetica,Arial,sans-serif}
+@media (prefers-color-scheme:dark){svg{--bg:#161b22;--ink:#e6edf3;--soft:#b6bfc9;--faint:#8b949e;--accent:#ff8a8a;--tint:rgba(255,138,138,.12);--warn:#e3b341;--rule:#3d444d}}
+.backdrop{fill:var(--bg)}.fill-strong{fill:var(--ink)}.fill-muted{fill:var(--soft)}.fill-dim{fill:var(--faint)}
+.fill-accent{fill:var(--accent)}.fill-amber{fill:var(--warn)}.fill-bg{fill:var(--bg)}.fill-accent-tint{fill:var(--tint)}
+.stroke-accent{stroke:var(--accent)}.stroke-amber{stroke:var(--warn)}.stroke-rule{stroke:var(--faint)}
+</style><rect class="backdrop" width="760" height="404" rx="8"/>
+  <title id="arch-title">Three processes around one database: producers insert and notify, consumers claim with SKIP LOCKED</title>
+  <defs>
+    <marker id="ah-mut" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#7e7060"/>
+    </marker>
+    <marker id="ah-acc" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#9b2f23"/>
+    </marker>
+    <marker id="ah-amb" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#b5871e"/>
+    </marker>
+  </defs>
+  <rect class="fill-accent-tint stroke-accent" x="34" y="160" width="692" height="104" rx="6" stroke-width="1.5"/>
+  <text class="fill-accent" x="50" y="182" font-size="12" font-weight="600">SQLite or Postgres — the database is the message bus</text>
+  <g font-size="10.5">
+    <rect class="fill-bg stroke-rule" x="50" y="198" width="152" height="50" rx="4"/>
+    <text class="fill-strong" x="126" y="219" text-anchor="middle" font-weight="600">workflow_node_jobs</text>
+    <text class="fill-dim" x="126" y="235" text-anchor="middle">cpu · gpu (DAG)</text>
+    <rect class="fill-bg stroke-rule" x="214" y="198" width="124" height="50" rx="4"/>
+    <text class="fill-strong" x="276" y="219" text-anchor="middle" font-weight="600">ingest_jobs</text>
+    <text class="fill-dim" x="276" y="235" text-anchor="middle">host queues</text>
+    <rect class="fill-bg stroke-rule" x="350" y="198" width="186" height="50" rx="4"/>
+    <text class="fill-strong" x="443" y="219" text-anchor="middle" font-weight="600">workflow_dispatch_events</text>
+    <text class="fill-dim" x="443" y="235" text-anchor="middle">durable outbox</text>
+    <rect class="fill-bg stroke-rule" x="548" y="198" width="162" height="50" rx="4"/>
+    <text class="fill-strong" x="629" y="219" text-anchor="middle" font-weight="600">worker_heartbeats</text>
+    <text class="fill-dim" x="629" y="235" text-anchor="middle">+ worker_controls</text>
+  </g>
+  <rect class="fill-bg stroke-rule" x="96" y="40" width="224" height="74" rx="6"/>
+  <text class="fill-strong" x="208" y="66" text-anchor="middle" font-size="12.5" font-weight="600">Orchestrator</text>
+  <text class="fill-muted" x="208" y="84" text-anchor="middle" font-size="10">migrations · dispatch · outbox drain</text>
+  <text class="fill-muted" x="208" y="100" text-anchor="middle" font-size="10">lease reclaim · dead-worker sweep</text>
+  <rect class="fill-bg stroke-rule" x="440" y="40" width="224" height="74" rx="6"/>
+  <text class="fill-strong" x="552" y="66" text-anchor="middle" font-size="12.5" font-weight="600">Scheduler</text>
+  <text class="fill-muted" x="552" y="84" text-anchor="middle" font-size="10">DB-native ticker</text>
+  <text class="fill-muted" x="552" y="100" text-anchor="middle" font-size="10">enqueues ingest_jobs</text>
+  <rect class="fill-bg stroke-rule" x="96" y="318" width="224" height="64" rx="6"/>
+  <text class="fill-strong" x="208" y="344" text-anchor="middle" font-size="12.5" font-weight="600">Claim worker — cpu / gpu</text>
+  <text class="fill-muted" x="208" y="362" text-anchor="middle" font-size="10">1 process · 1 job · warm model</text>
+  <rect class="fill-bg stroke-rule" x="440" y="318" width="224" height="64" rx="6"/>
+  <text class="fill-strong" x="552" y="344" text-anchor="middle" font-size="12.5" font-weight="600">Ingest worker(s)</text>
+  <text class="fill-muted" x="552" y="362" text-anchor="middle" font-size="10">host-defined queues</text>
+  <line class="stroke-accent" x1="208" y1="114" x2="208" y2="158" stroke-width="1.5" marker-end="url(#ah-acc)"/>
+  <text class="fill-accent" x="216" y="140" font-size="9.5">INSERT + NOTIFY</text>
+  <line class="stroke-accent" x1="552" y1="114" x2="552" y2="158" stroke-width="1.5" marker-end="url(#ah-acc)"/>
+  <text class="fill-accent" x="560" y="140" font-size="9.5">INSERT + NOTIFY</text>
+  <line class="stroke-rule" x1="168" y1="266" x2="168" y2="316" stroke-width="1.3" marker-end="url(#ah-mut)"/>
+  <text class="fill-dim" x="120" y="294" font-size="9.5">NOTIFY wakes</text>
+  <line class="stroke-rule" x1="252" y1="316" x2="252" y2="266" stroke-width="1.3" marker-end="url(#ah-mut)"/>
+  <text class="fill-dim" x="260" y="294" font-size="9.5">claim · lease · outbox</text>
+  <line class="stroke-rule" x1="512" y1="266" x2="512" y2="316" stroke-width="1.3" marker-end="url(#ah-mut)"/>
+  <text class="fill-dim" x="464" y="294" font-size="9.5">NOTIFY wakes</text>
+  <line class="stroke-rule" x1="596" y1="316" x2="596" y2="266" stroke-width="1.3" marker-end="url(#ah-mut)"/>
+  <text class="fill-dim" x="604" y="294" font-size="9.5">claim · heartbeat</text>
+  <path class="stroke-amber" d="M443,198 C443,150 360,140 320,96" fill="none" stroke-width="1.4" marker-end="url(#ah-amb)"/>
+  <text class="fill-amber" x="334" y="150" font-size="9.5">drain outbox → fan out · reclaim</text>
+</svg>

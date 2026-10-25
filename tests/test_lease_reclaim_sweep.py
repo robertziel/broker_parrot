@@ -290,7 +290,7 @@ def test_reclaim_all_requeues_dead_workers_running_row():
 
 
 def test_reclaim_all_leaves_live_workers_running_row():
-    """Regression — "box-a2 stopped taking GPU tasks". A running row whose
+    """Regression — "box-a stopped taking GPU tasks". A running row whose
     claiming worker is STILL ALIVE (fresh heartbeat on the job's queue) must NOT
     be reclaimed on orchestrator boot: re-queuing it clears ``claimed_by`` and
     trips the live worker's JobStatusWatcher into a hard-exit. The orchestrator/
@@ -355,7 +355,7 @@ def test_reclaim_all_noop_when_nothing_running():
 
 def _cancel_run(run_id: str) -> None:
     """Flip ``workflow_runs.status`` to ``cancelled`` — same effect as
-    the Rails ``WorkflowsController#cancel`` endpoint, just the
+    a host app's cancel endpoint, just the
     state-transition step (the cascade is what we're testing isn't
     needed for the lease-reclaim path)."""
     with connection() as conn, conn.cursor() as cur:
@@ -374,11 +374,9 @@ def test_lease_reclaim_cancels_running_row_on_cancelled_parent():
     forever. The fix: when the parent run is in a terminal state, the
     sweep marks the row ``cancelled`` instead of re-queueing.
 
-    Reproduction: run ``41570ecd-566e-4281-8b12-4e925fceebd1`` —
-    ``reconstruct/render_hunyuan_i2v`` sat ``queued`` for 20+ minutes
-    after the run was cancelled. The orphan was discovered by the
-    operator in the queue popover and reported as
-    "I cancelled this run but it's still in the GPU queue."
+    The symptom: a gpu node of a cancelled run sat ``queued`` long after
+    the run was cancelled, visible in a queue UI as a cancelled run that is
+    still in the GPU queue.
     """
     run_id = _make_run()
     job_id = node_queue.enqueue_node_job(

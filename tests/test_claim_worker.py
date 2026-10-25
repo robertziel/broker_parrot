@@ -169,7 +169,7 @@ def _wedged_stall_watchdog(job_id, *, on_exit, stall_timeout_s=0.05,
 
 def test_stall_watchdog_trips_after_first_beat_then_silence_requeues_under_cap():
     """A no-progress trip below the retry cap RE-QUEUES the node for a retry on a
-    fresh worker (the user's reconstruct/beat_keyframes case): running→queued,
+    fresh worker (a node that beats, then goes silent): running→queued,
     lease cleared, priority bumped, watchdog_retries++, NO failed event — then
     hard-exits (code 76). The RUN stays alive. (Old behaviour was mark-failed.)
 
@@ -215,8 +215,8 @@ def test_stall_watchdog_trips_after_first_beat_then_silence_requeues_under_cap()
 # fires, the watchdog confirms with the same gpu_health samplers + "GPU idle AND
 # RAM static" rule the GpuHealthWatchdog uses. A loading/preparing/slow-but-
 # working node (busy GPU OR moving RAM) is NEVER killed; only a genuinely idle +
-# static (doing-nothing) worker trips. This fixes the user's false positive:
-# "should not kill if the GPU model is being loaded or preparing to start".
+# static (doing-nothing) worker trips. This fixes a false positive: a worker must
+# not be killed while its GPU model is being loaded or preparing to start.
 
 
 def test_stall_no_beat_but_gpu_busy_does_not_trip():
@@ -358,7 +358,7 @@ def test_stall_recovers_to_running_when_gpu_resumes_after_a_suspected_stall():
 # ── Part C — a hard-exiting worker must NOT leave a "busy" current_model ghost ─
 # os._exit skips _run_node's finally (mark_idle + the heartbeat never run), so the
 # dead worker's worker_heartbeats row keeps advertising current_model and inflates
-# the "N/M GPU busy" gauge (the user's "3/2 GPU busy" after a kill). The trip path
+# the "N/M GPU busy" gauge (a "3/2 GPU busy" reading after a kill). The trip path
 # (_requeue_job_and_exit / _fail_job_and_exit) clears current_model + ages
 # last_seen out of the gauge window BEFORE the hard-exit.
 
@@ -522,7 +522,7 @@ def test_stall_watchdog_does_not_trip_when_stopped_before_timeout():
 
 # ── watchdog re-queue-with-cap policy ────────────────────────────────────────
 # A watchdog trip RE-QUEUES the node for a retry on a fresh worker (run stays
-# alive) while watchdog_retries < AI_LEADS_WATCHDOG_MAX_RETRIES (default 3); once
+# alive) while watchdog_retries < QUEUE_WORKFLOWS_WATCHDOG_MAX_RETRIES (default 3); once
 # the counter has reached the cap it FALLS BACK to the old mark-failed path (+ a
 # failed dispatch event → the run fails) so a persistently-wedging node doesn't
 # loop forever.
@@ -625,10 +625,10 @@ def test_watchdog_cap_boundary_last_retry_requeues_then_next_fails():
 
 
 def test_watchdog_max_retries_env_override(monkeypatch):
-    """AI_LEADS_WATCHDOG_MAX_RETRIES overrides the cap, read at trip-time. With
+    """QUEUE_WORKFLOWS_WATCHDOG_MAX_RETRIES overrides the cap, read at trip-time. With
     the cap set to 1, a job already at retries=1 FAILS instead of re-queuing —
     even though the module default (3) would have re-queued."""
-    monkeypatch.setenv("AI_LEADS_WATCHDOG_MAX_RETRIES", "1")
+    monkeypatch.setenv("QUEUE_WORKFLOWS_WATCHDOG_MAX_RETRIES", "1")
     assert claim_worker._watchdog_max_retries() == 1
     run_id, job_id = _running_gpu_job_with_retries(1)  # == overridden cap
     exits: list[int] = []
@@ -646,11 +646,11 @@ def test_watchdog_max_retries_default_and_env_parse(monkeypatch):
     """The cap default is 3; the accessor reads the env override / falls back on
     junk (never crashes a worker on a bad env)."""
     assert claim_worker.WATCHDOG_MAX_RETRIES == 3
-    monkeypatch.delenv("AI_LEADS_WATCHDOG_MAX_RETRIES", raising=False)
+    monkeypatch.delenv("QUEUE_WORKFLOWS_WATCHDOG_MAX_RETRIES", raising=False)
     assert claim_worker._watchdog_max_retries() == 3
-    monkeypatch.setenv("AI_LEADS_WATCHDOG_MAX_RETRIES", "5")
+    monkeypatch.setenv("QUEUE_WORKFLOWS_WATCHDOG_MAX_RETRIES", "5")
     assert claim_worker._watchdog_max_retries() == 5
-    monkeypatch.setenv("AI_LEADS_WATCHDOG_MAX_RETRIES", "junk")
+    monkeypatch.setenv("QUEUE_WORKFLOWS_WATCHDOG_MAX_RETRIES", "junk")
     assert claim_worker._watchdog_max_retries() == 3
 
 
@@ -945,7 +945,7 @@ def test_stall_watchdog_not_armed_for_video_models(monkeypatch):
     HEALTH-driven GpuHealthWatchdog (video is the whole point of the health
     guard). So a video render gets a CALLABLE status_callback that fans out to
     the health watchdog ONLY — no StallWatchdog is constructed. Regression
-    guard: a live fence_render_narrative video render was hard-stopped at 120 s
+    guard: a live video render was hard-stopped at 120 s
     by an over-eager StallWatchdog arm."""
     run_id = _make_run()
     seen: dict = {}
@@ -1000,7 +1000,7 @@ def test_stall_watchdog_not_armed_for_video_models(monkeypatch):
 
 def test_gpu_job_gets_health_watchdog_and_no_wallclock_watchdog(monkeypatch):
     """Wiring: a GPU job is policed by the HEALTH-driven GpuHealthWatchdog and
-    gets NO wall-clock Watchdog (no fixed time cap — the user's spec). A CPU job
+    gets NO wall-clock Watchdog (no fixed time cap, by design). A CPU job
     is the inverse: a wall-clock Watchdog, no health watchdog."""
     constructed: list[str] = []
     real_wd = claim_worker.Watchdog
@@ -1381,34 +1381,34 @@ def test_gpu_health_threshold_defaults_are_documented():
 
 
 def test_gpu_health_load_grace_default_when_unset(monkeypatch):
-    """The load-grace window is env-overridable via AI_LEADS_GPU_HEALTH_LOAD_GRACE_S
+    """The load-grace window is env-overridable via QUEUE_WORKFLOWS_GPU_HEALTH_LOAD_GRACE_S
     through the same _env_float helper; unset/junk → 1200 s, set → override."""
-    monkeypatch.delenv("AI_LEADS_GPU_HEALTH_LOAD_GRACE_S", raising=False)
-    assert claim_worker._env_float("AI_LEADS_GPU_HEALTH_LOAD_GRACE_S", 1200.0) == 1200.0
-    monkeypatch.setenv("AI_LEADS_GPU_HEALTH_LOAD_GRACE_S", "600")
-    assert claim_worker._env_float("AI_LEADS_GPU_HEALTH_LOAD_GRACE_S", 1200.0) == 600.0
-    monkeypatch.setenv("AI_LEADS_GPU_HEALTH_LOAD_GRACE_S", "junk")
-    assert claim_worker._env_float("AI_LEADS_GPU_HEALTH_LOAD_GRACE_S", 1200.0) == 1200.0
+    monkeypatch.delenv("QUEUE_WORKFLOWS_GPU_HEALTH_LOAD_GRACE_S", raising=False)
+    assert claim_worker._env_float("QUEUE_WORKFLOWS_GPU_HEALTH_LOAD_GRACE_S", 1200.0) == 1200.0
+    monkeypatch.setenv("QUEUE_WORKFLOWS_GPU_HEALTH_LOAD_GRACE_S", "600")
+    assert claim_worker._env_float("QUEUE_WORKFLOWS_GPU_HEALTH_LOAD_GRACE_S", 1200.0) == 600.0
+    monkeypatch.setenv("QUEUE_WORKFLOWS_GPU_HEALTH_LOAD_GRACE_S", "junk")
+    assert claim_worker._env_float("QUEUE_WORKFLOWS_GPU_HEALTH_LOAD_GRACE_S", 1200.0) == 1200.0
 
 
 def test_gpu_health_env_parsers_override_and_fall_back(monkeypatch):
     """The env-parsing helpers read the override when set + valid, fall back to
     the default when unset or junk — so every threshold is env-overridable."""
     # unset → default
-    monkeypatch.delenv("AI_LEADS_GPU_IDLE_PCT", raising=False)
-    assert claim_worker._env_int("AI_LEADS_GPU_IDLE_PCT", 5) == 5
-    monkeypatch.delenv("AI_LEADS_GPU_HEALTH_INTERVAL_S", raising=False)
-    assert claim_worker._env_float("AI_LEADS_GPU_HEALTH_INTERVAL_S", 300.0) == 300.0
+    monkeypatch.delenv("QUEUE_WORKFLOWS_GPU_IDLE_PCT", raising=False)
+    assert claim_worker._env_int("QUEUE_WORKFLOWS_GPU_IDLE_PCT", 5) == 5
+    monkeypatch.delenv("QUEUE_WORKFLOWS_GPU_HEALTH_INTERVAL_S", raising=False)
+    assert claim_worker._env_float("QUEUE_WORKFLOWS_GPU_HEALTH_INTERVAL_S", 300.0) == 300.0
     # set + valid → override
-    monkeypatch.setenv("AI_LEADS_GPU_IDLE_PCT", "9")
-    assert claim_worker._env_int("AI_LEADS_GPU_IDLE_PCT", 5) == 9
-    monkeypatch.setenv("AI_LEADS_GPU_HEALTH_INTERVAL_S", "42.5")
-    assert claim_worker._env_float("AI_LEADS_GPU_HEALTH_INTERVAL_S", 300.0) == 42.5
-    monkeypatch.setenv("AI_LEADS_GPU_HEALTH_RAM_DELTA_MB", "1024")
-    assert claim_worker._env_int("AI_LEADS_GPU_HEALTH_RAM_DELTA_MB", 5120) == 1024
+    monkeypatch.setenv("QUEUE_WORKFLOWS_GPU_IDLE_PCT", "9")
+    assert claim_worker._env_int("QUEUE_WORKFLOWS_GPU_IDLE_PCT", 5) == 9
+    monkeypatch.setenv("QUEUE_WORKFLOWS_GPU_HEALTH_INTERVAL_S", "42.5")
+    assert claim_worker._env_float("QUEUE_WORKFLOWS_GPU_HEALTH_INTERVAL_S", 300.0) == 42.5
+    monkeypatch.setenv("QUEUE_WORKFLOWS_GPU_HEALTH_RAM_DELTA_MB", "1024")
+    assert claim_worker._env_int("QUEUE_WORKFLOWS_GPU_HEALTH_RAM_DELTA_MB", 5120) == 1024
     # set + junk → default (never crash a worker on a bad env)
-    monkeypatch.setenv("AI_LEADS_GPU_IDLE_PCT", "not-a-number")
-    assert claim_worker._env_int("AI_LEADS_GPU_IDLE_PCT", 5) == 5
+    monkeypatch.setenv("QUEUE_WORKFLOWS_GPU_IDLE_PCT", "not-a-number")
+    assert claim_worker._env_int("QUEUE_WORKFLOWS_GPU_IDLE_PCT", 5) == 5
 
 
 # ── ingest (fetch/load) claim + execute ──────────────────────────────────────
@@ -1454,7 +1454,7 @@ def test_budget_for_fetch_and_load():
     assert claim_worker.budget_for({"queue": "load"}) == claim_worker.LOAD_BUDGET_S
 
 
-# ── host-configurable ingest queue names (G1) ────────────────────────────────
+# ── host-configurable ingest queue names ────────────────────────────────
 
 
 def test_claim_worker_accepts_host_configured_ingest_queue():
@@ -1541,7 +1541,8 @@ def test_run_once_gpu_passes_current_model_for_affinity(monkeypatch):
 
 def test_await_schema_waits_for_required_version(monkeypatch):
     """``await_schema`` delegates to ``db.wait_for_schema(min_version)`` with the
-    queue's required engine version (cpu/gpu → 6, ingest queues → 8)."""
+    queue's required engine version (cpu → 6, gpu → 28 since its claim filters on the
+    0028 window columns, ingest queues → 8)."""
     from queue_workflows import db
 
     seen: dict = {}
@@ -1555,7 +1556,7 @@ def test_await_schema_waits_for_required_version(monkeypatch):
     claim_worker.ClaimWorker(queue="cpu", host="h").await_schema()
     assert seen["min_version"] == 6
     claim_worker.ClaimWorker(queue="gpu", host="h").await_schema()
-    assert seen["min_version"] == 6
+    assert seen["min_version"] == 29
     claim_worker.ClaimWorker(queue="fetch", host="h").await_schema()
     assert seen["min_version"] == 8
     claim_worker.ClaimWorker(queue="load", host="h").await_schema()
@@ -1725,7 +1726,7 @@ def _wipe_heartbeats():
 
 @pytest.fixture
 def _heartbeat_enabled(monkeypatch):
-    monkeypatch.delenv("AI_LEADS_DISABLE_WORKER_HEARTBEAT", raising=False)
+    monkeypatch.delenv("QUEUE_WORKFLOWS_DISABLE_WORKER_HEARTBEAT", raising=False)
 
 
 def test_heartbeat_emit_once_upserts_cpu_row(_heartbeat_enabled):
@@ -1772,7 +1773,7 @@ def test_heartbeat_emits_for_ingest_queues(queue, _heartbeat_enabled):
 
 
 def test_heartbeat_disabled_by_env(monkeypatch):
-    monkeypatch.setenv("AI_LEADS_DISABLE_WORKER_HEARTBEAT", "1")
+    monkeypatch.setenv("QUEUE_WORKFLOWS_DISABLE_WORKER_HEARTBEAT", "1")
     emitter = claim_worker.HeartbeatEmitter(queue="cpu", host_label="host-c")
     assert emitter._enabled is False
     emitter.start()

@@ -7,7 +7,7 @@ LLM-request activity and, after an idle window, SIGTERMs the vllm sidecar
 ollama the supervisor is INERT — its daemon self-manages idle.
 
 These tests mirror ``test_gpu_idle_unload.py``: the supervisor *thread* is
-disabled under tests (conftest sets ``AI_LEADS_DISABLE_LLM_SUPERVISOR``), so we
+disabled under tests (conftest sets ``QUEUE_WORKFLOWS_DISABLE_LLM_SUPERVISOR``), so we
 drive the logic directly via the pure decision helper ``vllm_should_stop`` and a
 single ``reap_idle_once`` tick on an :class:`LLMSupervisor` wrapping an in-file
 ``_FakeBackend``. The supervisor is generic over any backend exposing the
@@ -75,10 +75,10 @@ class _FakeBackend:
 
 @pytest.fixture(autouse=True)
 def _enable_supervisor(monkeypatch):
-    """conftest sets AI_LEADS_DISABLE_LLM_SUPERVISOR=1 for the whole session;
+    """conftest sets QUEUE_WORKFLOWS_DISABLE_LLM_SUPERVISOR=1 for the whole session;
     clear it by default here so ``_enabled`` reflects the backend, not the global
     test gate. The one env-gate test re-sets it explicitly."""
-    monkeypatch.delenv("AI_LEADS_DISABLE_LLM_SUPERVISOR", raising=False)
+    monkeypatch.delenv("QUEUE_WORKFLOWS_DISABLE_LLM_SUPERVISOR", raising=False)
     yield
 
 
@@ -166,7 +166,7 @@ def test_enabled_true_for_vllm_with_positive_ttl():
 def test_disabled_via_env(monkeypatch):
     """The session-wide test gate (or an ops kill-switch): supervisor stays inert
     and start() spawns no thread."""
-    monkeypatch.setenv("AI_LEADS_DISABLE_LLM_SUPERVISOR", "1")
+    monkeypatch.setenv("QUEUE_WORKFLOWS_DISABLE_LLM_SUPERVISOR", "1")
     backend = _FakeBackend(server_type="vllm", idle_ttl_s=60.0)
     sup = LLMSupervisor(backend=backend)
     assert sup._enabled is False

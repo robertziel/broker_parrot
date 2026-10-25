@@ -92,27 +92,27 @@ def _status(job_id: str) -> str:
 def test_default_is_one_thread(monkeypatch):
     """Unset everywhere ⇒ 1. The serial worker is still the default."""
     monkeypatch.delenv("QUEUE_WORKFLOWS_CPU_WORKER_THREADS", raising=False)
-    monkeypatch.delenv("AI_LEADS_CPU_WORKER_THREADS", raising=False)
+    monkeypatch.delenv("QUEUE_WORKFLOWS_CPU_WORKER_THREADS", raising=False)
     assert claim_worker.resolve_cpu_worker_threads() == 1
     assert config.get_config().cpu_worker_threads == 1
 
 
 def test_configure_sets_the_thread_count(monkeypatch):
     monkeypatch.delenv("QUEUE_WORKFLOWS_CPU_WORKER_THREADS", raising=False)
-    monkeypatch.delenv("AI_LEADS_CPU_WORKER_THREADS", raising=False)
+    monkeypatch.delenv("QUEUE_WORKFLOWS_CPU_WORKER_THREADS", raising=False)
     queue_workflows.configure(cpu_worker_threads=6)
     assert claim_worker.resolve_cpu_worker_threads() == 6
 
 
-def test_env_beats_configure_and_takes_the_legacy_spelling(monkeypatch):
+def test_env_beats_configure(monkeypatch):
     """The operator override wins over the host's ``configure()`` — same order as
-    every other tunable — and the legacy ``AI_LEADS_*`` spelling comes free."""
+    every other tunable."""
     queue_workflows.configure(cpu_worker_threads=6)
     monkeypatch.setenv("QUEUE_WORKFLOWS_CPU_WORKER_THREADS", "4")
     assert claim_worker.resolve_cpu_worker_threads() == 4
 
     monkeypatch.delenv("QUEUE_WORKFLOWS_CPU_WORKER_THREADS")
-    monkeypatch.setenv("AI_LEADS_CPU_WORKER_THREADS", "3")
+    monkeypatch.setenv("QUEUE_WORKFLOWS_CPU_WORKER_THREADS", "3")
     assert claim_worker.resolve_cpu_worker_threads() == 3
 
 
@@ -120,7 +120,7 @@ def test_env_beats_configure_and_takes_the_legacy_spelling(monkeypatch):
 def test_bad_values_never_produce_a_zero_width_lane(monkeypatch, raw):
     """A malformed or sub-1 value floors at 1 — a worker that claims nothing is
     strictly worse than the default."""
-    monkeypatch.delenv("AI_LEADS_CPU_WORKER_THREADS", raising=False)
+    monkeypatch.delenv("QUEUE_WORKFLOWS_CPU_WORKER_THREADS", raising=False)
     monkeypatch.setenv("QUEUE_WORKFLOWS_CPU_WORKER_THREADS", raw)
     assert claim_worker.resolve_cpu_worker_threads() >= 1
 

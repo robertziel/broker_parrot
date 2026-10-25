@@ -7,8 +7,8 @@ table, so the autouse truncate list is trimmed to the engine tables.
 DB selection:
   * ``QUEUE_WORKFLOWS_TEST_DB_URL`` if set (preferred — points straight at a
     ``queue_workflows_test`` DB), else
-  * ``AI_LEADS_DB_URL`` with its db-name suffixed ``_test`` (so a checkout that
-    already has the ai_leads env reaches a sibling ``<db>_test`` DB).
+  * ``QUEUE_WORKFLOWS_DB_URL`` with its db-name suffixed ``_test`` (so a checkout that
+    already has a host env reaches a sibling ``<db>_test`` DB).
 
 The engine is configured here (``queue_workflows.configure(db_url_env=...)``)
 so ``db.db_url()`` reads the test DSN. A tiny fake node module + fake ModelSpec
@@ -24,12 +24,12 @@ from typing import Iterator
 import pytest
 
 # Disable side-effect threads the engine would otherwise spin up under tests
-# (mirrors ai_leads' conftest env gates — same env names, byte-compat).
-os.environ.setdefault("AI_LEADS_DISABLE_HW_METRICS", "1")
-os.environ.setdefault("AI_LEADS_DISABLE_WORKER_HEARTBEAT", "1")
-os.environ.setdefault("AI_LEADS_DISABLE_GPU_IDLE_REAPER", "1")
-os.environ.setdefault("AI_LEADS_DISABLE_LLM_SUPERVISOR", "1")
-os.environ.setdefault("AI_LEADS_DISABLE_LLM_CONFIG_LISTENER", "1")
+# (the engine's ``*_DISABLE_*`` env gates).
+os.environ.setdefault("QUEUE_WORKFLOWS_DISABLE_HW_METRICS", "1")
+os.environ.setdefault("QUEUE_WORKFLOWS_DISABLE_WORKER_HEARTBEAT", "1")
+os.environ.setdefault("QUEUE_WORKFLOWS_DISABLE_GPU_IDLE_REAPER", "1")
+os.environ.setdefault("QUEUE_WORKFLOWS_DISABLE_LLM_SUPERVISOR", "1")
+os.environ.setdefault("QUEUE_WORKFLOWS_DISABLE_LLM_CONFIG_LISTENER", "1")
 
 # The env var the engine reads its DSN from, for THIS test session.
 _TEST_DB_ENV = "QUEUE_WORKFLOWS_TEST_DB_URL"
@@ -37,15 +37,15 @@ _TEST_DB_ENV = "QUEUE_WORKFLOWS_TEST_DB_URL"
 
 def _resolve_test_db_url() -> str:
     """Resolve the test DSN: ``QUEUE_WORKFLOWS_TEST_DB_URL`` verbatim, else
-    ``AI_LEADS_DB_URL`` with a ``_test`` suffix on the db name. Skip the whole
+    ``QUEUE_WORKFLOWS_DB_URL`` with a ``_test`` suffix on the db name. Skip the whole
     suite if neither is set (Postgres is required)."""
     raw = os.environ.get(_TEST_DB_ENV)
     if raw:
         return raw
-    base = os.environ.get("AI_LEADS_DB_URL")
+    base = os.environ.get("QUEUE_WORKFLOWS_DB_URL")
     if not base:
         pytest.skip(
-            f"set {_TEST_DB_ENV} (or AI_LEADS_DB_URL) to a Postgres DSN; "
+            f"set {_TEST_DB_ENV} (or QUEUE_WORKFLOWS_DB_URL) to a Postgres DSN; "
             "engine tests need Postgres"
         )
     parsed = urllib.parse.urlparse(base)
@@ -96,6 +96,9 @@ _ENGINE_TABLES = (
     "worker_controls",
     "ingest_jobs",
     "hw_watch_samples",
+    # 0026/0029: the model catalog is engine state too — a profile recorded by one test
+    # must not be the one the next test reads back.
+    "llm_model_catalog",
 )
 
 

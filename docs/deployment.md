@@ -2,7 +2,7 @@
 
 *Running the engine in production: which process runs which console script, the recommended one-container/N-process claim lane, migrations at boot, backend selection, a worked fleet-cutover checklist, and how to run the test suite.*
 
-See [architecture](architecture.md) for the process-role model this doc operationalizes, [schema](schema.md) for the migration chain, [storage_backends](storage_backends.md) for the `db_backend` seam, [configuration](configuration.md) for the full config-hook reference, [worker_control](worker_control.md) for the operator ON/OFF plane, [broker](broker.md) for the shared-broker/multitenant model, and [gpu_and_llm](gpu_and_llm.md) for GPU pool + LLM backend specifics.
+See [architecture](architecture.md) for the process-role model this doc operationalizes, [schema](schema.md) for the migration chain, [storage_backends](storage_backends.md) for the `db_backend` seam, [configuration](configuration.md) for the full config-hook reference, [worker_control](worker_control.md) for the operator ON/OFF plane, [broker](broker.md) for the shared-broker/multitenant model, and [gpu_and_llm](gpu_and_llm.md) for GPU model-cache + LLM backend specifics.
 
 ## 1. Process roles → console scripts
 
@@ -11,14 +11,13 @@ Every process role in [architecture](architecture.md) ships as a `pip`-installed
 | Script | Module | Role |
 |---|---|---|
 | `queue-orchestrator` | `queue_workflows.orchestrator:main` | Bootstraps migrations (`db.bootstrap`) then runs `NodePool` — dispatch loop, outbox drain, lease-reclaim sweeps, `InputListener`. **The only process that bootstraps.** |
-| `queue-claim-worker --queue=<name>` | `queue_workflows.claim_worker:main` | One worker process, concurrency-1 by default (`--threads N` widens the **cpu** lane — §2.5). `--queue` ∈ `{cpu, gpu}` (DAG node-jobs) ∪ `config.ingest_queues` (default `{fetch, load}`). |
+| `queue-claim-worker --queue=<name>` | `queue_workflows.claim_worker:main` | One worker process, concurrency-1 by default (`--threads N` widens the **cpu** lane — §2.5). `--queue` ∈ `{cpu, gpu, download}` (DAG node-jobs) ∪ `config.ingest_queues` (default `{fetch, load}`). |
 | `queue-scheduler` | `queue_workflows.scheduler:main` | PG-native ingest ticker — sleeps to the next scheduled minute, enqueues `ingest_jobs` rows. |
 | `queue-worker-control --queue=<name> --on\|--off` | `queue_workflows.worker_control:main` | Operator CLI for the ON/OFF control plane (migration 0012) — flips a `(host, queue)` `worker_controls` row; see [worker_control](worker_control.md). |
-| `queue-broker` | `queue_workflows.broker:main` | Stand up / inspect the **shared broker** DB (migration 0017 multitenant model) — bootstrap once, then `--status` to view every project's queue depth. See [broker](broker.md). |
-| `queue-broker-web` | `queue_workflows.broker_service.web:main` | v2 broker control-plane HTTP face: the worker/broker JSON API (`submit`/`ask`/`heartbeat`/`renew`/`finish`/`abort`/`revoke`) plus the read-only operator panel. |
-| `queue-broker-worker` | `queue_workflows.broker_service.worker:main` | v2 worker that runs *behind the broker's permission gate* — asks for grants instead of claiming rows itself, stops the instant the broker revokes. |
+| `queue-hw-watch` | `queue_workflows.hw_watch:main` | Standalone hardware flight recorder (migration 0021) — two-tier persisted GPU/thermal/memory samples; see [hw_watch](hw_watch.md). |
+| `queue-box-agent [--manifest PATH]` | `queue_workflows.box_agent:main` | Per-box supervisor — runs the box's lanes from a manifest and reconciles them to `worker_controls` (starts ON lanes, stops OFF ones, restarts crashed ones). |
 
-The first five scripts are the **v1 client model** (a project runs its own orchestrator/workers/scheduler against a DB it owns, optionally a shared one via `queue-broker`). `queue-broker-web` + `queue-broker-worker` are the **v2 broker service** (pull→grant over HTTP) — see [broker](broker.md) for when to reach for which model.
+A project runs its own orchestrator/workers/scheduler against a DB it owns, optionally a shared one — see [broker](broker.md).
 
 ## 2. Recommended default: one container, N claim PROCESSES per lane
 
@@ -77,7 +76,7 @@ They compose: M containers × P processes × N threads all claim independently t
 **Operational consequences of N > 1:**
 
 - **Connection pool (Postgres).** Each concurrent job wants its own claim/terminal txn plus a lease renewer and watchers — roughly 4–5 pooled connections under load. The pool cap defaults to 10 (`QUEUE_WORKFLOWS_DB_POOL_MAX`), so budget **≈ 4–5 × N** and raise the cap before raising the thread count, or jobs will block on pool checkout. Postgres' own `max_connections` is the fleet-wide ceiling. On the **sqlite** backend (the v1.0.0 default) there is no pool to size — `connection()` hands out one process-shared connection under a global lock held for the whole `with` block, so N threads serialise on every DB touch. That is fine for an IO-bound lane whose waiting happens outside the DB, and a reason not to reach for a large N there.
-- **Starving the heartbeat is the real failure mode, not slowness.** The heartbeat and every `LeaseRenewer` are ordinary threads competing with N job bodies for the GIL. This has already bitten once with wide cpu concurrency (`node_pool.py`): a worker's beat thread was starved past the 30 s staleness window while its jobs' leases kept renewing, and 23 live jobs were yanked mid-flight — which is why the dead-worker sweep is now flag-only. Widening the lane raises the blast radius of the same starvation: a starved beat draws a spurious `DEAD WORKER:` flag (which a host-supervisor is told to bounce on), and a starved renewer lets `NodePool` reclaim a *live* job, whose owner then self-exits on its `JobStatusWatcher` (77) and takes the other N−1 with it. Keep N modest, and prefer processes when the bodies hold the GIL.
+- **Starving the heartbeat is the real failure mode, not slowness.** The heartbeat and every `LeaseRenewer` are ordinary threads competing with N job bodies for the GIL. This is a known failure with wide cpu concurrency (`node_pool.py`): a worker's beat thread was starved past the 30 s staleness window while its jobs' leases kept renewing, and its live jobs were yanked mid-flight — which is why the dead-worker sweep is now flag-only. Widening the lane raises the blast radius of the same starvation: a starved beat draws a spurious `DEAD WORKER:` flag (which a host-supervisor is told to bounce on), and a starved renewer lets `NodePool` reclaim a *live* job, whose owner then self-exits on its `JobStatusWatcher` (77) and takes the other N−1 with it. Keep N modest, and prefer processes when the bodies hold the GIL.
 - **The wall-clock budget does not scale with N.** A cpu job is still policed by `Watchdog` against `budget_for(job)` (exit 75), and that budget is per-job wall clock. N GIL-contending threads stretch every job's wall clock while doing no more work, so raising the knob on CPU-bound nodes pushes them toward a trip whose blast radius is all N. Another reason the knob is for IO-bound work.
 - **A watchdog trip is still a process exit.** A Python thread cannot be killed, so a wedged body is only stopped by killing the process — which takes the N−1 healthy siblings with it. The trip therefore re-queues those siblings first (resume-style: front of the queue, **no** `watchdog_retries` bump — see [watchdogs](watchdogs.md)), so they redistribute immediately instead of waiting out their leases. This is the real cost of the thread lever: one bad job briefly costs N.
 
@@ -101,7 +100,7 @@ Three properties worth knowing:
 
 - **A serial worker ignores it completely.** At the default `threads=1` a job already owns the whole process, so any `cpu_slots` value runs there unchanged — no fleet impact until you widen a lane.
 - **A job wider than the lane is not excluded outright.** `cpu_slots=9` on a 3-wide lane can never "fit" arithmetically; the weight is clamped to the lane width, so it becomes claimable as soon as the lane is idle and then occupies the whole worker. (Excluding it instead would be invisible queue rot.)
-- **⚠ But a wide job CAN be starved by a stream of narrow ones — there is no aging and no reservation.** The fit test is a `WHERE` filter, so it silently overrides the claim's `ORDER BY`: while the lane stays busier than `threads − cpu_slots`, a wide job waits *regardless of `is_priority` or `priority`*. Measured on a saturated 4-wide lane, a `cpu_slots=3` job flagged `is_priority` **and** `priority=0` — the absolute head of the queue — was passed over while 66 lower-priority 1-slot jobs went ahead of it. On a lightly-loaded lane it gets in promptly; the point is that admission is a function of load, not of priority. **If a wide node's latency matters, give it its own lane** (a second container with its own `--threads`) rather than relying on priority to get it scheduled.
+- **⚠ But a wide job CAN be starved by a stream of narrow ones — there is no aging and no reservation.** The fit test is a `WHERE` filter, so it silently overrides the claim's `ORDER BY`: while the lane stays busier than `threads − cpu_slots`, a wide job waits *regardless of `is_priority` or `priority`*. On a saturated 4-wide lane, a `cpu_slots=3` job flagged `is_priority` **and** `priority=0` — the absolute head of the queue — was passed over while dozens of lower-priority 1-slot jobs went ahead of it. On a lightly-loaded lane it gets in promptly; the point is that admission is a function of load, not of priority. **If a wide node's latency matters, give it its own lane** (a second container with its own `--threads`) rather than relying on priority to get it scheduled.
 - **It reserves capacity, it does not hand you threads.** The engine sets the slots aside; the node body still creates its own pool. Size that pool to the `cpu_slots` you declared.
 - **cpu queue only.** The column is read solely by the cpu claim; setting `cpu_slots` on a `gpu` node stores the value and changes nothing (gpu has its own PAR budget).
 
@@ -115,7 +114,7 @@ The heartbeat advertises N automatically when the lane is widened, so the panel 
 
 Only the **orchestrator** calls `db.bootstrap()`. On Postgres it's concurrency-safe: it takes a `pg_advisory_xact_lock` keyed on the version table **before** even `CREATE TABLE IF NOT EXISTS`, so if many orchestrators (e.g. every project's orchestrator, all pointed at one shared broker) boot at once against the same DB, the lock serializes them — the winner applies the pending chain and commits, every waiter's post-lock read then sees the winner's work already done and applies nothing. On SQLite the advisory lock is a no-op; that's fine because SQLite is a single-machine deploy where, by convention, only the orchestrator ever calls `bootstrap()` — claim workers and the scheduler never do.
 
-Every other process — claim workers, the scheduler — calls `db.wait_for_schema(min_version)` instead of bootstrapping, and **blocks** (polling `current_schema_version`, default 120 s timeout) until the ledger reaches the version that queue depends on, rather than racing the orchestrator's migration run. `min_version` is per queue-family: DAG node-jobs (`cpu`/`gpu`) require schema ≥ 6 (`_NODE_REQUIRED_VERSION`); ingest queues require schema ≥ 8 (`_INGEST_REQUIRED_VERSION`, migration 0008's multi-tenant ingest). This means the current chain (0001‥0024 — see [schema](schema.md)) is far ahead of what a worker actually gates on: worker-control (0012) is read-optional and a pre-0012 DB is treated as all-ON, so a fleet doesn't need to be fully caught up to schema HEAD for workers to run — only orchestrators applying new migrations need to. **The exception is a WIDENED cpu lane**: `cpu_slots` (0024) is read by the claim itself, so a `--threads > 1` worker against a pre-0024 schema errors on every claim and silently claims nothing (the gate is still 6). Apply 0024 before widening a lane.
+Every other process — claim workers, the scheduler — calls `db.wait_for_schema(min_version)` instead of bootstrapping, and **blocks** (polling `current_schema_version`, default 120 s timeout) until the ledger reaches the version that queue depends on, rather than racing the orchestrator's migration run. `min_version` is per queue (`ClaimWorker._min_schema_version`): `cpu` ≥ 6 (`_NODE_REQUIRED_VERSION`); ingest queues ≥ 8 (`_INGEST_REQUIRED_VERSION`, migration 0008's multi-tenant ingest); `download` ≥ 25 (`_DOWNLOAD_REQUIRED_VERSION`, the 0025 queue-CHECK drop); `gpu` ≥ 29 (`_GPU_REQUIRED_VERSION`, the 0028/0029 columns its claim reads). This means the current chain (0001‥0030 — see [schema](schema.md)) is ahead of what a cpu or ingest worker actually gates on: worker-control (0012) is read-optional and a pre-0012 DB is treated as all-ON, so a fleet doesn't need to be fully caught up to schema HEAD for workers to run — only orchestrators applying new migrations need to. **The exception is a WIDENED cpu lane**: `cpu_slots` (0024) is read by the claim itself, so a `--threads > 1` worker against a pre-0024 schema errors on every claim and silently claims nothing (the gate is still 6). Apply 0024 before widening a lane.
 
 A host with its own domain tables runs a **second** chain against its own ledger, by calling `db.bootstrap(migrations_dir=..., version_table=...)` with its own directory and version-table name — "two ORMs / two chains, one Postgres." The engine never sees or touches the host's chain.
 
@@ -138,7 +137,7 @@ or via the env knob, which also reaches every standalone console script above (t
 export QUEUE_WORKFLOWS_DB_BACKEND=pg
 ```
 
-`queue-broker` and the v2 `queue-broker-web` / `queue-broker-worker` scripts additionally take `--db-backend` / `--db-url-env` flags that override the env for that invocation. `redis`/`mongodb` are also selectable (`configure(db_backend="redis"|"mongodb")`) but are an **additive** durable-queue SPI, not a relational engine backend — selecting one does not re-home the orchestrator/dispatcher (see [storage_backends](storage_backends.md) for exactly what does and doesn't move onto them).
+`queue-hw-watch` additionally takes a `--db-backend` flag that overrides the env for that invocation. `sqlite` and `pg` are the only backends; any other value fails at startup (see [storage_backends](storage_backends.md)).
 
 **The landmine to avoid on any cutover:** if you swap a shared engine checkout under multiple already-running projects without also flipping each one's `db_backend` to `pg` in the same change, every project that relied on the old `pg` default will read its Postgres DSN as a SQLite file path the instant the new engine goes live — total breakage, all at once, not a graceful one-project-at-a-time failure. Land the engine swap and the `db_backend="pg"` opt-in **together**. See §5 for the worked sequence.
 
@@ -164,8 +163,9 @@ Swapping the shared engine checkout in place makes every process that reads it d
      stage  <shared-mount>/queue_workflows_v1   (broker_parrot @ the target commit)
 
 1. Stand up the broker DB (idempotent — brings the ledger to schema HEAD):
-     QUEUE_WORKFLOWS_DB_BACKEND=pg BROKER_DSN=postgresql://…/broker \
-       queue-broker --db-backend pg --db-url-env BROKER_DSN
+     QUEUE_WORKFLOWS_DB_BACKEND=pg BROKER_DSN=postgresql://…/broker python -c \
+       "import queue_workflows as q; q.configure(db_url_env='BROKER_DSN'); \
+        from queue_workflows import db; db.bootstrap()"
 
 2. STOP all N fleets (orchestrators + claim workers + schedulers, every project).
 
@@ -187,11 +187,8 @@ Swapping the shared engine checkout in place makes every process that reads it d
 
 6. START all N fleets — now pointed at the broker.
 
-7. VERIFY:
-     queue-broker --db-backend pg --db-url-env BROKER_DSN --status
-   lists every project with a nonzero/expected cpu+gpu queue depth; the
-   operator panel (queue-broker-web, or a host's own panel) shows ONE
-   consolidated cpu/gpu queue, filterable by project.
+7. VERIFY: node_queue.list_projects() + node_queue.snapshot(project=p) against
+   the broker list every project with a nonzero/expected cpu+gpu queue depth.
 
 ROLLBACK: repoint the mount back to the old engine path + each project's
    *_DB_URL back to its own DB; restart. Old per-project DBs are untouched
@@ -210,7 +207,7 @@ Prefer doing this interactively, one gated step at a time, with each step's outc
 ## 6. Running the test suite
 
 ```bash
-pip install -e '.[test]'   # pytest, pytest-cov, redis>=5, pymongo>=4.4
+pip install -e '.[test]'   # pytest, pytest-cov, PyYAML
 ```
 
 The suite **requires a reachable Postgres** by default — it forces a `*_test`-suffixed database and creates it if missing (`tests/conftest.py`):
@@ -234,14 +231,3 @@ QUEUE_WORKFLOWS_TEST_SQLITE=1 python -m pytest
 ```
 
 Runs the whole suite against a throwaway SQLite file instead (`QUEUE_WORKFLOWS_TEST_SQLITE_PATH`, auto-created), calling `configure(db_backend="sqlite", ...)`. Pg-specific behavior (raw `LISTEN`/trigger `NOTIFY`, some DDL `ALTER` paths) is skipped in this mode — expect a small number of pre-existing skips, not failures.
-
-### Multi-backend contract suite
-
-`tests/test_backend_contract.py` runs the same parametrized contract (enqueue / claim-exactly-once / lease+reclaim / idempotent terminals / the atomic outbox / wake / heartbeat / ON-OFF control) against every `StorageBackend`. Each backend **skips** independently if its server env var is unset or unreachable:
-
-```bash
-QUEUE_WORKFLOWS_TEST_REDIS_URL=redis://localhost:6379/0        python -m pytest tests/test_backend_contract.py
-QUEUE_WORKFLOWS_TEST_MONGO_URL=mongodb://localhost:27017/?replicaSet=rs0  python -m pytest tests/test_backend_contract.py
-```
-
-Mongo needs a replica set (the backend uses multi-document transactions + a change stream — a standalone `mongod` will skip). See [storage_backends](storage_backends.md) for what each backend actually implements and the anti-leakage rule (no driver object — cursor/pipeline/session — crosses the `StorageBackend` port).

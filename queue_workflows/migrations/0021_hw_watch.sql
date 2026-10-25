@@ -2,7 +2,7 @@
 --
 -- WHY. hw_metrics is push-only (NOTIFY, no row retained), so when a GPU box
 -- hard-dies there is NO persisted hardware trail to autopsy. The motivating
--- incident: a unified-memory GPU box's firmware thermal protection killed the machine with
+-- incident: a GPU box's firmware thermal protection killed the machine with
 -- zero kernel trace — the GPU asserted a HW slowdown (throttle mask 0x48)
 -- seconds before an OS-invisible power cut, and only an ad-hoc side-channel
 -- recorder caught it. This table is that flight recorder, engine-owned.

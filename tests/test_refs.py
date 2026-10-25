@@ -1,6 +1,6 @@
 """``refs.resolve_ref`` behaviour (the ref-resolution mini-language).
 
-(The workflow-loading half of ai_leads' ``test_registry`` stays in ai_leads;
+(The workflow-loading half of the original host app's ``test_registry`` stayed there;
 only the ``resolve_ref``/``_dig``/``_match`` cases move here.)
 """
 
@@ -18,26 +18,26 @@ def test_value_literal():
 
 
 def test_from_simple_path():
-    ctx = {"parcel": {"lat": 50.5, "lon": 22.0, "label": "p1"}}
-    assert resolve_ref({"$from": "parcel.lat"}, ctx) == 50.5
-    assert resolve_ref({"$from": "parcel.label"}, ctx) == "p1"
+    ctx = {"item": {"lat": 50.5, "lon": 22.0, "label": "p1"}}
+    assert resolve_ref({"$from": "item.lat"}, ctx) == 50.5
+    assert resolve_ref({"$from": "item.label"}, ctx) == "p1"
 
 
 def test_from_nested_path():
     ctx = {
-        "svinfer": {
+        "node_a": {
             "primary_file": "views/comparison.png",
             "summary": {"top_score": 0.72, "n": 3},
         }
     }
-    assert resolve_ref({"$from": "svinfer.primary_file"}, ctx) == "views/comparison.png"
-    assert resolve_ref({"$from": "svinfer.summary.top_score"}, ctx) == 0.72
+    assert resolve_ref({"$from": "node_a.primary_file"}, ctx) == "views/comparison.png"
+    assert resolve_ref({"$from": "node_a.summary.top_score"}, ctx) == 0.72
 
 
 def test_from_missing_path_raises():
-    ctx = {"parcel": {"lat": 1.0}}
+    ctx = {"item": {"lat": 1.0}}
     with pytest.raises(KeyError, match="missing segment"):
-        resolve_ref({"$from": "parcel.lon"}, ctx)
+        resolve_ref({"$from": "item.lon"}, ctx)
 
 
 # ── $eq / $ne (skip_if backing) ───────────────────────────────────────────
@@ -67,14 +67,14 @@ def test_eq_handles_non_string_values():
 
 
 def test_filter_eq():
-    ctx = {"svinfer": {"files": [
+    ctx = {"node_a": {"files": [
         {"rel_path": "inputs/views.json", "kind": "json"},
         {"rel_path": "views/annotated_pano_0.png", "kind": "image"},
         {"rel_path": "views/annotated_pano_1.png", "kind": "image"},
         {"rel_path": "comparison.png", "kind": "image"},
     ]}}
     result = resolve_ref(
-        {"$from": "svinfer.files", "$filter": {"kind:eq": "image"}},
+        {"$from": "node_a.files", "$filter": {"kind:eq": "image"}},
         ctx,
     )
     assert len(result) == 3
@@ -82,14 +82,14 @@ def test_filter_eq():
 
 
 def test_filter_regex():
-    ctx = {"svinfer": {"files": [
+    ctx = {"node_a": {"files": [
         {"rel_path": "views/annotated_pano_0.png", "kind": "image"},
         {"rel_path": "comparison.png", "kind": "image"},
         {"rel_path": "views/annotated_pano_1.png", "kind": "image"},
     ]}}
     result = resolve_ref(
         {
-            "$from": "svinfer.files",
+            "$from": "node_a.files",
             "$filter": {"rel_path:matches": "annotated_pano_\\d+\\.png$"},
         },
         ctx,
@@ -116,10 +116,10 @@ def test_filter_combined():
 
 
 def test_plain_dict_recurses():
-    ctx = {"parcel": {"lat": 1.5}}
+    ctx = {"item": {"lat": 1.5}}
     out = resolve_ref(
         {
-            "lat": {"$from": "parcel.lat"},
+            "lat": {"$from": "item.lat"},
             "count": {"$value": 3},
             "name": "literal",
         },
@@ -137,8 +137,8 @@ def test_literal_scalar_returns_as_is():
 def test_filter_on_non_list_raises():
     with pytest.raises(TypeError, match="\\$filter on non-list"):
         resolve_ref(
-            {"$from": "parcel", "$filter": {"kind:eq": "x"}},
-            {"parcel": {"lat": 1.0}},
+            {"$from": "item", "$filter": {"kind:eq": "x"}},
+            {"item": {"lat": 1.0}},
         )
 
 
@@ -152,7 +152,7 @@ def test_coalesce_returns_first_resolvable():
 def test_coalesce_skips_missing_lane():
     # The lane-convergence case: lane "a" was SKIPPED (absent from context), so its
     # $from raises KeyError; $coalesce swallows it and returns lane "b".
-    ctx = {"b": {"collage_path": "/runs/x/paint_fence_gf/collage.png"}}
+    ctx = {"b": {"collage_path": "/runs/x/wf_a/collage.png"}}
     out = resolve_ref(
         {"$coalesce": [
             {"$from": "a.collage_path"},     # skipped lane → KeyError, skipped
@@ -160,7 +160,7 @@ def test_coalesce_skips_missing_lane():
         ]},
         ctx,
     )
-    assert out == "/runs/x/paint_fence_gf/collage.png"
+    assert out == "/runs/x/wf_a/collage.png"
 
 
 def test_coalesce_skips_none_values():

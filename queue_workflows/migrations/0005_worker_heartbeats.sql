@@ -1,18 +1,18 @@
 -- queue_workflows 0005 — worker_heartbeats (per-host fleet capacity ledger).
 --
 -- Each claim worker upserts its (host_label, queue) row at startup and
--- refreshes last_seen every ~10s. Rails sums concurrency across rows whose
+-- refreshes last_seen every ~10s. A host dashboard sums concurrency across rows whose
 -- last_seen is recent enough — the denominator behind `CPU 1/N` / `GPU 0/N`
 -- in the queue pill. A stopped worker stops refreshing and falls out of the
 -- SUM filter within 30s (no DELETE on shutdown needed).
 --
--- CONSOLIDATED final shape (old 031 + 032 + 037):
---   * current_model (old 032)  — GPU model-affinity hint for sticky routing.
---   * known_models (old 037)   — capability advertisement (model_registry
+-- CONSOLIDATED final shape:
+--   * current_model  — GPU model-affinity hint for sticky routing.
+--   * known_models   — capability advertisement (model_registry
 --                                .known_ids() snapshot) for pre-flight
 --                                validation + affinity routing.
 --
--- Idempotent (`IF NOT EXISTS`) so re-running on the live ai_leads DB is a
+-- Idempotent (`IF NOT EXISTS`) so re-running on a live database is a
 -- no-op.
 
 CREATE TABLE IF NOT EXISTS worker_heartbeats (
@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS worker_heartbeats (
     CONSTRAINT worker_heartbeats_queue_check CHECK (queue IN ('cpu', 'gpu'))
 );
 
--- Supports Rails' staleness filter (`last_seen > now() - interval '30s'`).
+-- Supports a dashboard staleness filter (`last_seen > now() - interval '30s'`).
 CREATE INDEX IF NOT EXISTS worker_heartbeats_last_seen_idx
     ON worker_heartbeats (last_seen);
 

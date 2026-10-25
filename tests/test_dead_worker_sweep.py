@@ -271,20 +271,20 @@ def test_threshold_boundary_arg():
 
 
 def test_threshold_env_override(monkeypatch):
-    """``AI_LEADS_STALE_WORKER_AFTER_S`` overrides the 30 s default; junk falls
+    """``QUEUE_WORKFLOWS_STALE_WORKER_AFTER_S`` overrides the 30 s default; junk falls
     back to the default; unset is the default."""
-    monkeypatch.delenv("AI_LEADS_STALE_WORKER_AFTER_S", raising=False)
+    monkeypatch.delenv("QUEUE_WORKFLOWS_STALE_WORKER_AFTER_S", raising=False)
     assert node_queue._stale_worker_after_s() == node_queue.STALE_WORKER_AFTER_S == 30
-    monkeypatch.setenv("AI_LEADS_STALE_WORKER_AFTER_S", "5")
+    monkeypatch.setenv("QUEUE_WORKFLOWS_STALE_WORKER_AFTER_S", "5")
     assert node_queue._stale_worker_after_s() == 5
-    monkeypatch.setenv("AI_LEADS_STALE_WORKER_AFTER_S", "junk")
+    monkeypatch.setenv("QUEUE_WORKFLOWS_STALE_WORKER_AFTER_S", "junk")
     assert node_queue._stale_worker_after_s() == 30
 
 
 def test_default_threshold_used_when_arg_omitted(monkeypatch):
     """With the default 30 s threshold, a 40 s-stale worker holding work is
     flagged (no explicit arg) — the live call path the sweep uses."""
-    monkeypatch.delenv("AI_LEADS_STALE_WORKER_AFTER_S", raising=False)
+    monkeypatch.delenv("QUEUE_WORKFLOWS_STALE_WORKER_AFTER_S", raising=False)
     _running_job_owned_by("host-a", model="video-model-b")
     _put_heartbeat("host-a", "gpu", last_seen_age_s=40)
     assert len(node_queue.flag_stale_workers_holding_running_jobs()) == 1
@@ -345,11 +345,11 @@ def test_sweep_logs_actionable_dead_worker_line(caplog):
 
 
 def test_sweep_flags_but_never_touches_the_job_row():
-    """CONTRACT REVERTED to flag-only. The zombie audit
-    made this sweep also re-queue the flagged worker's rows — and a live
-    incident proved the premise wrong: a heartbeat is a PROCESS-level signal
-    from one thread, and a 30-wide cpu worker under a heavy batch starved its
-    beat past staleness while every job's lease kept renewing — 23 LIVE jobs
+    """CONTRACT REVERTED to flag-only. An earlier version
+    made this sweep also re-queue the flagged worker's rows — and operation
+    proved the premise wrong: a heartbeat is a PROCESS-level signal
+    from one thread, and a wide-concurrency cpu worker under a heavy batch starved its
+    beat past staleness while every job's lease kept renewing — live jobs
     were yanked mid-flight. Job recovery belongs to the frozen-lease sweep
     (per-job lease renewal, ~35 s — same speed for a true death, immune to a
     starved beat thread); this sweep only flags the process for a supervisor

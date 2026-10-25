@@ -250,7 +250,7 @@ def test_enqueue_with_conn_rolls_back_with_caller():
     assert node_queue.get_ingest_job(holder["id"]) is None
 
 
-# ── host-configurable queue names (G1) ───────────────────────────────────────
+# ── host-configurable queue names ───────────────────────────────────────
 
 
 def test_enqueue_accepts_host_configured_queue():

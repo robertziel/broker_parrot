@@ -66,7 +66,7 @@ def resolve_llm_idle_ttl_s() -> float:
     """The effective idle TTL, resolved at CALL time (not import time, so a
     host's ``configure()`` — which runs after import — is honoured): the
     ``QUEUE_WORKFLOWS_LLM_SERVER_IDLE_TTL_S`` env knob wins (operator override,
-    legacy spelling free via envcompat), then ``EngineConfig.llm_server_idle_ttl_s``,
+    read via envcompat), then ``EngineConfig.llm_server_idle_ttl_s``,
     then :data:`DEFAULT_LLM_IDLE_TTL_S`. A malformed env value falls through."""
     raw = env_get("QUEUE_WORKFLOWS_LLM_SERVER_IDLE_TTL_S")
     if raw:
@@ -266,7 +266,7 @@ class VLLMIdleStopper:
         stop_fn: Callable[[], object],
         start_fn: Callable[[], object] | None = None,
         pending_fn: Callable[[], int] | None = None,
-        min_queue: int = 0,
+        min_queue: int | Callable[[], int] = 0,
         restart_cooldown_s: float = 120.0,
         ttl_s: float | None = None,
         now_fn: Callable[[], float] = time.monotonic,
@@ -279,18 +279,25 @@ class VLLMIdleStopper:
         self._stop_fn = stop_fn
         self._start_fn = start_fn
         self._pending_fn = pending_fn
-        #: PARK RELEASES THE CARD (operator rule #2): a worker whose
+        #: PARK RELEASES THE CARD (design rule): a worker whose
         #: control state is OFF must not ignite a multi-minute server start the
         #: parked box can never use — the demand it would be answering is some
         #: OTHER box's business. ``None`` (every pre-rule caller) = always may.
         self._may_start_fn = may_start_fn
-        self._min_queue = int(min_queue)
+        #: How many waiting jobs justify a cold start — a NUMBER or a reader of one.
+        #: A reader, for the deployments where it is operator policy: the topology
+        #: file's ``vllm_min_queue`` is documented as taking effect without a restart,
+        #: and it did on the claim side while this side had frozen the value at arm
+        #: time. A box armed under an old hold of 1000000 then ignored a queue the
+        #: operator had explicitly opened the gate for, silently, indefinitely.
+        self._min_queue_fn: Callable[[], int] = (
+            min_queue if callable(min_queue) else (lambda value=int(min_queue): value))
         self._restart_cooldown_s = float(restart_cooldown_s)
         self._last_action_at: float | None = None
         #: Consecutive starts that never produced a serving server — each doubles the
         #: cooldown (capped at 2^5 = 32x). Without it a permanently-broken target was
-        #: re-requested every cooldown, taking the box out of service ~88 % of the
-        #: time (analysis #5). Reset the moment the server is actually observed
+        #: re-requested every cooldown, taking the box out of service most of the
+        #: time. Reset the moment the server is actually observed
         #: serving.
         self._failed_starts = 0
         self._ttl_s = resolve_llm_idle_ttl_s() if ttl_s is None else float(ttl_s)
@@ -339,13 +346,13 @@ class VLLMIdleStopper:
             idle_s=idle_s, ttl_s=self._ttl_s,
         ):
             return False
-        # STICKY HYSTERESIS (asymmetric on purpose — operator rule).
+        # STICKY HYSTERESIS (asymmetric on purpose — a design rule).
         # The START side refuses to pay a cold start for fewer than min_queue jobs;
         # the STOP side refuses while ANY job is waiting — zero, not min_queue.
         # Stopping under a 1..min_queue-1 backlog handed the very next job to
         # ollama, which reloaded the same weights this box just held warm, and the
-        # re-deepening queue then paid the vLLM cold start AGAIN (~8 min; 887 s
-        # observed on an NFS-mounted load). A warm server with work behind it is
+        # re-deepening queue then paid the vLLM cold start AGAIN (many minutes on an
+        # NFS-mounted load). A warm server with work behind it is
         # never torn down; it stops only once the queue it serves is EMPTY.
         # Deliberately independent of min_queue, so min_queue=0 ("always pay the
         # start") cannot also unstick the stop.
@@ -353,7 +360,7 @@ class VLLMIdleStopper:
             try:
                 raw = self._pending_fn()
                 if raw is None or raw == "":
-                    # AUDIT DELTA D5 — UNREADABLE IS NOT ZERO. A probe that raises
+                    # UNREADABLE IS NOT ZERO. A probe that raises
                     # already keeps the server (below); a probe that returns None
                     # knows exactly as little, and used to coerce to 0 and STOP.
                     # Same ignorance must take the same branch, and the branch is
@@ -365,8 +372,8 @@ class VLLMIdleStopper:
                         "keeping the warm server", self._label, int(raw))
                     return False
             except Exception:
-                # FAIL SAFE, not open (found live): stopping is the EXPENSIVE action
-                # (a 15-minute NFS reload on box-b); keeping a warm server costs
+                # FAIL SAFE, not open: stopping is the EXPENSIVE action
+                # (a long reload, e.g. over NFS); keeping a warm server costs
                 # RAM for one more tick. An unreadable queue must never trigger the
                 # expensive action — same direction as the start side.
                 log.debug("[llm-idle] %s: pending count unreadable — KEEPING the "
@@ -431,8 +438,16 @@ class VLLMIdleStopper:
             log.debug("[llm-idle] %s: pending probe failed; not starting",
                       self._label, exc_info=True)
             return False
+        try:
+            min_queue = int(self._min_queue_fn())
+        except Exception:
+            # Same direction as every other unknown on this side: a start is minutes
+            # of weight loading, so ignorance must not trigger it.
+            log.debug("[llm-idle] %s: start threshold unreadable; not starting",
+                      self._label, exc_info=True)
+            return False
         if not should_start_vllm(
-            served=served, pending=pending, min_queue=self._min_queue,
+            served=served, pending=pending, min_queue=min_queue,
         ):
             return False
         try:
@@ -442,7 +457,7 @@ class VLLMIdleStopper:
             return False
         log.info(
             "[llm-idle] %s: %d job(s) waiting (>= %d) — starting vLLM",
-            self._label, pending, self._min_queue,
+            self._label, pending, min_queue,
         )
         self._last_action_at = now
         self._failed_starts += 1      # provisional; reset when it is seen serving
@@ -473,26 +488,26 @@ class VLLMIdleStopper:
             self.tick()
 
 
-# ── THE PARK WATCHDOG (operator rule #3) ─────────────────────────
+# ── THE PARK WATCHDOG (the kill rule) ────────────────────────────
 
 
 class ParkQuiesce:
     """Tick-driven KILL of a parked box's broker-managed LLM servers.
 
-    "Create watchdog that kills any broker_parrot servers if box is parked."
+    The rule: a parked box runs no engine-managed LLM server.
     Unconditional — no idle TTL, no activity exemption.
 
     History, because the softer versions both failed live:
 
-    * Rule #1 (no quiesce at all): a parked box's vllm sidecar
+    * No quiesce at all: a parked box's vllm sidecar
       crash-looped (``restart: unless-stopped`` resurrects every clean
-      self-exit) and re-loaded 65 GB ~2 h later with nothing able to stop it —
+      self-exit) and re-loaded a large model hours later with nothing able to stop it —
       the only stop mechanism (the idle stopper) lives in the gpu claim
       worker, which was parked.
-    * Rule #2 (idle-reaper composition, activity-guarded for peers): killed
-      within hours by REMOTE traffic — box-c POSTing chat completions over
-      the fast iface kept parked box-a's vllm "busy" at 96 % GPU (9 concurrent
-      requests), so the busy-exemption meant anyone outside the box could keep
+    * Idle-reaper composition, activity-guarded for peers: defeated
+      by REMOTE traffic — a peer box POSTing chat completions over
+      the fast iface kept a parked box's vllm "busy" at high GPU (several
+      concurrent requests), so the busy-exemption meant anyone outside the box could keep
       it un-parked forever. An out-of-band ``docker run`` had also recreated
       the container mid-park (fresh CreatedAt, RestartCount reset — the
       engine's start lever can only START an existing container).
@@ -513,29 +528,53 @@ class ParkQuiesce:
     THE ONE EXEMPTION — our OWN in-flight work. ``stop_policy='drain'``
     (what the panel's park lever writes) means "finish what you are holding, claim
     nothing new", so a parked worker legitimately keeps running the job it already had.
-    Rule #3 then told ollama to unload the very model that job was streaming from —
-    290 ``keep_alive:0`` posts in 30 minutes, one identical log line at 0.2 Hz.
+    The kill rule then told ollama to unload the very model that job was streaming from —
+    a ``keep_alive:0`` post every tick, one identical log line each time.
 
-    What that actually cost, measured rather than assumed: ollama does NOT refuse the
+    What that actually cost: ollama does NOT refuse the
     unload. It applies the zero keep-alive at the REQUEST BOUNDARY — the runner exits
     when the in-flight call ends (``Stopping...`` means "expiry scheduled, runner
-    draining", not "refused") — and the job's NEXT call then COLD-RELOADS 34 GiB. One
-    box went from 6 model reloads in 3 h 21 m before the park to 7 in the 30 minutes
-    after it; the other from 5 in 3 h 12 m to 10 in 28 minutes. The park was not
+    draining", not "refused") — and the job's NEXT call then COLD-RELOADS the whole
+    model. The model-reload rate after a park rose several-fold over the rate before
+    it. The park was not
     releasing the card, it was making the kept job thrash it.
 
-    Rule #3 is about OTHER people's traffic — an exemption a peer could hold open for
+    The kill rule is about OTHER people's traffic — an exemption a peer could hold open for
     ever — and that stays dead. A job THIS worker is running is the opposite: the park
     policy itself chose to preserve it, and it ends. So the watchdog holds off while
     ``in_flight_fn`` reports work and kills on sight the instant it does not — which is
     immediately under ``hard`` park, since that re-queues the job first. A caller that
-    passes no seam gets rule #3 verbatim, and an unreadable probe falls back to killing.
+    passes no seam gets the kill rule verbatim, and an unreadable probe falls back to killing.
 
     The seam must be scoped to the lane that uses the LLM (the pool lane), NOT to every
     GPU job: an inline diffusion render does not touch the LLM, and exempting on one
-    would let a peer's traffic keep a parked box's vLLM at 96 % — the rule #2 failure,
+    would let a peer's traffic keep a parked box's vLLM busy — the activity-guard failure,
     through a side door.
+
+    BY CONTAINER STATE. ``vllm_activity_fn`` reads ``/metrics``, and a vLLM
+    still LOADING its weights answers nothing: a lane parked in the middle of a vLLM
+    start goes on loading the whole model, invisible to a probe-only watchdog,
+    until the server binds its port. ``vllm_running_fn`` — the container's own
+    state, where the caller can read it — closes that: a container that runs but does not
+    answer yet is stopped too. An unreadable container state falls back to the probe alone,
+    exactly as before.
+
+    THE SECOND VOICE — a CLUSTER RESERVATION's hold (``voice='cluster-hold'``). A lane that
+    holds its box for a server the engine does not run keeps the broker's own servers down
+    for the reason a park does. The reservation's OWN body uses no LLM, but the pool lane
+    can have claimed an llm_chat moments before the hold began, and that job streams from
+    this very card — so the same exemption applies, with a much shorter ceiling
+    (``claim_worker.CLUSTER_HOLD_DRAIN_MAX_S``): the in-flight job drains, and then the
+    cluster gets its box whether or not the job ended. The caller counts the reservation's
+    own pool slot OUT of ``in_flight_fn``, or the hold would wait for itself.
     """
+
+    #: How each caller's lines read: ``(log tag, the box's state, why it serves nothing)``.
+    _VOICES = {
+        "park": ("park-watchdog", "PARKED", "a parked box serves nobody"),
+        "cluster-hold": ("cluster-hold", "HELD for a cluster reservation",
+                         "the external cluster needs the whole box"),
+    }
 
     #: How often a repeated, unchanged verdict is restated at INFO. The watchdog ticks
     #: on the park loop (~5 s); narrating every tick is what buried the real lines.
@@ -547,7 +586,7 @@ class ParkQuiesce:
     #: long as the process lives, so lease-reclaim cannot fire either. One wedged HTTP
     #: call would therefore pin the counter at 1 and hold the card SILENTLY for ever,
     #: with the operator looking at PARKED. After this much CONTINUOUS holding off,
-    #: rule #3 wins and says why. The default is the GPU job budget: we wait no longer
+    #: the kill rule wins and says why. The default is the GPU job budget: we wait no longer
     #: than a GPU job may legitimately run.
     DEFAULT_HOLD_OFF_MAX_S = 8100.0
 
@@ -563,9 +602,15 @@ class ParkQuiesce:
         report_every_s: float = DEFAULT_REPORT_EVERY_S,
         hold_off_max_s: float = DEFAULT_HOLD_OFF_MAX_S,
         label: str = "?",
+        vllm_running_fn: Callable[[], bool] | None = None,
+        voice: str = "park",
     ) -> None:
         self._vllm_activity_fn = vllm_activity_fn
         self._vllm_stop_fn = vllm_stop_fn
+        #: The vLLM CONTAINER's own state (running = serving OR still loading); ``None`` =
+        #: the caller cannot read it, and the watchdog decides on ``/metrics`` alone.
+        self._vllm_running_fn = vllm_running_fn
+        self._tag, self._state, self._reason = self._VOICES.get(voice, self._VOICES["park"])
         self._ollama_models_fn = ollama_models_fn
         self._ollama_unload_fn = ollama_unload_fn
         self._in_flight_fn = in_flight_fn
@@ -597,7 +642,7 @@ class ParkQuiesce:
         try:
             return max(0, int(self._in_flight_fn() or 0))
         except Exception:
-            # Fail TOWARD rule #3: if we cannot tell whether the work is ours, a
+            # Fail TOWARD the kill rule: if we cannot tell whether the work is ours, a
             # parked box still serves nobody.
             log.debug("[park-watchdog] %s: in-flight probe failed — assuming none",
                       self._label, exc_info=True)
@@ -614,39 +659,63 @@ class ParkQuiesce:
             if held_for < self._hold_off_max_s:
                 self._say(
                     "draining", str(in_flight),
-                    "[park-watchdog] %s: PARKED and draining — %d job(s) still in "
+                    "[%s] %s: %s and draining — %d job(s) still in "
                     "flight on this worker; holding off the LLM eviction until they "
                     "finish (force-kill the job to release the card now)",
-                    self._label, in_flight,
+                    self._tag, self._label, self._state, in_flight,
                 )
                 return False, []
             self._say(
                 "holdoff-expired", str(in_flight),
-                "[park-watchdog] %s: %d job(s) have held the card for %.0fs since "
-                "this box was parked (ceiling %.0fs) — releasing it anyway; a job "
-                "that never ends must not keep a parked box serving",
-                self._label, in_flight, held_for, self._hold_off_max_s,
+                "[%s] %s: %d job(s) have held the card for %.0fs since this box was %s "
+                "(ceiling %.0fs) — releasing it anyway; %s",
+                self._tag, self._label, in_flight, held_for, self._state,
+                self._hold_off_max_s, self._reason,
                 level=logging.WARNING,
             )
         else:
             self._holding_since = None
         stopped = False
+        served, requests = False, "?"
         try:
             act = self._vllm_activity_fn() or {}
-            if bool(act.get("served")):
-                # KILL FIRST, narrate after (audit LOW #1): the log line's value
+            served = bool(act.get("served"))
+            requests = act.get("running", "?")
+        except Exception:
+            log.debug("[%s] %s: vLLM activity probe failed", self._tag, self._label,
+                      exc_info=True)
+        loading = False
+        if not served and self._vllm_running_fn is not None:
+            try:
+                loading = bool(self._vllm_running_fn())
+            except Exception:
+                # No readable container state: exactly as good as the probe alone, never
+                # worse.
+                log.debug("[%s] %s: vLLM container state unreadable (probe only)",
+                          self._tag, self._label, exc_info=True)
+        if served or loading:
+            try:
+                # KILL FIRST, narrate after: the log line's value
                 # formatting must never be able to skip the stop.
                 self._vllm_stop_fn()
                 stopped = True
-                self._say(
-                    "vllm", str(act.get("running", "?")),
-                    "[park-watchdog] %s: box is PARKED but vLLM was serving "
-                    "(%s request(s) in flight) — stopped it NOW; a parked box "
-                    "serves nobody", self._label, act.get("running", "?"),
-                )
-        except Exception:
-            log.debug("[park-watchdog] %s: vllm half failed (retried next tick)",
-                      self._label, exc_info=True)
+                if served:
+                    self._say(
+                        "vllm", str(requests),
+                        "[%s] %s: box is %s but vLLM was serving "
+                        "(%s request(s) in flight) — stopped it NOW; %s",
+                        self._tag, self._label, self._state, requests, self._reason,
+                    )
+                else:
+                    self._say(
+                        "vllm-loading", "loading",
+                        "[%s] %s: box is %s but its vLLM container was running and not "
+                        "answering yet (still loading) — stopped it NOW, by container "
+                        "state; %s", self._tag, self._label, self._state, self._reason,
+                    )
+            except Exception:
+                log.debug("[%s] %s: vllm half failed (retried next tick)", self._tag,
+                          self._label, exc_info=True)
         unloaded: list[str] = []
         try:
             infos = self._ollama_models_fn() or []
@@ -654,14 +723,14 @@ class ParkQuiesce:
             if names:
                 self._say(
                     "ollama", ",".join(names),
-                    "[park-watchdog] %s: box is PARKED but ollama holds %s — "
-                    "unloading NOW; a parked box serves nobody",
-                    self._label, ", ".join(names),
+                    "[%s] %s: box is %s but ollama holds %s — "
+                    "unloading NOW; %s",
+                    self._tag, self._label, self._state, ", ".join(names), self._reason,
                 )
                 self._ollama_unload_fn(names)
                 unloaded = names
         except Exception:
-            log.debug("[park-watchdog] %s: ollama half failed (retried next tick)",
+            log.debug("[%s] %s: ollama half failed (retried next tick)", self._tag,
                       self._label, exc_info=True)
         return stopped, unloaded
 

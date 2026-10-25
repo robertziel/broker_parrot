@@ -1,7 +1,7 @@
 """Two servers holding the SAME model is two copies of VRAM — the guard must see it.
 
-Observed live on box-a: ollama and vLLM both resident on ``chat-model-a:latest``, box at
-117.7/121 GB, ~3 GB from OOM on a machine that has already died of OOM once. The
+The failure: ollama and vLLM both resident on ``chat-model-a:latest``, the box a few GB
+from OOM. The
 residency enforcer waved it through because it counted distinct MODEL IDS, and both
 copies share one id.
 
@@ -18,7 +18,7 @@ def _r(server, model, mru=0.0):
 
 
 def test_the_same_model_on_two_servers_is_a_violation():
-    """THE live bug. ~68 GB, not 34 — one of them has to go."""
+    """THE bug. Two copies of the weights, not one — one of them has to go."""
     residents = [_r("ollama", "chat-model-a:latest", 10), _r("vllm", "chat-model-a:latest", 5)]
     evicted = decide_evictions(residents, cap=1)
     assert len(evicted) == 1, "one of the two copies must be evicted"
@@ -77,9 +77,9 @@ def test_a_BUSY_server_is_never_the_victim():
 
 
 def test_with_neither_busy_COST_outranks_the_default():
-    """CONTRACT FLIP (found live): this test used to assert desired_server=ollama
+    """CONTRACT FLIP: this test used to assert desired_server=ollama
     evicts the vLLM copy of the same model — which is precisely the eviction loop
-    that kept killing a 15-minute server to save a 5-second copy. Cost decides."""
+    that kept killing a slow-to-restore server to save a fast-to-restore copy. Cost decides."""
     residents = [
         Resident(server="ollama", model="m", mru=1),
         Resident(server="vllm", model="m", mru=99),
@@ -113,9 +113,9 @@ def test_protection_is_scoped_to_the_switch_target():
 
 
 def test_same_model_on_both_kinds_ALWAYS_evicts_the_ollama_copy():
-    """THE EVICTION LOOP (found live). One stray ollama-resolved job put an LLM on
+    """THE EVICTION LOOP. One stray ollama-resolved job put an LLM on
     ollama beside a serving vLLM; the (busy, desired, mru) vote — ollama never busy,
-    desired default = ollama — then killed the 15-minute-to-restore vLLM to save the
+    desired default = ollama — then killed the slow-to-restore vLLM to save the
     seconds-to-restore ollama copy. Every time. Cost decides: same model on both ⇒
     the ollama copy is the victim, whatever busy/desired/mru say."""
     residents = [

@@ -3,7 +3,7 @@
 -- WHY columns on worker_controls (not a new table). The LLM server a host runs
 -- is DESIRED, operator-set state with the SAME key as the ON/OFF switch —
 -- (host_label, queue) — and is read by the SAME worker that reads desired_state.
--- It belongs next to it, written by the same Rails/operator path. Other consumer
+-- It belongs next to it, written by the same operator path. Other consumer
 -- projects read worker_controls only through the engine accessors (never
 -- SELECT *), so widening the row is safe for them.
 --

@@ -4,7 +4,7 @@ The GPU worker's POOL lane was for lightweight VLM-facade jobs (no in-process
 model — they POST to the per-host vLLM server, which batches up to PAR). It
 claimed EVERY no-model gpu job (``required_model IS NULL``). But many no-model
 gpu jobs are NOT facade work — they self-load a heavy GPU model in-process
-(``fence_remove`` / ``car_remove`` erasers, the GroundingDINO+SAM detectors,
+(``object_remove`` erasers, the GroundingDINO+SAM detectors,
 ``scene_build``, ...). Running several of those concurrently in the pool at
 PAR>1 thrashes / OOMs the GPU.
 
@@ -27,7 +27,7 @@ from __future__ import annotations
 from queue_workflows import node_queue
 from tests._helpers import make_run
 
-POOL = ("facade_parse_walls_vlm",)   # the one genuine VLM-facade module
+POOL = ("vlm_facade_parse",)   # the one genuine VLM-facade module
 
 
 def _enqueue(node_module: str, *, required_model: str | None = None) -> str:
@@ -39,9 +39,9 @@ def _enqueue(node_module: str, *, required_model: str | None = None) -> str:
 
 
 def test_inprocess_gpu_job_routes_to_inline_not_pool():
-    """A no-model in-process GPU job (``fence_remove``) is NOT pool-eligible:
+    """A no-model in-process GPU job (``object_remove``) is NOT pool-eligible:
     the pool lane skips it and the inline lane claims it."""
-    job_id = _enqueue("fence_remove")
+    job_id = _enqueue("object_remove")
 
     # Pool lane refuses it.
     assert node_queue.claim_next_gpu_job(
@@ -57,9 +57,9 @@ def test_inprocess_gpu_job_routes_to_inline_not_pool():
 
 
 def test_vlm_facade_job_stays_in_pool():
-    """A pool-eligible VLM-facade job (``facade_parse_walls_vlm``) is claimed by
+    """A pool-eligible VLM-facade job (``vlm_facade_parse``) is claimed by
     the pool lane and NOT by the inline lane."""
-    job_id = _enqueue("facade_parse_walls_vlm")
+    job_id = _enqueue("vlm_facade_parse")
 
     # Inline lane leaves it for the pool.
     assert node_queue.claim_next_gpu_job(
@@ -76,7 +76,7 @@ def test_vlm_facade_job_stays_in_pool():
 def test_model_backed_job_unaffected_by_pool_modules():
     """A model-backed job always belongs to the inline lane regardless of
     ``pool_modules``."""
-    job_id = _enqueue("img_fence_edit", required_model="img_edit")
+    job_id = _enqueue("img_object_edit", required_model="img_edit")
 
     assert node_queue.claim_next_gpu_job(
         0, None, host="h", require_model=False, pool_modules=POOL,
@@ -90,8 +90,8 @@ def test_model_backed_job_unaffected_by_pool_modules():
 
 def test_empty_pool_modules_is_legacy_split():
     """Unset ``pool_modules`` ⇒ legacy behaviour: EVERY no-model job is
-    pool-eligible (pool claims ``fence_remove``), inline claims none of them."""
-    job_id = _enqueue("fence_remove")
+    pool-eligible (pool claims ``object_remove``), inline claims none of them."""
+    job_id = _enqueue("object_remove")
 
     # Legacy: inline (require_model=True) does NOT claim a no-model job.
     assert node_queue.claim_next_gpu_job(
@@ -107,7 +107,7 @@ def test_empty_pool_modules_is_legacy_split():
 def test_lanes_disjoint_and_exhaustive_over_mixed_queue():
     """With a mix of (facade, heavy-no-model, model-backed) queued, the two
     lanes partition them: pool gets the facade, inline gets the other two."""
-    facade = _enqueue("facade_parse_walls_vlm")
+    facade = _enqueue("vlm_facade_parse")
     heavy = _enqueue("car_remove")
     backed = _enqueue("osediff_node", required_model="osediff")
 

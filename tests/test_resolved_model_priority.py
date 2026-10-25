@@ -1,6 +1,6 @@
 """The ORDER in `required_models` is a PRIORITY, and the claim must honour it.
 
-"Highest in order has highest priority of use if a slot is available" — so a box that can
+The earliest entry has the highest priority of use when a slot is available — so a box that can
 serve BOTH the first and the second acceptable model must take the FIRST, and only fall
 through when it genuinely cannot serve the earlier ones. Without this the array degrades
 into an unordered set: the row still claims, so nothing looks broken, and the fleet quietly

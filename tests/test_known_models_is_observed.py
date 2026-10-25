@@ -195,7 +195,7 @@ def test_an_observation_matching_NOTHING_falls_back_to_declared_not_to_empty():
 
 
 def test_the_registry_defaults_to_PROTECTED_so_an_unmarked_spec_is_never_narrowed():
-    """Fail-safe direction, and it matters across projects: ai_leads registers in-process
+    """Fail-safe direction, and it matters across projects: a host registers in-process
     torch/diffusers specs that know nothing about `served_by`. Unmarked must mean
     in-process, never 'assume a server has it'."""
     from queue_workflows import model_registry

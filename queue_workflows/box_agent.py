@@ -71,7 +71,7 @@ def reconcile(
 def _host_matches(row_host: str, box: str) -> bool:
     """A ``worker_controls`` row governs this box if its ``host_label`` is the bare
     box name (``box-a``) or one of the box's lane labels (``box-a-gpu``). The
-    ``box + "-"`` guard stops ``box-a`` from matching ``box-a2``."""
+    ``box + "-"`` guard stops ``box-a`` from matching ``box-a-extra``."""
     return row_host == box or row_host.startswith(box + "-")
 
 

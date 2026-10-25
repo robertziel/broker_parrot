@@ -40,7 +40,7 @@ htmlcov/
 
 # ── local journals + agent tooling (never committed) ─────────────────────────
 worklog/
-# Claude Workflow scripts + session dirs (they live in ~/.claude — never commit these)
+# agent tooling state + workflow scripts (never commit these)
 .claude/
 **/workflows/scripts/
 *-wf_*.js

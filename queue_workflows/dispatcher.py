@@ -12,7 +12,7 @@ a stream of queued node-jobs:
    Resume via :func:`resume_after_input`.
 
 All DB work goes through :mod:`node_queue` (jobs) + :mod:`run_store` (the run
-row). The workflow/pipeline DEFINITION SOURCE is host-injected (plan §1e): the
+row). The workflow/pipeline DEFINITION SOURCE is host-injected: the
 dispatcher reads workflows + pipeline schemas through ``config.workflow_loader``
 / ``config.pipeline_schema_loader``, and resolves ``$from`` refs through
 ``config.get_resolve_ref()`` (defaulting to the engine's own
@@ -85,7 +85,7 @@ def _nodes_of(
     run_out_dir = (run or {}).get("out_dir") if run else None
 
     # Step-to-leaf-nodes map — a step-level ``depends_on`` entry like
-    # ``"svinfer"`` must expand to "every terminal node of the svinfer
+    # ``"detect"`` must expand to "every terminal node of the detect
     # pipeline is completed".
     step_leaves: dict[str, list[str]] = {}
     for step in workflow.get("steps", []) or []:
@@ -192,6 +192,12 @@ def _nodes_of(
                 # node reserved 1 slot — precisely the silent drop the comment
                 # above warns about. Threaded through like its siblings now.
                 "cpu_slots": sn.get("cpu_slots"),
+                # The LLM context window this node's requests need (migration
+                # 0028). A literal or a ``$ref`` the run supplies — resolved and
+                # validated at enqueue in ``_enqueue``. Left off this list, a
+                # schema's requirement would vanish here and the prompt would be
+                # truncated by the server instead.
+                "context_length": sn.get("context_length"),
             })
     return out
 
@@ -551,7 +557,7 @@ def _finish_patch_job(
     copy the patch file over the source node's original path. Downstream
     ``$from <source_node>.<key>`` refs and the parked input spec keep their
     paths — the content changes underneath (the patch job's own node dir
-    remains on disk as the audit trail). Then bump the spec's ``patched_at``.
+    remains on disk as the history). Then bump the spec's ``patched_at``.
     """
     import shutil
     from pathlib import Path
@@ -620,7 +626,7 @@ def on_node_completed(run_id: str, node_id: str) -> int:
     ``completed``. Returns the number of new node-jobs inserted.
 
     PATCH jobs (synthetic non-DAG rows carrying a ``__patch__`` inputs marker —
-    the operator's "fix an earlier step in place") never cascade: their outputs
+    a user's "fix an earlier step in place") never cascade: their outputs
     are made canonical and the parked input's spec is bumped instead.
     """
     run = run_store.get_run(run_id)
@@ -858,8 +864,8 @@ def _build_input_spec(step: dict[str, Any], run: dict[str, Any]) -> dict[str, An
             spec["fisheye_abs_path"] = options[0].get("abs_path")
         spec["pano_meta"] = _resolve_pano_meta(run, options)
     elif widget == "pick_fence":
-        # Per-detection fence picker — operator clicks individual detections
-        # (their own fence, ignore neighbour's) before the paint refinement
+        # Per-detection picker — the user clicks individual detections
+        # (keep the relevant ones, ignore the rest) before the paint refinement
         # step. Spec carries (a) the source image to display as background and
         # (b) the detections.json index the host widget fetches to render each
         # detection as a colored overlay. Same $from/$filter resolution shape
@@ -882,9 +888,8 @@ def _build_input_spec(step: dict[str, Any], run: dict[str, Any]) -> dict[str, An
             # single string. Wrap into a single-element file-info list so the
             # widget renders that exact image — without this branch the code
             # fell into the ``else: []`` arm below, the widget showed
-            # ``source_options=[]``, and the operator saw "No source image was
-            # attached to this step." (the masked-compose experiment is the one
-            # flow that feeds pick_fence a scalar source). Mirrors the
+            # ``source_options=[]``, and the user saw an empty source (a flow
+            # whose upstream pick writes a scalar path hits this). Mirrors the
             # paint_mask / paint_fence_regions source blocks. Regression test:
             # ``test_pick_fence_source_wraps_scalar_abs_path_from_upstream_pick``.
             src_options = [_file_info_for_abs_path(src_options, run.get("out_dir"))]
@@ -918,7 +923,7 @@ def _build_input_spec(step: dict[str, Any], run: dict[str, Any]) -> dict[str, An
         # uploads a binary mask PNG back through the standard multipart pipe;
         # the spec just needs to tell it which image to display.
         #
-        # ``paint_fence_regions`` (the one-canvas Fence/Gate/Concrete labeled
+        # ``paint_fence_regions`` (the one-canvas multi-label region
         # painter) shares this exact source resolution — including the scalar
         # ``$from: pick_clean.clean_plate_path`` abs-path wrap below. It simply
         # carries no ``initial_mask`` (regions are painted from scratch, not
@@ -941,7 +946,7 @@ def _build_input_spec(step: dict[str, Any], run: dict[str, Any]) -> dict[str, An
             # single string). Wrap into a single-element file-info list so
             # the widget renders that exact image — without this branch the
             # code fell into the ``else: []`` arm below, the widget showed
-            # ``source_options=[]``, and the operator saw a blank canvas
+            # ``source_options=[]``, and the user saw a blank canvas
             # (or the lane-0 fallback). Regression test:
             # ``test_paint_mask_source_wraps_scalar_abs_path_from_upstream_pick``.
             options = [_file_info_for_abs_path(options, run.get("out_dir"))]
@@ -953,9 +958,8 @@ def _build_input_spec(step: dict[str, Any], run: dict[str, Any]) -> dict[str, An
             spec["source_abs_path"] = options[0].get("abs_path")
         # Optional ``initial_mask`` ref — when set, the widget pre-paints the
         # resolved PNG onto the overlay so the operator starts from an
-        # auto-detected mask instead of a blank canvas (e.g. the
-        # multi-erase fence experiment seeds this from a GroundingDINO+SAM2
-        # pre-pass). Same shape as ``source`` — a $from/$filter ref against
+        # auto-detected mask instead of a blank canvas (e.g. an upstream
+        # detection/segmentation pre-pass seeds it). Same shape as ``source`` — a $from/$filter ref against
         # the run context — to keep the resolver symmetrical.
         initial_mask = step.get("initial_mask")
         if initial_mask is not None:
@@ -971,7 +975,7 @@ def _build_input_spec(step: dict[str, Any], run: dict[str, Any]) -> dict[str, An
                 im_options = [im_options]
             elif isinstance(im_options, str):
                 # Scalar abs_path — e.g. ``$from: pick_fence.selected_mask_path``,
-                # the operator's chosen fence mask from an upstream pick widget
+                # the user's chosen mask from an upstream pick widget
                 # (the paint_fence_regions seed). Mirror the source block's wrap
                 # so a single-path ref pre-paints rather than vanishing into [].
                 im_options = [_file_info_for_abs_path(im_options, run.get("out_dir"))]
@@ -993,8 +997,8 @@ def _build_input_spec(step: dict[str, Any], run: dict[str, Any]) -> dict[str, An
             except (TypeError, ValueError):
                 pass
         # Optional ``predefined_layers`` + ``hide_mask`` refs (v1.5) — when set, an
-        # upstream node (``fence_preassign_layers``) pre-computed the perspective
-        # fence rectangles (a JSON) + a bottom-only occluder mask (a PNG); the editor
+        # upstream node pre-computed the perspective
+        # region rectangles (a JSON) + a bottom-only occluder mask (a PNG); the editor
         # opens PRE-POPULATED from them instead of a blank canvas. Same $from ref
         # shape as ``source``/``initial_mask``; the widget fetches each file via
         # /workflow/:id/file?path=... . Carrying only the paths keeps this engine
@@ -1023,7 +1027,7 @@ def _build_input_spec(step: dict[str, Any], run: dict[str, Any]) -> dict[str, An
                 spec[_rel] = _opts[0].get("rel_path")
                 spec[_abs] = _opts[0].get("abs_path")
     elif widget == "assign_walls":
-        # Operator-facing wall-assignment widget for the facade-merge workflow.
+        # User-facing wall-assignment widget for a wall-assignment workflow.
         import json
         from pathlib import Path
         out_dir = run.get("out_dir")
@@ -1350,6 +1354,31 @@ def resolve_inputs_for_job(
 # ── Internal ─────────────────────────────────────────────────────────────
 
 
+def _context_length_of(node: dict[str, Any], context: dict) -> int | None:
+    """The node's ``context_length`` (migration 0028), resolved and coerced.
+
+    Lenient where JSON is lenient — a whole-number float (``65536.0``) or a digit
+    string (``"65536"``) from run params means that many tokens — and strict about
+    everything else: a value that cannot be read as a positive whole number FAILS the
+    expansion. Quietly treating a typo as "no requirement" is the silent prompt
+    truncation this field exists to prevent. ``None`` (absent, or a ref that resolved to
+    nothing) means no requirement."""
+    raw = node.get("context_length")
+    if raw is None:
+        return None
+    value = _resolve_ref(raw, context)
+    if value is None or value == "":
+        return None
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    elif isinstance(value, str) and value.strip().isdigit():
+        value = int(value.strip())
+    try:
+        return node_queue.validate_context_length(value)
+    except ValueError as exc:
+        raise ValueError(f"node {node.get('id')!r}: {exc}") from exc
+
+
 def _enqueue(run_id: str, node: dict[str, Any], run: dict[str, Any]) -> str:
     """Translate a workflow-JSON node into a queued node-job row.
 
@@ -1422,4 +1451,7 @@ def _enqueue(run_id: str, node: dict[str, Any], run: dict[str, Any]) -> str:
             str(_resolve_ref(node.get("dedup_key"), context) or "") or None
             if node.get("dedup_key") is not None else None
         ),
+        # The context window the node needs (migration 0028), through the same ref
+        # machinery so a caller that knows its prompt size can supply it per run.
+        context_length=_context_length_of(node, context),
     )

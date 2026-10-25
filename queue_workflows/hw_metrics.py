@@ -8,13 +8,13 @@ collects:
 - Swap used (psutil)
 - Per-GPU utilisation + VRAM used (nvidia-smi or rocm-smi)
 
-And fires a Postgres ``NOTIFY hw_metrics, <json>``. Rails reads that and
-attaches it to the queue-snapshot payload, so the frontend pill can show live
+And fires a Postgres ``NOTIFY hw_metrics, <json>``. A consumer app reads that
+and attaches it to the queue-snapshot payload, so the frontend pill can show live
 CPU/GPU load.
 
 This is generic telemetry plumbing that any GPU-worker fleet wants; the channel
-name + payload shape are part of the engine's monitoring contract (Rails is the
-consumer, not a Python importer). ``psutil`` is an OPTIONAL dependency — the
+name + payload shape are part of the engine's monitoring contract (the consumer is any
+LISTENer, not a Python importer). ``psutil`` is an OPTIONAL dependency — the
 ``import psutil`` is guarded; without it CPU/RAM stay ``None`` and only GPU
 telemetry flows.
 """
@@ -51,7 +51,7 @@ log = logging.getLogger(__name__)
 
 # Push-only: every SAMPLE_INTERVAL_S seconds we fire a Postgres
 # ``NOTIFY hw_metrics, <json>`` and move on — no UPSERT, no row retained.
-# Rails' SSE controller has a matching ``LISTEN`` on a dedicated connection and
+# A consumer's SSE endpoint has a matching ``LISTEN`` on a dedicated connection and
 # forwards each payload to browser clients.
 SAMPLE_INTERVAL_S = 5.0
 NOTIFY_CHANNEL = "hw_metrics"
@@ -78,8 +78,8 @@ def _uses_dedicated_metrics_dsn() -> bool:
 
 def _host_label() -> str:
     """Stable identifier for the box this sampler is running on. Set the
-    configured host-label env (default ``AI_LEADS_HOST_LABEL``) on remote
-    worker boxes so the Rails SSE indicator can group samples by source.
+    configured host-label env (default ``QUEUE_WORKFLOWS_HOST_LABEL``) on remote
+    worker boxes so a consumer's indicator can group samples by source.
     Defaults to ``socket.gethostname()``."""
     from queue_workflows.config import get_config
     return env_get(get_config().host_label_env, "").strip() or socket.gethostname()
@@ -113,11 +113,11 @@ def _gpu_probe() -> list[dict[str, Any]]:
 # claim-any) rather than gate the worker to "fits nothing". Env-overridable.
 MIN_PLAUSIBLE_VRAM_MB = 2048
 
-#: Operator override for total GPU VRAM (MB). The RELIABLE source on this fleet's
+#: Operator override for total GPU VRAM (MB). The RELIABLE source on
 #: unified-memory hardware, where the smi probe can't report a meaningful total.
 #: Set per host (e.g. in compose) to ACTIVATE capacity-aware assignment; unset ⇒
 #: the probe is used, and an implausible/absent probe ⇒ unknown ⇒ claim-any.
-_VRAM_TOTAL_ENV = "AI_LEADS_GPU_VRAM_TOTAL_MB"
+_VRAM_TOTAL_ENV = "QUEUE_WORKFLOWS_GPU_VRAM_TOTAL_MB"
 
 
 def total_vram_mb() -> int | None:
@@ -125,7 +125,7 @@ def total_vram_mb() -> int | None:
     measured against.
 
     Resolution order:
-      1. ``AI_LEADS_GPU_VRAM_TOTAL_MB`` if set (operator-declared truth — the
+      1. ``QUEUE_WORKFLOWS_GPU_VRAM_TOTAL_MB`` if set (operator-declared truth — the
          reliable source on unified-memory GPUs where the smi total is bogus).
       2. else the LARGEST single GPU's probed ``vram_total_mb`` (a model loads on
          ONE device, so capacity is the max single card, not the sum) — but only
@@ -489,7 +489,7 @@ def start_hw_metrics_sampler_flocked() -> HwMetricsSampler | None:
     (one gpu container per host ⇒ one sampler per host); the flock is a
     secondary guard against an accidental double-start within a host. Returns
     the started sampler, or ``None`` when this process lost the flock contest,
-    when telemetry is disabled (``AI_LEADS_DISABLE_HW_METRICS``), or when the
+    when telemetry is disabled (``QUEUE_WORKFLOWS_DISABLE_HW_METRICS``), or when the
     sampler failed to construct/start (non-fatal — boot must not depend on
     telemetry).
 

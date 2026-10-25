@@ -202,7 +202,7 @@ def test_reset_for_tests_accepts_socket_test_dsn(monkeypatch) -> None:
     "url",
     [
         "postgresql://u@/queue_workflows_prod?host=/var/run/postgresql",
-        "postgresql://u:p@host:5432/ai_leads",
+        "postgresql://u:p@host:5432/otherdb",
         "postgresql://u@/queue_workflows_test_backup",   # name ends in _backup
         "postgresql://u@host:5432/prod?options=db_test",  # _test only in the query
     ],

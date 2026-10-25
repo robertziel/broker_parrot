@@ -1,4 +1,4 @@
-"""Reference-resolution mini-language (carved from ai_leads ``registry.py``).
+"""Reference-resolution mini-language.
 
 The dispatcher resolves a node's ``inputs`` (and ``skip_if`` predicates,
 ``choose_one``/``pick_perspective`` sources) against the run context using a
@@ -24,10 +24,10 @@ def resolve_ref(value: Any, context: dict) -> Any:
 
         {"$value": 42}                       → 42
         {"$from": "parcel.lat"}              → context["parcel"]["lat"]
-        {"$from": "svinfer.primary_file"}    → context["svinfer"]["primary_file"]
-        {"$from": "svinfer.files",           → filter array items
+        {"$from": "detect.primary_file"}     → context["detect"]["primary_file"]
+        {"$from": "detect.files",            → filter array items
          "$filter": {"kind:eq": "image",
-                     "rel_path:matches": "annotated_pano_\\d+"}}
+                     "rel_path:matches": "view_\\d+"}}
         {"$from": "turnout.path",            → True if context["turnout"]["path"] == "rotate"
          "$eq": "rotate"}
         {"$from": "turnout.path",            → True if context["turnout"]["path"] != "direct"
@@ -99,7 +99,7 @@ def _coalesce(value: dict, context: dict) -> Any:
 
 
 def _dig(obj: Any, dotted_path: str) -> Any:
-    """Walk a dotted path like ``svinfer.summary.top_score``.
+    """Walk a dotted path like ``detect.summary.top_score``.
 
     Each path segment looks up either a dict key or a dataclass attr.
     Empty/missing segments raise KeyError.

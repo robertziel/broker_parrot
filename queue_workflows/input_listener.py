@@ -1,6 +1,6 @@
 """Poller for user input submissions.
 
-Rails inserts a row into ``workflow_input_submissions`` with
+The host app inserts a row into ``workflow_input_submissions`` with
 ``status='pending'`` when the user submits a value for an ``awaiting_input``
 node. This daemon thread polls that table every ``POLL_INTERVAL_S`` seconds and
 for each pending row:
@@ -13,7 +13,7 @@ for each pending row:
 3. On exception, flips the row to ``status='failed'`` with the error text so an
    operator can see why.
 
-Durable by design: if the poller is down when Rails INSERTs, the row sits in
+Durable by design: if the poller is down when the host app INSERTs, the row sits in
 the table until the poller comes up. No notifications are lost.
 """
 

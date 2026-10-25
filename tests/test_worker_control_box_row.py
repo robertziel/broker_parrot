@@ -1,6 +1,6 @@
 """A BOX-ADDRESSED control row: ``(<box>, queue)`` governs ``<box>-<lane>`` workers.
 
-THE INCIDENT THIS PINS. Deployments label per-lane workers ``<box>-<lane>``
+WHY THIS EXISTS. Deployments label per-lane workers ``<box>-<lane>``
 (``box-c-gpu``), but an operator UI parks a *machine*: it wrote
 ``worker_controls (host_label='box-c', queue='gpu', desired_state='off')`` — keyed by
 the bare box name. The worker's control lookup matched only its exact label, found no

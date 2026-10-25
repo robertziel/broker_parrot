@@ -49,7 +49,7 @@ def _write_scope(root: Path, cid: str, usage_usec: int, mem_bytes: int) -> None:
 
 
 def _make(tmp: Path, *, ncpu: int = 4) -> CgroupAttribution:
-    return CgroupAttribution(cgroup_root=str(tmp), name_prefix="ai_leads-", ncpu=ncpu)
+    return CgroupAttribution(cgroup_root=str(tmp), name_prefix="myapp-", ncpu=ncpu)
 
 
 def test_returns_none_when_cgroup_root_missing(tmp_path):
@@ -60,7 +60,7 @@ def test_returns_none_when_cgroup_root_missing(tmp_path):
 def test_first_call_has_ram_but_no_cpu_baseline(tmp_path):
     _write_scope(tmp_path, "abc123", usage_usec=1_000_000, mem_bytes=128 * 1024 * 1024)
     a = _make(tmp_path)
-    a._docker = _FakeDocker([_FakeContainer("abc123", "ai_leads-workers-1")])
+    a._docker = _FakeDocker([_FakeContainer("abc123", "myapp-workers-1")])
 
     out = a.sample()
     assert out is not None
@@ -71,7 +71,7 @@ def test_first_call_has_ram_but_no_cpu_baseline(tmp_path):
 def test_second_call_computes_cpu_delta(tmp_path, monkeypatch):
     _write_scope(tmp_path, "abc123", usage_usec=0, mem_bytes=64 * 1024 * 1024)
     a = _make(tmp_path, ncpu=4)
-    a._docker = _FakeDocker([_FakeContainer("abc123", "ai_leads-workers-1")])
+    a._docker = _FakeDocker([_FakeContainer("abc123", "myapp-workers-1")])
 
     import queue_workflows.cgroup_attribution as mod
     times = iter([100.0, 101.0])
@@ -87,7 +87,7 @@ def test_second_call_computes_cpu_delta(tmp_path, monkeypatch):
 def test_idle_container_reads_as_zero_percent(tmp_path, monkeypatch):
     _write_scope(tmp_path, "abc123", usage_usec=42, mem_bytes=8 * 1024 * 1024)
     a = _make(tmp_path, ncpu=4)
-    a._docker = _FakeDocker([_FakeContainer("abc123", "ai_leads-workers-1")])
+    a._docker = _FakeDocker([_FakeContainer("abc123", "myapp-workers-1")])
 
     import queue_workflows.cgroup_attribution as mod
     times = iter([100.0, 101.0])
@@ -104,8 +104,8 @@ def test_ram_sums_across_multiple_containers(tmp_path):
     _write_scope(tmp_path, "bbb", usage_usec=0, mem_bytes=250 * 1024 * 1024)
     a = _make(tmp_path)
     a._docker = _FakeDocker([
-        _FakeContainer("aaa", "ai_leads-workers-1"),
-        _FakeContainer("bbb", "ai_leads-rails-1"),
+        _FakeContainer("aaa", "myapp-workers-1"),
+        _FakeContainer("bbb", "myapp-rails-1"),
     ])
     out = a.sample()
     assert out is not None
@@ -119,7 +119,7 @@ def test_foreign_containers_excluded_by_prefix(tmp_path):
     _write_scope(tmp_path, "theirs", usage_usec=0, mem_bytes=2_000 * 1024 * 1024)
     a = _make(tmp_path)
     a._docker = _FakeDocker([
-        _FakeContainer("ours", "ai_leads-workers-1"),
+        _FakeContainer("ours", "myapp-workers-1"),
         _FakeContainer("theirs", "otherapp-prep-1"),
     ])
     out = a.sample()
@@ -129,7 +129,7 @@ def test_foreign_containers_excluded_by_prefix(tmp_path):
 
 def test_missing_scope_dir_does_not_crash(tmp_path):
     a = _make(tmp_path)
-    a._docker = _FakeDocker([_FakeContainer("ghost", "ai_leads-workers-1")])
+    a._docker = _FakeDocker([_FakeContainer("ghost", "myapp-workers-1")])
     out = a.sample()
     assert out is not None
     assert out["ram_used_mb"] == 0
@@ -235,8 +235,16 @@ def test_returns_none_when_docker_socket_unavailable(tmp_path, monkeypatch):
 
 def test_default_prefix_comes_from_config(monkeypatch):
     """When no explicit name_prefix is passed, the default reads
-    config.container_prefix (the configurable seam, plan §1f/§2c)."""
+    config.container_prefix (the configurable seam)."""
     import queue_workflows
     queue_workflows.configure(container_prefix="myproj-")
     a = CgroupAttribution(cgroup_root="/nonexistent")
     assert a._prefix == "myproj-"
+
+
+def test_no_prefix_configured_means_no_attribution(tmp_path):
+    """No default prefix: an empty one must not count every container as ours."""
+    _write_scope(tmp_path, "abc123", 1_000_000, 64 * 1024 * 1024)
+    a = CgroupAttribution(cgroup_root=str(tmp_path), name_prefix="", ncpu=4)
+    a._docker = _FakeDocker([_FakeContainer("abc123", "anything-1")])
+    assert a.sample() is None

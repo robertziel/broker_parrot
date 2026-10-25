@@ -123,8 +123,8 @@ def test_required_models_survives_the_SCHEMA_to_NODE_bridge():
     """The seam a first wiring test missed by building the node dict BY HAND.
 
     `_nodes_of` is an explicit per-field copy, not a passthrough: a schema key absent from
-    that list is dropped silently. Measured live — llm_chat declared `required_models`, the
-    orchestrator loaded the schema WITH it, and every enqueued row still had NULL. Testing
+    that list is dropped silently. The failure mode: llm_chat declares `required_models`, the
+    orchestrator loads the schema WITH it, and every enqueued row still has NULL. Testing
     `_enqueue` with a hand-built node proved only that `_enqueue` works; it could not see
     the bridge that feeds it.
     """

@@ -29,7 +29,7 @@ module's GPU idle reaper so the two read the same:
     (running + nothing in flight + idle ≥ ttl; ttl<=0 disables);
   * :meth:`LLMSupervisor.reap_idle_once` is one tick of the reaper;
   * :meth:`_loop` polls on the same ``max(5, min(60, ttl/5))`` cadence;
-  * :meth:`start` gates on :attr:`_enabled` (the ``AI_LEADS_DISABLE_LLM_SUPERVISOR``
+  * :meth:`start` gates on :attr:`_enabled` (the ``QUEUE_WORKFLOWS_DISABLE_LLM_SUPERVISOR``
     env kill-switch, plus the vllm-only / positive-ttl conditions).
 
 The daemon-thread plumbing (``start`` / ``stop`` / ``threading.Event`` /
@@ -61,10 +61,10 @@ DEFAULT_SUPERVISOR_POLL_CEIL_S = 60.0
 #: every other type the supervisor is inert (see :attr:`LLMSupervisor._enabled`).
 _VLLM = "vllm"
 
-#: Env kill-switch (matches the engine's other ``AI_LEADS_DISABLE_*`` gates,
-#: byte-compatible with ai_leads' conftest). Set ⇒ the supervisor stays inert and
+#: Env kill-switch (matches the engine's other ``QUEUE_WORKFLOWS_DISABLE_*`` gates,
+#: e.g. a host's test conftest). Set ⇒ the supervisor stays inert and
 #: ``start()`` spawns no thread, regardless of backend.
-DISABLE_ENV = "AI_LEADS_DISABLE_LLM_SUPERVISOR"
+DISABLE_ENV = "QUEUE_WORKFLOWS_DISABLE_LLM_SUPERVISOR"
 
 
 def vllm_should_stop(

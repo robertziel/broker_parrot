@@ -25,7 +25,7 @@ and deliberately **not** the per-project `host_label` (`box-b-gpu`), so one cons
 covers every project/lane on that machine.
 
 > **Requirement:** for placement to bind, workers on the box must agree on the name — set
-> `QUEUE_WORKFLOWS_GPU_BOX_ID` (the fleet already does this for the box lease:
+> `QUEUE_WORKFLOWS_GPU_BOX_ID` (the same name the box lease uses, e.g.
 > `box-a` / `box-b` / `box-c`). A worker that resolves **no** box name claims **only
 > unconstrained** jobs — the safe default (it can't verify a constraint it can't name).
 

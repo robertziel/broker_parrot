@@ -14,7 +14,7 @@ not as an afterthought. Contracts pinned here:
     others only up to the remainder;
   * a job wider than the whole lane runs ALONE rather than starving forever
     (the weight is clamped to the lane width for the fit test);
-  * a serial worker (``threads=1``, the default and the whole fleet today) is
+  * a serial worker (``threads=1``, the default) is
     completely unaffected — it runs one job at a time, so exclusivity is already
     total and every ``cpu_slots`` value is claimable;
   * the weight is released on every path, exactly like a plain slot.
@@ -154,7 +154,7 @@ def test_the_dispatcher_carries_cpu_slots_from_the_node_spec():
 def test_a_serial_worker_ignores_cpu_slots_entirely():
     """THE compatibility contract. A threads=1 worker runs one job at a time, so
     it already gives that job the whole process — a cpu_slots=8 job must run
-    there unchanged. The whole fleet is threads=1 today; if this breaks, weighted
+    there unchanged. Most deployments run threads=1; if this breaks, weighted
     rows become permanently unclaimable in production."""
     run_id = _make_run()
     ran = {}

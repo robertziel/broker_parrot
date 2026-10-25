@@ -169,14 +169,14 @@ def test_dispatcher_reads_server_types_off_the_node_spec(monkeypatch):
 
 
 def test_remote_served_row_is_claimable_even_if_its_module_is_NOT_pool_listed():
-    """REGRESSION (audit D1). The inline lane refuses every remote-served row, so if
+    """REGRESSION. The inline lane refuses every remote-served row, so if
     the pool lane ALSO demanded pool_modules membership, a remote-served row whose
     module is not listed would be claimable by NEITHER lane — queued forever, silently.
 
-    a second consumer hit this for real: `plan_reel_segments` carries chat-model-a (so it gets a
+    A real shape: a node like `plan_gen_segments` carries chat-model-a (so it gets a
     server preference stamped) but is not in vlm_pool_node_modules."""
     jid = _queue("n", server_types=["ollama"], required_model="chat-model-a:latest",
-                 node_module="plan_reel_segments")          # deliberately NOT in POOL
+                 node_module="plan_gen_segments")          # deliberately NOT in POOL
 
     inline = node_queue.claim_next_gpu_job(
         0, "chat-model-a:latest", host="h-gpu", served_types=["ollama"],
@@ -194,7 +194,7 @@ def test_remote_served_row_is_claimable_even_if_its_module_is_NOT_pool_listed():
 def test_no_model_job_outside_pool_modules_is_still_inline_only():
     """The counterpart: pool_modules still gates NO-MODEL jobs, so heavy in-process
     GPU work keeps running serially on the inline lane."""
-    jid = _queue("n", node_module="heavy_eraser")           # no model, not pool-listed
+    jid = _queue("n", node_module="heavy_job")           # no model, not pool-listed
     pool = node_queue.claim_next_gpu_job(
         0, None, host="h-gpu", require_model=False, pool_modules=POOL,
     )

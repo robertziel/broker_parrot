@@ -34,7 +34,7 @@
 -- emits, once, when it first flags a node — joins the existing 0011 timeline).
 --
 -- Additive + idempotent (IF NOT EXISTS / drop-then-add the CHECK) so re-running
--- on the live ai_leads DB is a safe no-op.
+-- on a live DB is a safe no-op.
 
 ALTER TABLE worker_heartbeats
     ADD COLUMN IF NOT EXISTS vram_total_mb INTEGER;

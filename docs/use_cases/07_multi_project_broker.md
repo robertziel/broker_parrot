@@ -30,15 +30,5 @@ exact-match, the instant a running deploy switches to
 name on a **drained** queue, or backfill in the same maintenance window
 (`UPDATE workflow_node_jobs SET project='alpha' WHERE project='' …`).
 
-## Scaling up: the pull→grant broker service
-
-Tag-pooling keeps each client autonomous (it claims for itself). The
-**broker service** goes further: workers *ask permission*
-(`POST /api/ask`) and the broker grants work, arbitrates shared CPU/GPU
-capacity across projects, and can revoke a grant at will — with a bundled
-operator panel (`queue-broker-web`):
-
-![queue-broker-web panel](../images/broker-web-panel.png)
-
-The full model, API, and cutover checklist:
+The full model and cutover checklist:
 [`../broker.md`](../broker.md) and [`../deployment.md`](../deployment.md).

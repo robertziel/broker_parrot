@@ -7,7 +7,7 @@
 -- computes it at startup and re-advertises every ~10 s.
 --
 -- WHY it matters. vllm here is the CUDA ``vllm/vllm-openai`` sidecar — it runs
--- ONLY on the NVIDIA box-c hubs, never on the AMD/ROCm control box (host-c). The
+-- ONLY on NVIDIA hosts, never on an AMD/ROCm control host. The
 -- queue UI reads this list to gate its per-machine server-type control: a host
 -- that can't run vllm shows the vllm option DISABLED, so an operator can't toggle
 -- a machine onto a server it has no sidecar for (which would route every VLM

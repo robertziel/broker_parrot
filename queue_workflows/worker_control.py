@@ -1,7 +1,7 @@
 """Worker ON/OFF control — durable desired-state per ``(host_label, queue)`` plus
 the worker-side watcher that enforces it.
 
-An operator (or a host UI such as ai_leads' Rails, which shares the same Postgres)
+An operator (or a host's own UI, e.g. a web app, which shares the same Postgres)
 turns a machine's cpu / gpu / ingest worker ON or OFF by writing a ``worker_controls``
 row (migration 0012). This module owns:
 
@@ -10,10 +10,10 @@ row (migration 0012). This module owns:
     so a non-Python consumer can write the same row directly + let the row trigger
     fire the wake NOTIFY);
   * the **stop-policy registry** :data:`STOP_POLICIES` — the extensibility seam.
-    Only ``"hard"`` is implemented today (kill in-flight work + free RAM now);
-    ``"drain"`` (finish current task, then stop) and ``"pause"`` (stop claiming,
-    keep the model warm) are reserved names that slot in later as additional
-    handlers with NO schema/API change;
+    ``"hard"`` (kill in-flight work + free RAM now) and ``"drain"`` (finish the
+    current task, then park) are implemented; ``"pause"`` (stop claiming, keep
+    the model warm) is a reserved name that slots in later as an additional
+    handler with NO schema/API change;
   * the **worker-side watcher** :class:`WorkerControlWatcher` — a daemon thread,
     modelled on :class:`queue_workflows.claim_worker.JobStatusWatcher`, that
     LISTENs ``worker_control`` (+ a safety poll) and, on observing OFF, dispatches
@@ -559,7 +559,7 @@ class WorkerControlWatcher:
     safety poll (catches a dropped NOTIFY and a row written before this worker
     booted). On OFF it dispatches the row's ``stop_policy`` through
     :data:`STOP_POLICIES`. ``on_exit`` is injectable so tests assert the trip
-    without killing the test process; honours ``AI_LEADS_DISABLE_WORKER_CONTROL``
+    without killing the test process; honours ``QUEUE_WORKFLOWS_DISABLE_WORKER_CONTROL``
     (tests) to stay inert.
 
     Runs ONLY while the worker is in its claiming state (started after the boot
@@ -677,7 +677,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--host", default=None,
-        help="host_label (default: this host's AI_LEADS_HOST_LABEL / hostname)",
+        help="host_label (default: this host's QUEUE_WORKFLOWS_HOST_LABEL / hostname)",
     )
     parser.add_argument(
         "--queue", required=True,

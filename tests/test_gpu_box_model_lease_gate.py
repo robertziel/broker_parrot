@@ -426,14 +426,14 @@ def _heartbeat(occupant=None, model=None):
         occupant_fn=(lambda: occupant))
 
 
-def test_the_gauge_names_a_self_managing_occupant():
-    """The panel used to show the LLM's model "in use" while a Blender render
-    held the card; with the slot fixed it would have shown NULL — an idle box
-    doing minutes of GPU work. The gauge now says what actually holds the card."""
+def test_the_gauge_does_not_name_a_self_managing_occupant_as_a_MODEL():
+    """``current_model`` names a MODEL. A self-managing occupant (e.g. a Blender
+    render holding the card) is a running job, not a model, so the gauge reads None
+    for it; the box still does not look idle, because its running job row says so."""
     from queue_workflows.gpu_model_lease import self_managed_slot
 
     hb = _heartbeat(occupant=self_managed_slot("render_blender_reel"))
-    assert hb._current_model() == "GPU job: render_blender_reel"
+    assert hb._current_model() is None
 
 
 def test_a_real_in_process_model_still_wins_the_gauge():
@@ -448,3 +448,130 @@ def test_the_llm_slot_stays_null_so_the_server_is_not_double_reported():
 
     assert _heartbeat(occupant=LLM_SERVER_SLOT)._current_model() is None
     assert _heartbeat(occupant=None)._current_model() is None
+
+
+# ── a box that serves BOTH: the slot follows the JOB, not the box ─────────────
+#
+# Seen on a box that serves ComfyUI (a configured URL) AND the
+# LLM lanes, which the rule above never anticipated: every no-model job on such a box
+# took COMFYUI_SERVER_SLOT — including `system.vllm_lease` and every LLM dispatch. Two
+# consequences, and the second is the serious one:
+#
+#   * the panel showed "ComfyUI render" as the occupant beside vLLM's real model and
+#     raised "⚠ 2 models resident — one GPU, contending for VRAM" while ComfyUI's queue
+#     was empty and nvidia-smi showed one process;
+#   * sharing one slot means NOT excluding: an LLM dispatch and a real ComfyUI render
+#     both keyed to COMFYUI_SERVER_SLOT and the lease granted BOTH — two models on one
+#     card, which is the very thing this lease exists to prevent.
+#
+# A job that resolves to an LLM server IS the LLM server's occupant, whatever else the
+# box can serve.
+
+
+def test_an_llm_job_takes_the_llm_slot_on_a_box_that_also_serves_comfyui():
+    get_config().comfyui_url = "http://box:8188"
+    w = _worker()
+    assert w._effective_gpu_model({"server_types": ["vllm"]}) == LLM_SERVER_SLOT
+    assert w._effective_gpu_model({"server_types": ["ollama", "vllm"]}) == LLM_SERVER_SLOT
+    assert w._effective_gpu_model({"resolved_server": "ollama"}) == LLM_SERVER_SLOT
+    assert w._effective_gpu_model({"resolved_server": "vllm", "server_types": []}) == LLM_SERVER_SLOT
+
+
+def test_a_job_with_no_server_of_its_own_is_still_the_boxs_kind():
+    get_config().comfyui_url = "http://box:8188"
+    w = _worker()
+    assert w._effective_gpu_model({"required_model": None}) == COMFYUI_SERVER_SLOT
+    assert w._effective_gpu_model({"server_types": []}) == COMFYUI_SERVER_SLOT
+    assert w._effective_gpu_model({"server_types": None, "resolved_server": None}) == COMFYUI_SERVER_SLOT
+
+
+def test_a_real_model_and_a_self_managing_module_still_win_over_the_server_kind():
+    get_config().comfyui_url = "http://box:8188"
+    w = _worker()
+    assert w._effective_gpu_model({"required_model": "sdxl", "server_types": ["vllm"]}) == "sdxl"
+    get_config().gpu_self_load_node_modules = frozenset({"render.blender"})
+    assert w._effective_gpu_model(
+        {"node_module": "render.blender", "server_types": ["ollama"]}).startswith("__gpu__:")
+
+
+def test_an_unknown_server_kind_is_not_treated_as_the_llm_server():
+    get_config().comfyui_url = "http://box:8188"
+    assert _worker()._effective_gpu_model({"server_types": ["tgi"]}) == COMFYUI_SERVER_SLOT
+
+
+def test_an_llm_job_and_a_comfyui_render_exclude_each_other_on_one_such_box(monkeypatch, tmp_path):
+    """The co-residency the mislabelling allowed: both were 'ComfyUI render', so the
+    lease saw one occupant and let both on. The vLLM lease job and a render must not
+    share a card."""
+    get_config().comfyui_url = "http://box:8188"
+    monkeypatch.setattr(claim_worker.node_queue, "requeue_job_for_retry", lambda jid: None)
+    llm = _worker(host="box-b-gpu", lease=_file_lease(tmp_path, "llm:1"))
+    render = _worker(host="box-b-gpu", lease=_file_lease(tmp_path, "render:1"))
+    assert llm._acquire_box_or_spill(
+        {"id": "lease", "required_model": None, "server_types": ["vllm"]}) is True
+    assert render._acquire_box_or_spill({"id": "render", "required_model": None}) is False
+
+
+# ── current_model carries a MODEL, or nothing ────────────────────────────────
+#
+# Seen in an operator panel: the second "model" is not a model, and showing it
+# makes no sense. The box card showed
+#
+#     MODEL chat-model-a:latest      18 GB · in use
+#     MODEL GPU job: render_job         content_app/gpu
+#     ⚠ 2 models resident — one GPU, contending for VRAM
+#
+# The second row is a LEASE SLOT rendered for humans and published in
+# `worker_heartbeats.current_model`. The LLM slot was already excluded there, with the
+# right reason — "the server's OWN model reporting already covers it, and 'LLM server'
+# beside 'chat-model-a:latest' would double-report one occupant" — and that reason
+# applies to every sentinel: a ComfyUI render and a self-managing node are OCCUPANCY,
+# not models. A field named current_model carries a model id or NULL; what the box is
+# doing is already on the card, one section down, as its running jobs.
+
+
+def _emitter(occupant, model=None):
+    class _Cache:
+        current_model = model
+    return claim_worker.HeartbeatEmitter(
+        host_label="box-b-gpu", queue="gpu", model_cache=(_Cache() if model else None),
+        occupant_fn=lambda: occupant)
+
+
+def test_a_real_model_on_the_card_is_reported():
+    from queue_workflows.gpu_model_lease import self_managed_slot
+
+    assert _emitter(None, model="sdxl")._current_model() == "sdxl"
+    assert _emitter("sdxl")._current_model() == "sdxl", "a model id is a model, slot or not"
+    assert _emitter(self_managed_slot("render.blender"), model="sdxl")._current_model() == "sdxl"
+
+
+@pytest.mark.parametrize("slot", [
+    LLM_SERVER_SLOT,
+    COMFYUI_SERVER_SLOT,
+    "__gpu__:render_job",
+    "__gpu__:render_blender",
+])
+def test_a_sentinel_slot_is_not_a_model_and_is_not_published(slot):
+    assert _emitter(slot)._current_model() is None
+
+
+def test_an_idle_gpu_box_and_every_cpu_box_report_nothing():
+    assert _emitter(None)._current_model() is None
+    e = claim_worker.HeartbeatEmitter(host_label="box-a-cpu", queue="cpu",
+                                      occupant_fn=lambda: "sdxl")
+    assert e._current_model() is None
+
+
+def test_every_sentinel_follows_the_convention_the_predicate_tests():
+    """The predicate matches SHAPE (``__name__`` / ``__gpu__:<module>``) rather than a
+    list somebody must remember to extend. That only works while every sentinel keeps
+    the shape — so each one is pinned here, and a rename that breaks it fails loudly."""
+    from queue_workflows import claim_worker as cw
+    from queue_workflows import gpu_model_lease as gl
+
+    for slot in (gl.LLM_SERVER_SLOT, gl.COMFYUI_SERVER_SLOT, cw.SWITCH_SLOT,
+                 gl.self_managed_slot("render_blender_reel")):
+        assert gl.is_sentinel_slot(slot), slot
+    for model in ("chat-model-a:latest", "sdxl", "chat-expert-a", "chat-model-a:v2", None, ""):
+        assert not gl.is_sentinel_slot(model), model

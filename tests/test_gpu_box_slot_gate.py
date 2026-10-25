@@ -2,9 +2,8 @@
 
 THE DUPLICATE-JOBS FAILURE THIS ENDS. A GPU box's concurrency was guarded by
 in-process counters spread across two lanes (`_pool_inflight`, `_inline_running`)
-— independent callbacks that must all agree. They didn't: every box in the fleet
-was observed running 2 concurrent GPU jobs against an advertised capacity of 1
-(panel `NODE JOBS ⚠ 2/1`). Counter drift, a thread dying without finalizing its
+— independent callbacks that must all agree. They didn't: a box could run 2
+concurrent GPU jobs against an advertised capacity of 1. Counter drift, a thread dying without finalizing its
 row, or a second worker process all slip past process-local accounting, because
 the accounting isn't where the truth is.
 

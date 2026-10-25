@@ -33,7 +33,7 @@ worker_controls(
 
 ## The NOTIFY trigger
 
-A row trigger fires `pg_notify('worker_control', '<host>:<queue>')` on every INSERT/UPDATE, riding the writer's own transaction — there's no "row written, no wake" window. This is the same shape as the `node_job_ready` / `ingest_job_ready` triggers from migrations 0006/0007: because the wake is DB-native, **any** process that can write a row wakes the worker, with zero app-side NOTIFY code. A host Rails app sharing the Postgres instance can flip a worker off with a raw `INSERT … ON CONFLICT`.
+A row trigger fires `pg_notify('worker_control', '<host>:<queue>')` on every INSERT/UPDATE, riding the writer's own transaction — there's no "row written, no wake" window. This is the same shape as the `node_job_ready` / `ingest_job_ready` triggers from migrations 0006/0007: because the wake is DB-native, **any** process that can write a row wakes the worker, with zero app-side NOTIFY code. A host app sharing the Postgres instance can flip a worker off with a raw `INSERT … ON CONFLICT`.
 
 The NOTIFY payload is deliberately just `host:queue` — no project segment, even after 0019 added the tenant column. Both the watcher and the boot park-gate re-read their own `(host, queue, project)` row on any wake rather than trusting the payload, so adding a tenant term would buy nothing; it would only break the pinned two-field payload for any external listener. The cost on a shared broker is a spurious wake when another tenant's row changes — the re-read is correct either way.
 
@@ -46,12 +46,13 @@ A **second**, separate trigger (migration 0013) fires `pg_notify('worker_llm_con
 On seeing `desired_state = 'off'` it looks up the row's `stop_policy` in the `STOP_POLICIES` registry and dispatches to the handler:
 
 ```python
-STOP_POLICIES: dict[str, Callable[..., None]] = {
+STOP_POLICIES: dict[str, Callable[..., Any]] = {
     "hard": _apply_hard_stop,
+    "drain": _apply_drain_stop,
 }
 ```
 
-Only `"hard"` exists today. `"drain"` (finish the current job, then park) and `"pause"` (stop claiming, keep the model warm) are **reserved names** — the column exists to receive them later. That's exactly why `stop_policy` is free-form `TEXT` in the schema rather than a `CHECK`-constrained enum: a new policy is a new Python handler registered in `STOP_POLICIES`, no migration required. `set_worker_control` validates a requested policy against the registry *before* writing (fail-before-write); if a row somehow carries an unregistered policy, the watcher logs an error and falls back to `hard` rather than doing nothing.
+Two policies are implemented: `"hard"` (below) and `"drain"` — the worker finishes its in-flight job, then parks at the next claim-loop boundary; nothing is killed, and the watcher stays armed so a slow drain can be escalated to `hard`. `"pause"` (stop claiming, keep the model warm) is a **reserved name** — the column exists to receive it later. That's exactly why `stop_policy` is free-form `TEXT` in the schema rather than a `CHECK`-constrained enum: a new policy is a new Python handler registered in `STOP_POLICIES`, no migration required. `set_worker_control` validates a requested policy against the registry *before* writing (fail-before-write); if a row somehow carries an unregistered policy, the watcher logs an error and falls back to `hard` rather than doing nothing.
 
 ## Hard stop = process exit (`os._exit(79)`)
 
@@ -67,9 +68,9 @@ The re-queue is wrapped so a failure there can't block the exit: if it raises, t
 
 ## Restart / park-on-boot
 
-`os._exit` is a **non-zero** exit specifically so the container's `restart: on-failure` policy brings it back. On boot, before doing anything else, the claim worker calls `_park_until_enabled()`: it re-reads `worker_controls` and, if still OFF, parks — sits idle, does not claim, does not heartbeat (so it ages out of the capacity gauge) — while it `LISTEN`s the same `worker_control` channel plus a safety poll for the eventual ON. There is no in-process running→parked transition: a running worker that gets turned off always hard-exits, and parking only ever happens at this one boot gate.
+`os._exit` is a **non-zero** exit specifically so the container's `restart: on-failure` policy brings it back. On boot, before doing anything else, the claim worker calls `_park_until_enabled()`: it re-reads `worker_controls` and, if still OFF, parks — sits idle, does not claim, does not heartbeat (so it ages out of the capacity gauge) — while it `LISTEN`s the same `worker_control` channel plus a safety poll for the eventual ON. Under `hard`, a running worker that gets turned off always hard-exits and parks at this boot gate; `drain` is the one in-process running→parked path (the claim loop stops claiming once the in-flight job finishes).
 
-**The park watchdog — parked kills the box's LLM servers** (operator rule; supersedes the activity-guarded quiesce). A parked **gpu** worker does not merely stop claiming — every wait iteration it ticks `ParkQuiesce` (`llm_idle_unload.py`), which kills broker-managed LLM service **on sight, unconditionally**: a serving vLLM is stopped immediately — mid-request included — with the host's real `docker stop` (which `restart: unless-stopped` respects), and every loaded ollama **model** is unloaded (`keep_alive: 0`; the daemon itself survives as shared box infra). Every resurrection — the restart policy relaunching a self-exited container, or an out-of-band `docker run` — is re-killed on the next tick. Both softer designs failed live: with no quiesce, a crash-looping sidecar re-loaded 65 GB mid-park with nothing able to stop it; with activity-guarded stopping, **remote** traffic (another box POSTing completions over the fast iface) kept a parked box serving at 96 % GPU indefinitely — a busy-exemption means anyone outside the box can keep it un-parked. Parked now means *no LLM service here*: remote callers get connection-refused, which is the pressure that fails them over to an ON box. The watchdog has **no start lever and reads no queue depth**; non-gpu lanes never touch the card; the shared `QUEUE_WORKFLOWS_DISABLE_GPU_IDLE_REAPER` kill-switch silences it. The running worker's demand-driven stopper keeps the mirror-image guard: a `may_start_fn` control-state gate (fail-open) so a worker whose row just went OFF cannot ignite a multi-minute server start on its way into the park.
+**The park watchdog — parked kills the box's LLM servers** (design rule; supersedes the activity-guarded quiesce). A parked **gpu** worker does not merely stop claiming — every wait iteration it ticks `ParkQuiesce` (`llm_idle_unload.py`), which kills broker-managed LLM service **on sight, unconditionally**: a serving vLLM is stopped immediately — mid-request included — with the host's real `docker stop` (which `restart: unless-stopped` respects), and every loaded ollama **model** is unloaded (`keep_alive: 0`; the daemon itself survives as shared box infra). Every resurrection — the restart policy relaunching a self-exited container, or an out-of-band `docker run` — is re-killed on the next tick. Both softer designs fail in practice: with no quiesce, a crash-looping sidecar reloads a large model mid-park with nothing able to stop it; with activity-guarded stopping, **remote** traffic (another box POSTing completions to this one) keeps a parked box serving at full GPU indefinitely — a busy-exemption means anyone outside the box can keep it un-parked. Parked now means *no LLM service here*: remote callers get connection-refused, which is the pressure that fails them over to an ON box. The watchdog has **no start lever and reads no queue depth**; non-gpu lanes never touch the card; the shared `QUEUE_WORKFLOWS_DISABLE_GPU_IDLE_REAPER` kill-switch silences it. The running worker's demand-driven stopper keeps the mirror-image guard: a `may_start_fn` control-state gate (fail-open) so a worker whose row just went OFF cannot ignite a multi-minute server start on its way into the park.
 
 ```
 operator/CLI/host UI ── INSERT/UPDATE worker_controls(off) ──► trigger ── NOTIFY 'worker_control' ──┐
@@ -99,10 +100,10 @@ queue-worker-control --queue=gpu --off [--host HOST] [--policy hard] [--requeste
 queue-worker-control --queue=gpu --on  [--host HOST]                 [--requested-by WHO] [--project PROJECT]
 ```
 
-- `--queue` is required: `cpu` | `gpu` | any configured ingest queue.
+- `--queue` is required: `cpu` | `gpu` | `download` | any configured ingest queue.
 - `--host` defaults to `QUEUE_WORKFLOWS_HOST_LABEL` (or the host-label env configured via `configure(host_label_env=...)`), falling back to `socket.gethostname()`.
 - `--project` defaults to this process's configured `project` (`configure(project=...)` / `QUEUE_WORKFLOWS_PROJECT`); on a shared broker this is what keeps an OFF scoped to the right tenant.
-- `--policy` defaults to `hard` (the only implemented policy today).
+- `--policy` defaults to `hard`; `drain` is the other registered policy.
 
 Equivalent Python:
 
@@ -131,10 +132,10 @@ ON CONFLICT (host_label, queue, project) DO UPDATE
 
 ## Related config on the same table
 
-Migration 0013 added **per-machine LLM server config** (`llm_server_type`, `llm_parallelism`, `vllm_idle_ttl_s`) to `worker_controls` — same `(host_label, queue, project)` key, same operator/Rails write path, but a *soft* config change (never touches `desired_state`/`stop_policy`, never stops a running worker) delivered over its own NOTIFY channel. See [gpu_and_llm.md](gpu_and_llm.md).
+Migration 0013 added **per-machine LLM server config** (`llm_server_type`, `llm_parallelism`, `vllm_idle_ttl_s`) to `worker_controls` — same `(host_label, queue, project)` key, same operator/host-app write path, but a *soft* config change (never touches `desired_state`/`stop_policy`, never stops a running worker) delivered over its own NOTIFY channel. See [gpu_and_llm.md](gpu_and_llm.md).
 
 Migration 0019 added the `project` column and re-keyed the primary key to `(host_label, queue, project)` for multi-tenant broker deploys — see [schema](schema.md) for the full migration chain and the tenant-pooling model.
 
 ## Residual gap
 
-A hang that holds the GIL freezes the watcher thread along with everything else, so the in-process `os._exit` can't fire. The backstop for that case is a host-local agent with a docker socket that force-kills the container when it observes `worker_controls.desired_state = 'off'` going unacknowledged for too long — the engine itself has no cross-host kill capability. That agent is future hardening, not part of this milestone.
+A hang that holds the GIL freezes the watcher thread along with everything else, so the in-process `os._exit` can't fire. The backstop for that case is the per-box supervisor `queue-box-agent` (`queue_workflows/box_agent.py`): it runs each lane as its own child process, reconciles them to `worker_controls`, and stops a lane whose row is `off` from outside the wedged process (SIGTERM, then SIGKILL after a 30 s grace). It acts only on its own box — the engine has no cross-host kill capability.

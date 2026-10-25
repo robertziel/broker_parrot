@@ -1,6 +1,6 @@
 """A server-served model must not go through the IN-PROCESS load gate.
 
-The failure this closes, measured on a live fleet:
+The failure this closes, as observed in a real deployment:
 
     node   llm_chat/llm_chat   required_model chat-expert-a   resolved_server inprocess
     error  MODEL LOAD BLOCKED on box-c-gpu: cleared the box for 'chat-expert-a' (inprocess)
@@ -9,8 +9,8 @@ The failure this closes, measured on a live fleet:
 `chat-expert-a` is served by ollama. Its ModelSpec is a SENTINEL whose loader returns the id and
 puts nothing in VRAM. Running the clear-then-load gate for it evicted the very ollama copy the
 node was about to call, and then refused the load because the survivor was reported under its
-full tag while the load asked for the bare one. 482 `chat-model-a:latest` failures on that fleet
-share the shape.
+full tag while the load asked for the bare one. Hundreds of `chat-model-a:latest` failures
+shared the shape.
 """
 from __future__ import annotations
 

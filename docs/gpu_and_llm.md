@@ -1,15 +1,13 @@
 # 🎮 GPU model management & LLM backends
 
-*How the GPU claim worker keeps one model warm, how a GPU fleet shares pooled work, how per-machine ollama/vLLM servers are wired, and the design for a broker-managed k8s LLM tier.*
+*How the GPU claim worker keeps one model warm and how per-machine ollama/vLLM servers are wired.*
 
-This doc consolidates the former `gpu_pool.md`, `llm_backends.md`, and `broker_k8s_llm.md` into one place, since all three sit on the same physical resource — the GPU — and interact (a diffusion model, a pooled task, and a co-tenant LLM server all compete for the same VRAM on a box).
+This doc covers the GPU in one place, since the warm cache and the LLM servers sit on the same physical resource — the GPU — and interact (a diffusion model and a co-tenant LLM server compete for the same VRAM on a box).
 
 ## Contents
 
 1. [The GPU warm-model cache & routing](#1-the-gpu-warm-model-cache--routing)
-2. [The shared GPU pool (pivot B)](#2-the-shared-gpu-pool-pivot-b)
-3. [LLM backends: per-machine ollama / vLLM + idle supervisor](#3-llm-backends-per-machine-ollama--vllm--idle-supervisor)
-4. [Broker-managed LLM on Kubernetes (design)](#4-broker-managed-llm-on-kubernetes-design)
+2. [LLM backends: per-machine ollama / vLLM + idle supervisor](#2-llm-backends-per-machine-ollama--vllm--idle-supervisor)
 
 ---
 
@@ -90,9 +88,9 @@ def gpu_should_unload(handle_present: bool, active: int, idle_s: float, ttl_s: f
     return handle_present and active <= 0 and idle_s >= ttl_s
 ```
 
-Pure function, unit-testable with no real waiting. `ModelCache.ensure_idle_reaper()` arms a daemon thread the first time `require_model` is called (idempotent; no-op if `QUEUE_WORKFLOWS_DISABLE_GPU_IDLE_REAPER` is set or `idle_ttl_s <= 0`), polling on `clamp(idle_ttl_s / 5, 5s, 60s)`. Default TTL is 60 s (`QUEUE_WORKFLOWS_GPU_MODEL_IDLE_TTL_S`) — short, so a shared GPU frees VRAM quickly for a co-tenant vLLM/ollama server between diffusion bursts (see [§3](#3-llm-backends-per-machine-ollama--vllm--idle-supervisor)). Each tick calls `reap_idle_once()`, which re-checks the same predicate under the lock and, if true, drops the cache and republishes `current_model = NULL`.
+Pure function, unit-testable with no real waiting. `ModelCache.ensure_idle_reaper()` arms a daemon thread the first time `require_model` is called (idempotent; no-op if `QUEUE_WORKFLOWS_DISABLE_GPU_IDLE_REAPER` is set or `idle_ttl_s <= 0`), polling on `clamp(idle_ttl_s / 5, 5s, 60s)`. Default TTL is 60 s (`QUEUE_WORKFLOWS_GPU_MODEL_IDLE_TTL_S`) — short, so a shared GPU frees VRAM quickly for a co-tenant vLLM/ollama server between diffusion bursts (see [§3](#2-llm-backends-per-machine-ollama--vllm--idle-supervisor)). Each tick calls `reap_idle_once()`, which re-checks the same predicate under the lock and, if true, drops the cache and republishes `current_model = NULL`.
 
-This is the same shape (`now_fn`/injectable clock, pure decision function, daemon-thread reaper) as the LLM idle supervisor in §3 and the watchdogs — a deliberate house style so the three GPU-idle mechanisms in this codebase read alike.
+This is the same shape (`now_fn`/injectable clock, pure decision function, daemon-thread reaper) as the LLM idle supervisor in §2 and the watchdogs — a deliberate house style so the three GPU-idle mechanisms in this codebase read alike.
 
 ### GPU health sampling
 
@@ -100,78 +98,7 @@ Per-container GPU%/RAM sampling that backs the `GpuHealthWatchdog`'s wedge detec
 
 ---
 
-## 2. The shared GPU pool (pivot B)
-
-### Why a separate primitive from the DAG node-job
-
-A DAG node-job (`workflow_node_jobs`) is bound to its app's own Postgres — its run row, dispatch outbox, leases, `workflow_node_events` — and to a local filesystem `out_dir`. A worker on a *different box* (let alone a different app) can't reach any of that. The shared GPU pool trades the DB-bound node-job for a **self-contained `PoolTask`**:
-
-```
-PoolTask = { model, handler, inputs, output_dir, params }
-```
-
-where `inputs` / `output_dir` are references into **shared NFS**, not local paths — a pooled worker reads/writes only the shared filesystem and the shared queue store, and **never opens an app's database**. The op *code* lives on each GPU box (a registered handler); the *data* lives on NFS.
-
-### Addressed independently of `db_backend`
-
-The pool is a `StorageBackend` (the same SPI backing the pluggable relational/redis/mongo `db_backend` seam — see [storage_backends.md](storage_backends.md)), but it is configured **separately** from an app's own `db_backend`:
-
-```python
-queue_workflows.configure(
-    gpu_pool_backend="redis",                          # default; config.gpu_pool_backend
-    gpu_pool_url_env="QUEUE_WORKFLOWS_GPU_POOL_URL",    # default; env var name holding the pool DSN
-    gpu_pool_namespace="gpu_pool",                      # default; every app + box sharing a fleet uses the SAME value
-)
-```
-
-An app keeps `db_backend="pg"` (or `"sqlite"`) for its own DAG/run state while pooled GPU workers **across apps** claim self-contained tasks from one shared redis store. The pool backend + connection are built lazily and cached by `(backend, url, namespace)` in `gpu_pool.py`'s module-level `_pool_backend()` — a namespace change (e.g. a test) rebuilds it; `close_pool_backend()` tears it down.
-
-### Capability routing — by queue name, not a scheduler
-
-A `PoolTask` is enqueued onto a **capability queue**: a model id, or a box-class name like `gpu:box-a` / `gpu:box-b`. A pooled worker serves an **ordered** set of queues via `claim_pool_task(queues=[...])`, which claims from the first non-empty queue in order — so the order itself *is* the routing policy (warm-model queue first for affinity, then box-class queues). This is coarser than the DAG GPU claim on purpose: no within-queue warm-model sort, no VRAM capacity-fit gate — the operator hand-partitions by choosing queue names.
-
-### API
-
-**Submitter (any app — needs no handlers registered locally):**
-
-```python
-from queue_workflows import gpu_pool
-
-task_id = gpu_pool.submit_pool_task(
-    queue="gpu:box-a", handler="upscale", model="sr",
-    inputs={"src": "/nfs/in/img.png"}, output_dir="/nfs/out/job123",
-    params={"scale": 4}, priority=0,
-)
-result = gpu_pool.await_pool_result(task_id, timeout_s=600)  # raises PoolTaskFailed / TimeoutError
-```
-
-**Worker (on each GPU box — registers the op code):**
-
-```python
-def upscale(*, inputs, output_dir, params):
-    ...                       # read inputs from NFS, write to output_dir
-    return {"out": f"{output_dir}/result.png"}
-
-queue_workflows.register_pool_handler("upscale", upscale)
-
-# claim -> resolve handler -> run -> atomic-outbox terminal
-gpu_pool.run_pool_worker_once(queues=["sr", "gpu:box-a"], worker="box-a-1")
-```
-
-`execute_pool_task` resolves `payload["handler"]` against `config.gpu_pool_handlers` (populated by `register_pool_handler`); an unregistered handler name, or a raising handler, is written back through the backend's atomic `fail_with_event` — never a silent vanish. `renew_pool_lease` extends a lease while a handler runs (a renewer heartbeat, same shape as the DAG `LeaseRenewer`); `reclaim_expired_pool_leases()` re-queues tasks whose worker died mid-run.
-
-**Not currently wired into any process.** Unlike the DAG lease-reclaim sweep (which `NodePool._tick` drives automatically), nothing in this repo calls `run_pool_worker_once` in a loop or `reclaim_expired_pool_leases` on a timer — a host stands up its own pooled-worker loop and its own sweep cron/thread. `gpu_pool.py` is the primitive; the worker process and orchestration around it are the consuming host's responsibility. Cross-link [configuration](configuration.md) (the `gpu_pool_*` knobs + `register_pool_handler`), [storage_backends.md](storage_backends.md) (the underlying SPI + its anti-leakage rule).
-
-### Guarantees
-
-- **Exactly-once terminal via an atomic outbox** — the worker writes the terminal status + result together (`complete_with_event`/`fail_with_event`), so a crash after the work is done never drops the result.
-- **Lease + reclaim** — a dead worker's task is re-queued, not lost.
-- **Namespace isolation** — two fleets on one shared redis server can't see each other's tasks.
-- **No app-DB coupling** — pooled workers touch only the shared pool store + NFS, never an app's database.
-
----
-
-## 3. LLM backends: per-machine ollama / vLLM + idle supervisor
+## 2. LLM backends: per-machine ollama / vLLM + idle supervisor
 
 ### Why: a co-tenant VLM server shares the GPU with the DAG worker
 
@@ -245,7 +172,7 @@ boxes:
 
 `worker_heartbeats.llm_servers_available text[]` (default `{ollama}`) is the **observed** counterpart — which server types *this machine can actually run* — re-advertised every heartbeat. A queue UI reads it to **gate** its per-machine server-type control: disable the vLLM toggle on a host with no sidecar for it, so an operator can't route VLM calls at a non-existent endpoint (vLLM, the CUDA `vllm/vllm-openai` sidecar, runs only on NVIDIA boxes, never on a ROCm box).
 
-**"Observed" means *probed*, not *declared* (`llm_probe`).** The column DEFAULTs to `{ollama}` and originally the worker just re-published a static config value that *also* defaulted to `["ollama"]` — so the field was a guess dressed as a fact. A GPU box running **no** LLM server still advertised `{ollama}`, drew an "OLLAMA · ON" chip, and (via a borrowing topology entry) dispatched every call to another box while its own GPU sat idle — invisibly, because nothing ever asked the endpoint. The GPU worker now wires `HeartbeatEmitter(llm_servers_fn=…)` to `llm_probe.probe_llm_servers(base_url)`, which GETs the box's resolved endpoint and advertises the server that **actually answers** — `[]` when none does. An empty list is the whole point: it makes "this box serves no model" a *visible* state, and the worker logs an ERROR (can't serve) or WARNING (dispatching to a remote box) at startup so the wiring is diagnosable from the log. `is_local_endpoint()` distinguishes serving-yourself from borrowing; the probe is stdlib-only (psycopg stays the one hard dep), HTTP-injected for tests, and never raises. cpu/ingest workers leave `llm_servers_fn` unset and keep publishing the config value unchanged.
+**"Observed" means *probed*, not *declared* (`llm_probe`).** The column DEFAULTs to `{ollama}` and originally the worker just re-published a static config value that *also* defaulted to `["ollama"]` — so the field was a guess dressed as a fact. A GPU box running **no** LLM server still advertised `{ollama}`, showed as an ollama server in any UI that reads the column, and (via a borrowing topology entry) dispatched every call to another box while its own GPU sat idle — invisibly, because nothing ever asked the endpoint. The GPU worker now wires `HeartbeatEmitter(llm_servers_fn=…)` to `llm_probe.probe_llm_servers(base_url)`, which GETs the box's resolved endpoint and advertises the server that **actually answers** — `[]` when none does. An empty list is the whole point: it makes "this box serves no model" a *visible* state, and the worker logs an ERROR (can't serve) or WARNING (dispatching to a remote box) at startup so the wiring is diagnosable from the log. `is_local_endpoint()` distinguishes serving-yourself from borrowing; the probe is stdlib-only (psycopg stays the one hard dep), HTTP-injected for tests, and never raises. cpu/ingest workers leave `llm_servers_fn` unset and keep publishing the config value unchanged.
 
 Both 0013 and 0014 are default-safe: a DB predating them (or an accessor call before they're applied) returns the all-defaults config / the `{ollama}` baseline, so the engine and any other consumer runs unchanged.
 
@@ -253,66 +180,57 @@ Both 0013 and 0014 are default-safe: a DB predating them (or an accessor call be
 
 `set_llm_server_resolver(resolver)` lets a host resolve the exact server (type + address + port) **per node-job** at dispatch time; `node_executor` threads the result in as `run(llm_server=...)`, so a node body never hardcodes a URL — it always asks for the backend the resolver decided on for that job.
 
+### The context window (migration 0028)
+
+**Why it is a routing fact and not a request parameter.** ollama does not refuse a prompt longer than the window its runner was loaded with — it **truncates it and answers HTTP 200**. Measured on 0.33.2: a ~12,000-token prompt at an 8192 window came back with `prompt_tokens` 4098, no error, no warning, a confident answer to half a document. Nothing downstream can detect that, so the window has to be decided **before the claim**: a node-job declares `context_length`, and the claim gives that row only to a box whose server serves at least that much. A box that cannot state its window claims only unsized rows.
+
+**What each box answers with.** Two heartbeat columns, recomputed every ~10 s by the GPU worker:
+
+| column | what it is | where it comes from |
+|---|---|---|
+| `llm_context_length` | the window this box serves **now** | ollama: the value its container is CONFIGURED with (`OLLAMA_CONTEXT_LENGTH`), clamped to the model's own maximum — *not* a loaded runner's, because another client can load one natively at a bigger window and our very next `/v1` call reloads it back. vLLM: `max_model_len` from `/v1/models`. |
+| `llm_context_max` | the biggest it could **switch** to | The memory the box has free (`MemAvailable`) plus what the current runner would release, minus an operator reserve, minus the weights, divided by what one token of window actually costs — capped by the model's maximum. vLLM instead: its KV pool is sized by `gpu_memory_utilization`, so a bigger window costs no new memory and only has to fit the pool it already owns. |
+
+A box serving two kinds advertises the **smaller** window (a sized job may resolve to either) and the **larger** ceiling (that is what a switch could reach). A box that cannot grow — no lever, the kill switch, or a resize that already failed here — advertises a ceiling equal to what it serves, so the fleet does not wait for a switch that cannot happen.
+
+**What a token of window costs — measured, not assumed.** The textbook f16 KV formula is wrong in both directions on real models, so the engine prefers the OBSERVED cost of a loaded runner (`(runner_bytes − weights) / window`, an average that bounds the marginal cost from above) and keeps the formula only as the fallback, with a ×1.25 safety factor:
+
+| model | observed | the formula says |
+|---|---|---|
+| a standard transformer (qwen2.5:0.5b) | 14–18 KB/token at the margin | 12,288 B — 15–30 % **low** (compute buffers grow with the window too) |
+| a hybrid (full attention every 4th layer) | ~3.7 KB/token | 64 KiB — ~18× **high** |
+
+**Growing into demand.** `node_queue.context_switch_need` is the demand read every box runs against the same heartbeats, so they elect the same box without talking to each other: a resize happens only when **nobody** is already serving that window (a box that can take the job will, within seconds), the job has waited (below ~30 s "nobody serves it" is as likely to be heartbeat lag), and of the boxes that could reach it this is the **tightest fit** — so the roomiest box stays free for the job that needs the room. Placement (0020) and tenancy bind exactly as they do in the claim, and a parked or stale box neither counts nor masks the demand.
+
+**Performing it.** A resize reuses the `ServerSwitch` (`docs/watchdogs.md`, §"one server at a time"): the box drains, blocks claims, and comes back when its server ANSWERS at the new window — with two differences. Nothing is unloaded (the lever replaces the container in one operation), and a failed resize quarantines *resizing that kind*, never the kind itself, so a box whose window cannot be changed can still switch to that server normally. If the resize leaves the server not answering at all, the operator's own window is restored — the one configuration the box is known to run.
+
+The lever itself recreates the box's container with one value swapped (`OLLAMA_CONTEXT_LENGTH` / `--max-model-len`), from the container's **own** inspect output, carrying its network endpoints over explicitly: docker's create body does not inherit them, and a `broker-ollama` that comes back without its aliases is a box whose LLM service is gone while the container looks healthy. The operator's original value is remembered in a container label, so "no queued job needs a big window" restores it rather than freezing the last override forever. A deployment whose server is not a local container wires `set_llm_context_lever(fn)` instead; a box with neither lever nor docker socket simply keeps the window it has.
+
+**When a server is started anyway** — a kind switch, or a cold vLLM start — it comes up at the highest window the queue needs and can reach, rather than coming up wrong and being restarted a minute later. No sized work queued ⇒ its configured default, exactly as before.
+
+**A job nobody can serve** is red-flagged by the existing `unassignable` sweep (0015), and the reason names the window, the largest any box could reach, and the fact that the answer was taken against each box's free memory. Model and window are judged **on the same box**: one box having the model and another the window must never pass a job nobody can run.
+
+**Knobs**: `QUEUE_WORKFLOWS_DISABLE_LLM_CONTEXT_SWITCH` (off switch), `QUEUE_WORKFLOWS_LLM_CONTEXT_RESERVE_MB` (default 8192), `QUEUE_WORKFLOWS_OLLAMA_CONTAINER` / `QUEUE_WORKFLOWS_VLLM_CONTAINER`, `QUEUE_WORKFLOWS_VLLM_MAX_CONTEXT` (a vLLM box cannot grow without it — vLLM does not publish its model's maximum, and exceeding it makes the server exit at startup).
+
 ### Operational notes
 
 - One machine runs **one** server type at a time — that is what the `llm_server_type` toggle means.
+- **…and it is the only kind offered while vLLM serves.** ollama's daemon stays up after a switch (only its models unload), so a box used to advertise both kinds — and an ollama-only job then loaded a second copy beside vLLM's pool, until the box was out of memory. While vLLM serves, the heartbeat advertises `{vllm}` alone.
+- **No load into memory the box does not have.** ollama loads on the first request, so the claim refuses a job whose model is not resident here unless weights + cache fit in `MemAvailable` minus the reserve (`QUEUE_WORKFLOWS_LLM_CONTEXT_RESERVE_MB`, 8 GB). vLLM's `--gpu-memory-utilization` — a fraction of the WHOLE machine on a unified-memory box — is lowered to what is free at start (the operator's value is remembered and never exceeded), and vLLM is not started at all below `QUEUE_WORKFLOWS_VLLM_MIN_UTILIZATION` (0.30). Raise the reserve on a box that runs wide cpu lanes or other GPU tenants.
+- **…and one daemon of it.** The residency enforcer only sees the servers it was configured with; a second `ollama/ollama` (or `vllm/vllm-openai`) container on another port is invisible to it, and its model is a second resident copy (e.g. a benchmark's ollama beside the box's own: two copies of one model in one box's memory). `rogue_llm.sweep` therefore stops such a container on sight, every tick, from whichever engine process holds the docker socket — the gpu claim worker's heartbeat, and the orchestrator's sweep loop. Run benchmarks against the box's own daemon or on another box; `QUEUE_WORKFLOWS_ROGUE_LLM_GUARD=report` if you only want it named.
+- **…and, on a box that is the broker's, nothing else on the GPU.** Opt-in: with `QUEUE_WORKFLOWS_GPU_CONTAINER_ALLOW=<name prefixes / compose projects>` set, the same sweep stops any other RUNNING container with GPU access that dockerd would bring back by itself (`always`/`unless-stopped`/`on-failure`) and pins it to `restart=no` (such a container can take the LLM server's host port after a reboot, and its memory is invisible to admission), while a hand-launched run (`restart=no`: a training job, a benchmark) is named once and left to share the box — presence is not the offence, MEMORY is. When the box crosses its danger floor the sentinel sheds the broker's own servers first, re-reads, and only if it is still short stops every un-named GPU container (`rogue_llm.stop_gpu_outsiders`). `QUEUE_WORKFLOWS_ROGUE_GPU_RUNS=stop` removes runs on sight instead. The engine's own containers are always allowed; unset, the rule is off. A parked gpu worker sweeps too.
+- **vLLM sized to what it needs; concurrency counted from what fits (0029).** The pool (`--gpu-memory-utilization`, a fraction of the WHOLE machine on unified memory) used to be sized to what was free. Now the worker reads, once per start, what vLLM itself printed — `Model loading took … GiB`, `Available KV cache memory`, `GPU KV cache size: … tokens`, `Maximum concurrency for … tokens per request` — caps the box's PAR at that concurrency (a cache that holds fewer full-window requests than the box's PAR would otherwise feed it), and remembers the numbers in `llm_model_catalog.profile` under the command line's fingerprint. The next start is planned (`llm_context.vllm_plan`): pool = weights + fixed overhead + N × window × per-token (+5 %), capped by what is free minus the reserve and by the operator's value; N lowered to what fits and passed as `--max-num-seqs`; a box that cannot hold one request of the window refuses, naming the numbers. A model's first start on a box keeps the old rule and becomes its profile. The startup lines are read by TIME (the half hour from the container's `StartedAt`), not by `tail=`, because a serving vLLM's request log buries them. A server already RUNNING whose startup was observed complete is exempt from a start-verdict — it is judged by whether the box is in danger (`MemAvailable` under the absolute `QUEUE_WORKFLOWS_LLM_DANGER_FLOOR_MB`, 12 GB — never a multiple of the reserve, which is a planning margin), not by whether a start it is not making would fit; one still LOADING into memory the box lacks is stopped at any reading.
 - vLLM cold start is real (roughly 1–4 min for a 7B AWQ on a modern GPU); the supervisor's idle-stop trades that cold start for reclaimed VRAM. ollama is always up but serializes by default (raise `OLLAMA_NUM_PARALLEL` for concurrency).
 - vLLM has no hot model swap — a model switch is a server restart; ollama hot-loads a new tag on the running daemon.
 - A vLLM server needs its model **fully present** in that host's own model cache before it can serve; an incomplete download makes the loader block (looks like a hang).
+- **While a server WARMS the box keeps being watched.** The pool is decided once per switch (re-deciding against the memory the start itself is consuming would recreate it in a loop), but the load is still watched: a crossing of the danger floor while it warms stops the loading server and abandons the switch — nothing is recomputed or recreated.
+- **A box out of memory sheds — it is never parked.** The gpu lane's `MemorySentinel` reads `MemAvailable` once a second; under the danger floor (12 GB) it stops the vLLM container (serving or loading), unloads every model ollama holds and abandons a warm in flight, at most once per 60 s; under the kill floor (512 MB) it does so at once. The lane stays ON so the next start is planned against what is then free and everything that fits keeps flowing. Parking is an operator lever and nothing in the engine writes `worker_controls` — a test forbids it.
+- **When RAM has been back for a minute, vLLM may come back.** A hold the plan placed over memory (every such refusal is tagged `memory: `) is lifted by the sentinel once `MemAvailable` has covered what a worthwhile vLLM needs here — weights + overhead + the minimum concurrency's worth of cache (+5 %) + the reserve, or the minimum pool + the reserve without a profile — for 60 s continuously; the demand logic then requests the switch and the plan sizes the start to what is free. A dip restarts the count; holds for other reasons (a server that never became ready) are left alone.
+- **A load killed mid-way raises the bar.** A vLLM load can take many minutes, so a kill is evidence, not just a loss: each one adds 25 % (capped at 1.5x) to the headroom the next start — and the memory-recovery lift — demands over the bare need, until a start completes and clears the history. Kills report what they cost ("4.7 min into the load").
 
 ### Coexisting with the diffusion / model-cache lane (§1)
 
 A diffusion (or SR/CV) model **never** goes through ollama or vLLM — those only serve language/vision-language models. A model-backed GPU node runs in-process in the claim worker's *inline* lane (concurrency-1, the warm `ModelCache` from §1); the LLM server, if any, runs *beside* it on the same physical GPU, fed only by a separate *pool* lane of VLM-only jobs (`require_model IS NULL`). The two lanes share one GPU, so a machine's total concurrent node-jobs is capped at `PAR` (the sidecar's `llm_parallelism`), and while an inline diffusion job runs it occupies one of those `PAR` slots (`PAR − 1` budgeted to the pool feeder). Running a resident LLM server *and* a diffusion model on one GPU competes for VRAM — this is precisely why the vLLM supervisor idle-stops the server (freeing VRAM for diffusion between VLM bursts) and why the diffusion side's own idle TTL (§1, default 60 s) is short.
-
----
-
-## 4. Broker-managed LLM on Kubernetes (design)
-
-> **Status: design + starting-point manifests only — NOT deployed.** Nothing described in this section runs today; it documents the v2 direction so future work builds toward it deliberately. See [`broker.md`](broker.md) for the shipped broker orchestration core this design extends, and `deploy/k8s/` for the (inert) manifests.
-
-### The direction
-
-Today (the per-host engine described in §1–§3) each machine runs its **own** ollama/vLLM and workers self-claim work from Postgres. The v2 direction the operator has set is to **centralize** both halves: one broker service owns the shared CPU/GPU queue and *grants* permission to worker Deployments (see [`broker.md`](broker.md) for the grant/heartbeat/finish protocol), and the LLM servers move from "one per host" to **one shared deployment per cluster** — ollama and vLLM each run once, behind a Kubernetes Service, used by every client project. Client projects stop running their own model servers and instead point `QUEUE_WORKFLOWS_OLLAMA_URL` / `QUEUE_WORKFLOWS_VLLM_URL` at the cluster Service.
-
-```mermaid
-flowchart TB
-    subgraph cluster["Kubernetes namespace: broker-parrot"]
-        WEB["broker-web — grants jobs, panel + JSON API"]
-        PG["Postgres — shared broker DB"]
-        subgraph llm["broker-managed LLM servers (shared, cluster-wide)"]
-            OLL["ollama Deployment/Service — always-on baseline"]
-            VLLM["vllm Deployment/Service — per-model, heavier"]
-        end
-        subgraph workers["client-project worker Deployments"]
-            WG["worker-alpha-gpu (nvidia.com/gpu)"]
-        end
-        CTRL["broker controller (NOT BUILT) — reconciles vLLM capacity from queue demand"]
-    end
-    WG -->|ask / heartbeat / finish| WEB
-    WEB --> PG
-    WG -.->|inference| OLL
-    WG -.->|inference| VLLM
-    CTRL -.->|scale / set served model| VLLM
-    CTRL -.->|reads pending gpu demand| PG
-```
-
-### Why this is a natural extension, not a rewrite
-
-The per-machine abstraction already built in §3 — `llm_backends/` (ollama/vLLM backends + the idle supervisor) and the desired/observed control columns (`worker_controls.llm_*` from 0013, `worker_heartbeats.llm_servers_available` from 0014) — is exactly the machinery a cluster-level controller needs, just **relocated**: ollama stays the always-on baseline (one Deployment); a **broker controller** (a small k8s controller, *to be built*) would read live GPU demand from the queue (which `model` the pending/granted `gpu` jobs need) and drive the `vllm` Deployment to serve it — set its `--model` arg / scale it, or run one Deployment per hot model behind per-model Services. Workers would never start/stop a sidecar themselves; they'd just call the Service URL, and the in-worker `LLMSupervisor` becomes unnecessary once the cluster owns the server's lifecycle.
-
-### Migration path (per project, incremental)
-
-1. Stand up `broker-web` + Postgres + the shared `ollama`/`vllm` Services.
-2. Point a project's workers at the broker (deploy `queue-broker-worker` for its lanes, register its handlers in the worker image — see [`broker.md`](broker.md)).
-3. Set the project's `QUEUE_WORKFLOWS_OLLAMA_URL` / `QUEUE_WORKFLOWS_VLLM_URL` to the cluster Services and retire its own per-host ollama/vLLM (done per project, in that project's own repo).
-4. Once every project is on the broker, retire the legacy per-host autonomous-worker engine described in §1–§3 above.
-
-### Gaps — not built yet
-
-- **The broker controller** that reconciles vLLM capacity from queue demand — today's manifests, if applied, would run vLLM *statically*.
-- **Concurrency-safe grant** — the broker's job-granting endpoint is check-then-act and runs a single replica; running more than one needs a serialized/locked grant first.
-- **Auth beyond a shared token**, and real secrets/image builds.
-- **Removing per-project ollama/vLLM** happens in each consumer's own repo, outside this one.
 
 ---
 
@@ -321,6 +239,4 @@ The per-machine abstraction already built in §3 — `llm_backends/` (ollama/vLL
 - [architecture.md](architecture.md) — the claim SQL, lease/reclaim, and the process roles the GPU worker plays.
 - [watchdogs.md](watchdogs.md) — the wall-clock, stall, and GPU-health watchdogs that police a *running* GPU job (a liveness concern, distinct from this doc's residency/capacity concerns).
 - [worker_control.md](worker_control.md) — the operator ON/OFF plane that `worker_controls` (this doc's migration 0013 columns live on the same table) also implements.
-- [configuration.md](configuration.md) — every hook-setter (`set_builtin_model_registrar`, `set_llm_servers_available`, `set_vllm_lifecycle`, `set_llm_server_resolver`, `register_pool_handler`) and env knob named above.
-- [storage_backends.md](storage_backends.md) — the `StorageBackend` SPI the shared GPU pool (§2) and `db_backend` both build on.
-- [broker.md](broker.md) — the v2 broker orchestration core that §4's k8s design extends.
+- [configuration.md](configuration.md) — every hook-setter (`set_builtin_model_registrar`, `set_llm_servers_available`, `set_vllm_lifecycle`, `set_llm_server_resolver`) and env knob named above.

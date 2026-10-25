@@ -36,7 +36,7 @@ export QUEUE_WORKFLOWS_BROADCAST_HW_STATS=1
 export QUEUE_WORKFLOWS_HW_BROADCAST_PORT=48291   # optional; this is the default
 ```
 
-The legacy `AI_LEADS_*` spelling resolves too, via `envcompat`.
+A retired `AI_LEADS_*` spelling of either knob is a startup error, via `envcompat`.
 
 ## What goes on the wire
 

@@ -3,16 +3,14 @@
 -- WHY. The engine already runs ONE cpu + ONE gpu queue (0002) partitioned by
 -- *resource*, never by project — but it assumed a single Postgres per project
 -- (per-project deployment topology). To run ONE shared broker DB across all
--- projects (operator decision: "shared DB + per-project clients"), every queue
+-- projects (the design: a shared DB with per-project clients), every queue
 -- record carries a ``project`` tenant tag: each project's client enqueues +
 -- claims ONLY its own project's rows, while the broker holds all projects'
--- jobs on the shared cpu/gpu (+ ingest) queues. Distinct from ``db_namespace``
--- (config.py) — that ISOLATES tenants on a shared redis/mongo so they can't see
--- each other; this column POOLS them into one queue with a filter, the inverse.
+-- jobs on the shared cpu/gpu (+ ingest) queues.
 --
 -- DESIGN — exact-match-always (the claim filters ``project = <client project>``
 -- unconditionally). ``DEFAULT ''`` makes a single-tenant deploy byte-compatible:
--- every row is ``''`` and the filter ``project=''`` matches them all, so today's
+-- every row is ``''`` and the filter ``project=''`` matches them all, so the existing
 -- behaviour is unchanged with zero host wiring. A multi-tenant client sets its
 -- ``config.project`` and only ever sees its own rows.
 --
@@ -35,7 +33,7 @@ ALTER TABLE worker_heartbeats
 
 -- ── worker_heartbeats identity now includes project ────────────────────────
 -- A shared broker can run two projects' workers on the same machine
--- (``host_label``) + queue (e.g. host-a runs both ai_leads' and alpha's gpu
+-- (``host_label``) + queue (e.g. host-a runs both app-a's and app-b's gpu
 -- client). The old PK ``(host_label, queue)`` would make the second client's
 -- upsert CLOBBER the first's heartbeat. The tenant tag disambiguates them, so
 -- the worker identity becomes ``(host_label, queue, project)``. Drop-then-add

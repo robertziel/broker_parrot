@@ -1,6 +1,6 @@
 """INVARIANT: a switch may never hold a box out of service for a start that cannot work.
 
-The outage: two GPU boxes sat at a ~50 % duty cycle for 3 h 08 m with 26 jobs
+The outage: GPU boxes sat at a fraction of their duty cycle for hours with jobs
 queued. Each had requested a switch to vLLM; the host's start lever answered
 ``HTTP 404: No such container`` on one box and an OCI mount error on the other — every
 30 s, for the whole 1800 s warm window — and the machine read that as "not ready YET",
@@ -212,7 +212,7 @@ def test_a_long_forgotten_quarantine_leaves_no_record_behind(tmp_path):
 
 
 def test_a_restart_mid_switch_INHERITS_the_remaining_budget_and_never_re_arms(tmp_path):
-    """Observed live: a switch was still blocking claims more than three hours after it
+    """A switch could still be blocking claims more than three hours after it
     was requested, because every restart re-entered DRAINING with a fresh clock. The
     deadline is now computed from the ORIGINAL request."""
     path = str(tmp_path / "switch.json")
@@ -394,11 +394,11 @@ def test_a_switch_can_never_outlive_its_budget_or_a_definitive_failure(seed):
         clock.advance(step); wall.advance(step)
 
 
-# ── the seam must be WIRED, not merely present (audit delta D1) ─────────────
+# ── the seam must be WIRED, not merely present ─────────────────────────────
 
 
 def test_a_SUCCESSFUL_switch_clears_the_kinds_quarantine():
-    """AUDIT D2. The entry outlives its own expiry so a broken target escalates — but
+    """The entry outlives its own expiry so a broken target escalates — but
     a completed switch proves the kind healthy. Without this every slow-but-successful
     load doubled the next hold until the box refused the kind for hours."""
     m, clock, wall = _m(quarantine_s=100.0)
@@ -419,7 +419,7 @@ def test_a_SUCCESSFUL_switch_clears_the_kinds_quarantine():
 
 
 def test_the_engine_actually_FEEDS_the_levers_verdict_to_the_switch():
-    """AUDIT D1, and the reason this test exists at all: the seam was written, unit
+    """The reason this test exists at all: the seam was written, unit
     tested and documented as 'called right after the START' — while the driver dropped
     the lever's return value on the floor. Every guarantee above was unreachable in the
     engine. A source scan is crude, but it is the thing that was missing."""
@@ -447,7 +447,7 @@ def test_a_missing_start_lever_is_PERMANENT_not_a_1800_second_wait():
 
 
 def test_the_deadline_survives_a_wall_clock_that_reads_ZERO():
-    """AUDIT round 5, follow-up 3. The `is None` sentinel that replaced `if not
+    """The `is None` sentinel that replaced `if not
     self._requested_wall` was fixed in code and pinned by nothing: every other test
     injects a large wall clock, so mutating the guard back left the whole suite green.
     A fix nobody can break is a fix nobody is keeping."""

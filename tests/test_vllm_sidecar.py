@@ -1,12 +1,12 @@
-"""Bringing the vLLM sidecar up on a REQUESTED model — the Phase-6 seam, finally built.
+"""Bringing the vLLM sidecar up on a REQUESTED model — the deferred seam, finally built.
 
 `vllm.py` has documented this hole since it was written:
 
     ensure_up_fn(model_id) -> None — Default is a NO-OP: today the bring-up is owned by
-    docker `restart: unless-stopped` + a (Phase-6) entrypoint that reads the desired model
+    docker `restart: unless-stopped` + a (future) entrypoint that reads the desired model
     from config.
 
-Consequence, measured on a live fleet: a box whose `worker_controls.
+Consequence, observed in operation: a box whose `worker_controls.
 llm_server_type` says `vllm` served whatever model was BAKED into its compose file, and a
 freshly quantized model sitting on that box's own disk could not be reached at all. The
 state machine already handles a switch (RELOADING → stop → cold start → health poll); it
@@ -150,8 +150,15 @@ def test_the_socket_timeout_outlasts_a_full_stop_remove_create_start_cycle():
 
     from queue_workflows.llm_backends import vllm
 
-    src = (__import__("pathlib").Path(vllm.__file__)).read_text()
-    sock = int(re.search(r"self\.sock\.settimeout\((\d+)\)", src).group(1))
+    from queue_workflows.llm_backends import docker_api
+
+    # The socket half moved to the shared docker_api module (the context lever performs
+    # the same recreate cycle); the stop grace stays with the caller that issues it.
+    path = __import__("pathlib").Path
+    src = path(vllm.__file__).read_text()
+    sock = int(re.search(r"self\.sock\.settimeout\((?:timeout_s|(\d+))\)",
+                         path(docker_api.__file__).read_text()).group(1)
+               or docker_api.DEFAULT_TIMEOUT_S)
     stop = int(re.search(r"/stop\?t=(\d+)", src).group(1))
     assert sock >= 120, f"socket timeout {sock}s is too short for a recreate cycle"
     assert stop <= 15, f"stop grace {stop}s keeps the box dark longer than needed"

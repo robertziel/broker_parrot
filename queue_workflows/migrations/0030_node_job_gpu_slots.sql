@@ -1,0 +1,26 @@
+-- 0030 — per-node-job GPU WEIGHT: how much of the box's GPU budget one job occupies.
+--
+-- The box-slot arbiter (the one centralized per-box gate every gpu claim funnels
+-- through) counted every running row as 1 against the worker's ``max_running``.
+-- A row that legitimately owns the whole server — a gateway's lease on the box's
+-- vLLM — therefore left PAR-1 slots open, and the fleet co-scheduled its own
+-- ``llm_chat`` work into the very server the lease was taken to hold.
+--
+-- ``gpu_slots`` is that weight, and it lives on the ROW so the CLAIM can enforce
+-- it — the reservation has to exist before the body starts. It is the exact shape
+-- ``cpu_slots`` (0024) gave the cpu lane, with two words the cpu lane never
+-- needed: ``'all'`` and ``'half'`` resolve against the CLAIMING box's own budget,
+-- because a whole box means a different number on a PAR-2 and a PAR-4 machine.
+--
+-- Values: NULL = 1 = "an ordinary job" (every pre-0030 row, every unweighted
+-- enqueue — nothing backfills, nothing changes meaning), ``'all'``, ``'half'``, or
+-- an integer >= 2 as text. Integers are measured as LEAST(n, max_running) so an
+-- over-wide row runs alone instead of waiting for a fit that can never arrive.
+--
+-- The value set is enforced HOST-SIDE in ``node_queue.enqueue_node_job`` (raises
+-- ValueError before the write), not as a DB CHECK — the same direction 0024 took,
+-- and required anyway because SQLite cannot ``ALTER TABLE ... ADD CONSTRAINT``.
+--
+-- Additive + idempotent, like 0024.
+ALTER TABLE workflow_node_jobs
+    ADD COLUMN IF NOT EXISTS gpu_slots text;

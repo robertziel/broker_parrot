@@ -7,7 +7,7 @@ This module owns the *background threads* the orchestrator container runs:
   newly-ready node is INSERTed as a ``workflow_node_jobs`` row; the
   migration-0006 trigger NOTIFYs a claim worker. The same loop drains the
   dispatch-event outbox and runs the lease-reclaim sweeps (node-job + ingest).
-- ``InputListener`` — polls ``workflow_input_submissions``; when Rails inserts
+- ``InputListener`` — polls ``workflow_input_submissions``; when the host app inserts
   a user's value for an ``awaiting_input`` node, calls
   :func:`dispatcher.resume_after_input` to unblock the DAG.
 
@@ -18,7 +18,7 @@ containers (one process == one worker, ``SELECT … FOR UPDATE SKIP LOCKED``
 claim). On startup the pool reclaims any expired-lease ``running`` rows left by
 a worker that died across the restart (:meth:`_await_recovery`).
 
-The builtin-model registration is an INJECTED hook (plan §2b-4):
+The builtin-model registration is an INJECTED hook:
 ``register_builtins`` is a ``Callable[[], None] | None`` (default None = skip),
 NOT an import of any host's ``builtin_models``. The host's orchestrator passes
 its registrar (or relies on ``config.builtin_model_registrar``).
@@ -120,18 +120,18 @@ def _available_cpus(
 def cpu_worker_count() -> int:
     """Intended per-box CPU-worker count. **Defaults to the box's available CPU
     cores** (cgroup-aware, see :func:`_available_cpus`) so each box scales to its
-    own capacity; override with ``AI_LEADS_WORKFLOW_CPU_WORKERS``.
+    own capacity; override with ``QUEUE_WORKFLOWS_WORKFLOW_CPU_WORKERS``.
 
     NOTE: the engine does NOT spawn workers from this — each ``claim_worker`` is
-    its own concurrency-1 process. This value backs the Rails queue-snapshot
+    its own concurrency-1 process. This value backs a host queue-snapshot
     fallback (before heartbeats exist) and is the engine's notion of the per-box
     count a deployment can read to decide how many claim-worker processes to
     launch; actually running that many is a deployment (compose/ansible) concern."""
-    return _int_env("AI_LEADS_WORKFLOW_CPU_WORKERS", _available_cpus())
+    return _int_env("QUEUE_WORKFLOWS_WORKFLOW_CPU_WORKERS", _available_cpus())
 
 
 def gpu_worker_count() -> int:
-    return _int_env("AI_LEADS_WORKFLOW_GPU_WORKERS", 1)
+    return _int_env("QUEUE_WORKFLOWS_WORKFLOW_GPU_WORKERS", 1)
 
 
 # ── Pool ──────────────────────────────────────────────────────────────────
@@ -150,7 +150,7 @@ class NodePool:
         self._cpu_n = cpu_workers if cpu_workers is not None else cpu_worker_count()
         self._gpu_n = gpu_workers if gpu_workers is not None else gpu_worker_count()
         # Injected registrar — Callable run once at start(), or None to skip.
-        # (The plan §2b-4 inversion: the engine never imports a host's
+        # (The inversion: the engine never imports a host's
         # builtin_models; the host passes its registrar here.)
         self._register_builtins = register_builtins
         self._dispatch_stop = threading.Event()
@@ -255,6 +255,15 @@ class NodePool:
             env_get("QUEUE_WORKFLOWS_UNASSIGNABLE_SWEEP_INTERVAL_S", "15")
         )
         self._unassignable_last_run: float = 0.0
+        # ONE LLM DAEMON PER BOX (rogue_llm). The orchestrator is not a per-box process,
+        # but on this box it may be the only engine process holding the docker socket —
+        # on the control box the claim container has none — so it polices the box it
+        # runs on. Interval-gated like the sweeps above; a no-socket host is a no-op.
+        # 10 s, the gpu heartbeat's cadence: this interval IS the window in which a
+        # second daemon can load a model before it is stopped, and a mid-size model load
+        # takes about that long. One docker listing per 10 s is nothing.
+        self._rogue_llm_interval_s: float = 10.0
+        self._rogue_llm_last_run: float = 0.0
 
         # Over-claim reaper — the runtime SAFETY-FALLBACK for the per-box slot
         # arbiter (``claim_next_gpu_job(max_running=…)``). The arbiter PREVENTS an
@@ -324,7 +333,7 @@ class NodePool:
 
     def current_gpu_model(self) -> str | None:
         """The orchestrator can't see a worker's in-process model cache
-        directly; the Rails snapshot reads ``current_model`` off
+        directly; a host snapshot reads ``current_model`` off
         ``worker_heartbeats``. This in-process inspector is unused, kept as a
         None stub."""
         return None
@@ -451,11 +460,11 @@ class NodePool:
         so the worker container restarts via its orchestrator.
 
         Configurable via env:
-            ``AI_LEADS_NODE_POOL_RECOVERY_RETRIES`` (default 5)
-            ``AI_LEADS_NODE_POOL_RECOVERY_BACKOFF_S`` (default 2.0)
+            ``QUEUE_WORKFLOWS_NODE_POOL_RECOVERY_RETRIES`` (default 5)
+            ``QUEUE_WORKFLOWS_NODE_POOL_RECOVERY_BACKOFF_S`` (default 2.0)
         """
         if max_attempts is None:
-            max_attempts = _int_env("AI_LEADS_NODE_POOL_RECOVERY_RETRIES", 5)
+            max_attempts = _int_env("QUEUE_WORKFLOWS_NODE_POOL_RECOVERY_RETRIES", 5)
         if backoff_s is None:
             raw = env_get("QUEUE_WORKFLOWS_NODE_POOL_RECOVERY_BACKOFF_S", "",
             ).strip()
@@ -545,6 +554,10 @@ class NodePool:
             self._sweep_expired_ingest_leases()
         except Exception:
             log.exception("[node-pool] ingest-lease-reclaim sweep failed")
+        try:
+            self._sweep_rogue_llm()
+        except Exception:
+            log.exception("[node-pool] rogue-LLM sweep failed")
 
         # 5) Dead-worker sweep — flag a worker whose heartbeat froze while it
         # still owns a ``running`` job (a GPU-hardware-hang that wedged the
@@ -614,7 +627,7 @@ class NodePool:
         except Exception:
             log.exception("[node-pool] unassignable-job sweep failed")
         try:
-            # SERVER-KIND twin (analysis #3): rows whose server_types no live worker
+            # SERVER-KIND twin: rows whose server_types no live worker
             # serves — e.g. a ['vllm']-only job on a fleet where no vLLM answers —
             # used to sit queued forever with no error, no flag, no log.
             for row in node_queue.flag_server_stranded_jobs():
@@ -627,11 +640,27 @@ class NodePool:
         except Exception:
             log.exception("[node-pool] server-stranded sweep failed")
 
+    def _sweep_rogue_llm(self) -> None:
+        """Stop a second ollama / vLLM daemon running beside the engine's own on THIS
+        host (see :mod:`queue_workflows.rogue_llm`). Runs here because on the control
+        box the orchestrator is the one engine process with the docker socket."""
+        import time as _time
+
+        now = _time.time()
+        if now - self._rogue_llm_last_run < self._rogue_llm_interval_s:
+            return
+        self._rogue_llm_last_run = now
+        from queue_workflows import rogue_llm
+
+        rogue_llm.sweep(host="orchestrator")
+
     def _sweep_unassignable_jobs(self) -> None:
-        """Red-flag queued GPU model-jobs that NO live machine can hold (none has
-        enough VRAM) and emit one ``unassignable`` node event per newly-flagged
-        job; the flag clears automatically once a big-enough machine appears or
-        the job leaves the queue (see :func:`node_queue.flag_unassignable_gpu_jobs`).
+        """Red-flag queued GPU jobs that NO live machine can serve — a model none
+        can hold (not installed, or not enough VRAM), or a ``context_length`` no
+        box can reach within its free memory (migration 0028) — and emit one
+        ``unassignable`` node event per newly-flagged job; the flag clears
+        automatically once a machine that can serve it appears or the job leaves
+        the queue (see :func:`node_queue.flag_unassignable_gpu_jobs`).
 
         Interval-gated (``_unassignable_interval_s``, default 15 s); ``last_run``
         starts at 0 so a fresh instance evaluates on its FIRST tick. The flag
@@ -762,11 +791,11 @@ class NodePool:
             host-supervisor hook that consumes the flag.
 
         FLAG-ONLY — this sweep must never touch job rows. It briefly also
-        re-queued the flagged worker's jobs; reverted after a live
-        false-positive: a heartbeat is a PROCESS-level signal from
+        re-queued the flagged worker's jobs; reverted after a
+        false positive in operation: a heartbeat is a PROCESS-level signal from
         ONE thread, and a wide-concurrency cpu worker under a heavy batch
         starved its beat thread past staleness while every job's lease kept
-        renewing — 23 LIVE jobs were yanked mid-flight. Stale heartbeat +
+        renewing — live jobs were yanked mid-flight. Stale heartbeat +
         running jobs ⇒ "bounce the process", never "the jobs are free".
 
         Interval-gated (``_dead_worker_interval_s``, default 5 s) so the 0.5 s
@@ -897,7 +926,7 @@ class NodePool:
         natural terminal bound, so an age-based sweep keeps it from growing
         unboundedly for runs that are never deleted. ``ON DELETE CASCADE`` from
         ``workflow_runs`` already covers purge / restart_from / session-delete.
-        Retention via ``AI_LEADS_NODE_EVENT_RETENTION_DAYS`` (default 30).
+        Retention via ``QUEUE_WORKFLOWS_NODE_EVENT_RETENTION_DAYS`` (default 30).
         """
         import time as _time
 

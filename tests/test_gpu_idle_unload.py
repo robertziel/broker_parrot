@@ -2,7 +2,7 @@
 freeing VRAM — but never while a GPU job is running.
 
 The reaper *thread* is disabled under tests (conftest sets
-AI_LEADS_DISABLE_GPU_IDLE_REAPER); we drive its logic directly via the pure
+QUEUE_WORKFLOWS_DISABLE_GPU_IDLE_REAPER); we drive its logic directly via the pure
 decision helper and a single ``reap_idle_once`` tick on a real ModelCache.
 """
 

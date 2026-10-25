@@ -1,6 +1,6 @@
 -- queue_workflows 0003 — workflow_input_submissions (durable user-input store).
 --
--- Rails inserts a row (status='pending') when the user submits a value for an
+-- The host app inserts a row (status='pending') when the user submits a value for an
 -- awaiting_input node; the Python InputListener polls, claims, calls
 -- dispatcher.resume_after_input, then marks processed. Replaces a transient
 -- pg_notify('input_submitted', ...) channel (which dropped submissions on
@@ -14,7 +14,7 @@
 --     'processing')) so legitimate re-submissions across retries don't 409.
 --
 -- Idempotent: `CREATE TABLE IF NOT EXISTS` + named-constraint forms that match
--- what the ai_leads chain reached, so re-running on the live DB is a no-op.
+-- what the original host chain reached, so re-running on a live DB is a no-op.
 
 CREATE TABLE IF NOT EXISTS workflow_input_submissions (
     id             text PRIMARY KEY,

@@ -1,4 +1,4 @@
-"""DEEP AUDIT — the full node_job → claim-eligibility and queue-ORDER matrix.
+"""The full node_job → claim-eligibility and queue-ORDER matrix.
 
 WHY THIS EXISTS. A node_job's fate is decided by SEVEN independent attributes that
 all meet in one SQL statement: ``queue``, ``required_model``, ``server_types``,
@@ -80,7 +80,7 @@ def test_every_row_shape_is_claimable_by_exactly_one_lane(model, servers, module
 
     A row claimable by BOTH lanes would let one box run it twice (the lanes are
     separate claim calls). A row claimable by NEITHER sits queued forever with no
-    error — the failure mode that cost 8 live jobs."""
+    error — a failure mode that silently strands live jobs."""
     jid = _q(required_model=model, server_types=servers, node_module=module)
 
     got_inline = _inline(known_models=[model] if model else None)
@@ -247,8 +247,8 @@ def test_affinity_is_never_a_filter_only_a_sort():
 
 # ═══ HALF 3 — THE DEFER VIEW MUST AGREE WITH THE CLAIM ═══════════════════════
 #
-# Found LIVE: a box deferred forever while 2579 remote-served jobs sat queued and
-# vLLM served zero requests. The claim SQL knew they were pool work; the defer view
+# The failure mode: a box defers forever while thousands of remote-served jobs sit
+# queued and vLLM serves zero requests. The claim SQL knew they were pool work; the defer view
 # still tested `required_model IS NULL`, so it saw none of them — peers read as idle
 # AND the anti-starvation break never armed. Same class as the
 # defer-standstill: two places defining "claimable" differently.

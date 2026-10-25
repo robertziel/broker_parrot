@@ -1,6 +1,6 @@
 """The GPU ON/OFF toggle also turns the machine's INFERENCE SERVER on/off.
 
-Operator policy: toggling a box's GPU worker OFF should also stop its LLM
+Policy: toggling a box's GPU worker OFF should also stop its LLM
 server (free the GPU's VRAM), and toggling it ON should start the server — so "GPU
 OFF" means the machine's GPU is actually released, not just the worker parked while
 ollama keeps a model resident.

@@ -392,8 +392,8 @@ def _install_body(name: str, ran: list):
 
 def test_enqueue_stores_dedup_key():
     run_id = make_run()
-    job_id = _enqueue_download(run_id, dedup_key="dataset|v1|2026-08-04|12z")
-    assert node_queue.get_node_job(job_id)["dedup_key"] == "dataset|v1|2026-08-04|12z"
+    job_id = _enqueue_download(run_id, dedup_key="dataset|v1|2024-01-01|12z")
+    assert node_queue.get_node_job(job_id)["dedup_key"] == "dataset|v1|2024-01-01|12z"
     # Blank ⇒ NULL — a whitespace key must never become a universal twin.
     job2 = _enqueue_download(run_id, node_id="dl2", dedup_key="   ")
     assert node_queue.get_node_job(job2)["dedup_key"] is None
@@ -403,7 +403,7 @@ def test_dedup_second_job_completes_without_running_body():
     ran: list[str] = []
     _install_body("_dl_first", ran)
     _install_body("_dl_second", ran)
-    key = "release|2026-08-04|12z"
+    key = "release|2024-01-01|12z"
 
     run_a = make_run()
     a = node_queue.enqueue_node_job(
@@ -538,7 +538,7 @@ def test_snapshot_includes_download_section():
     assert snap["counts"].get("download_queued") == 1
 
 
-# ── pg race-safety — the audit-delta-D1 lesson, applied to this arbiter ────
+# ── pg race-safety — the per-kind serializer lesson, applied to this arbiter ─
 
 
 @pytest.mark.pg_only
@@ -547,7 +547,7 @@ def test_concurrent_claims_cannot_exceed_cap():
 
     Without the (queue, project)-keyed advisory-lock serializer both MVCC
     snapshots read "0 running" and both take a row — the same race the box-slot
-    arbiter documents (D1). 10 rounds keeps the runtime tiny while making a
+    arbiter documents (test_audit_deltas_multi_server). 10 rounds keeps the runtime tiny while making a
     silent regression overwhelmingly unlikely to pass."""
     run_id = make_run()
     for i in range(2):

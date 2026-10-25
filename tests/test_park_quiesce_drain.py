@@ -1,20 +1,20 @@
 """A DRAIN-park must not fight the job it is deliberately keeping.
 
-Observed live, over about twenty minutes. An operator parked both GPU boxes from the
+Observed live. A park covered several GPU boxes from the
 panel. The panel's park lever writes ``stop_policy='drain'``, whose whole meaning is
-"finish what you are holding, claim nothing new" — so a 31-minute LLM job kept
+"finish what you are holding, claim nothing new" — so a long LLM job kept
 running, as designed. Meanwhile the park watchdog
 (rule #3: a parked box serves nobody, kill on sight) told ollama to unload the model
-that job was streaming from — every 5 seconds, 265 times:
+that job was streaming from — every 5 seconds, over and over:
 
     [park-watchdog] box-a-gpu: box is PARKED but ollama holds chat-model-a:latest —
     unloading NOW; a parked box serves nobody
 
 ollama does not refuse those. It applies the zero keep-alive at the REQUEST BOUNDARY,
 so the runner exits when the in-flight call ends and the job's NEXT call cold-reloads
-34 GiB (``Stopping...`` means "expiry scheduled", not "refused"). Measured: one box went
-from 6 model reloads in 3 h 21 m before the park to 7 in the 30 minutes after it; the
-other from 5 in 3 h 12 m to 10 in 28 minutes. The park was not releasing the card — it
+tens of GiB (``Stopping...`` means "expiry scheduled", not "refused"). The model-reload
+rate on each parked box jumped from a handful over hours before the park to several
+within half an hour after it. The park was not releasing the card — it
 was making the job it had promised to keep thrash it, while the panel said PARKED and the
 log filled with an identical line at 0.2 Hz. Two engine policies, each correct alone,
 cancelling each other out.
@@ -24,7 +24,7 @@ drained job.** Rule #2 died because a peer POSTing completions over the fast int
 could keep a parked box serving for ever — an exemption anyone outside the box could
 hold open. A job THIS worker is still running is the opposite: the park policy itself
 chose to preserve it, it is bounded (it ends, and its watchdog bounds it), and evicting
-its model mid-stream would fail work the operator asked to finish. So the watchdog holds
+its model mid-stream would fail work the park promised to finish. So the watchdog holds
 off exactly while this worker has in-flight work, and kills on sight the moment it does
 not — which is also the moment ``hard`` park reaches, since that policy re-queues the job
 first and therefore has no in-flight work at all.
@@ -74,7 +74,7 @@ _LOADED = [{"name": "chat-model-a:latest"}]
 
 def test_a_drained_job_in_flight_holds_off_the_ollama_eviction():
     """THE INCIDENT. The model the running job is streaming from must not be pulled
-    out from under it 265 times."""
+    out from under it over and over."""
     q, stopped, unloaded = _watchdog([_QUIET], [_LOADED], in_flight=[1])
 
     assert q.tick() == (False, [])
@@ -106,8 +106,8 @@ def test_the_kill_resumes_THE_MOMENT_the_drained_job_finishes():
 
 
 def test_a_PEERS_remote_traffic_still_gets_no_exemption():
-    """Rule #2 died here: 9 concurrent completions from another box kept a parked box
-    serving at 96 % GPU for ever. That must stay dead — those requests are not ours."""
+    """Rule #2 died here: concurrent completions from another box kept a parked box
+    serving at near-full GPU for ever. That must stay dead — those requests are not ours."""
     q, stopped, unloaded = _watchdog([_SERVING], [_LOADED], in_flight=[0])
 
     assert q.tick() == (True, ["chat-model-a:latest"])
@@ -150,7 +150,7 @@ def test_without_the_in_flight_seam_the_behaviour_is_unchanged():
 
 
 def test_the_unload_line_is_not_repeated_on_every_tick(caplog):
-    """265 identical lines in 22 minutes buried everything else on the box."""
+    """Hundreds of identical lines buried everything else on the box."""
     clock = _Clock()
     q, _, _ = _watchdog([_QUIET], [_LOADED], in_flight=[0], clock=clock)
 

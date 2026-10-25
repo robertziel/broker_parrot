@@ -93,7 +93,7 @@ def test_unconstrained_rows_score_zero_and_do_not_crash_the_sort():
 
 
 def test_legacy_rows_are_NOT_reordered_by_warm_affinity():
-    """REGRESSION (audit D2). The warm term sorts ABOVE `priority ASC`, so if it
+    """REGRESSION. The warm term sorts ABOVE `priority ASC`, so if it
     scored rows that never opted in, warm-model affinity would silently outrank the
     operator's priority bands for every pre-0022 row in production.
 

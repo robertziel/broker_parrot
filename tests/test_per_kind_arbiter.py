@@ -1,23 +1,21 @@
 """EVERY GPU row has a serving kind — the closed NULL hole in the per-kind arbiter.
 
-History. Migration 0023 added per-kind slot caps ("ollama allows 1!! vllm allows 3!!")
+History. Migration 0023 added per-kind slot caps (ollama 1, vllm N)
 but exempted any row with no ``server_types``: stamped NULL, it bypassed the caps
-entirely — rationalised as "not LLM-served work". On the operator's panel
-showed where that leads: box-a ran ``comfyui_video`` BESIDE ``compose_report``
-(96 % GPU) — BOTH rows undeclared, both exempt, and the second one is an
-ollama LLM user by the dispatch layer's own documentation (``llm_backends/factory.py``
-names compose_report as *"an LLM user with no model field, so no server_types
-ever gets stamped"*). Undeclared ≠ not LLM-served: 1530 rows of another LLM-calling node
-sat in the same class in one 2-day window.
+entirely — rationalised as "not LLM-served work". That leads to a box running
+``comfyui_video`` BESIDE ``report_node`` at high GPU — BOTH rows undeclared, both
+exempt, and the second one is an ollama LLM user by the dispatch layer's own
+documentation (``llm_backends/factory.py`` names such a node as *"an LLM user with no
+model field, so no server_types ever gets stamped"*). Undeclared ≠ not LLM-served: many
+rows of other LLM-calling nodes sit in the same class.
 
-THE LAW (operator decision — "it's not vllm: ollama, comfyui and any
-custom should allow 1 only"):
+THE LAW (every kind except vllm — ollama, comfyui and any custom — allows 1 only):
 
 * A GPU row's resolved kind is **NEVER NULL**: declared preference → ``'inprocess'``
   for an in-process model row → the box-default prediction (what dispatch's
   active-server-wins default will actually do).
 * Width is per KIND: ``kind_caps[kind]`` (vLLM = PAR), and **defaults to 1** for
-  every other kind — ollama, comfyui, any custom, any typo (D3's tightest-budget
+  every other kind — ollama, comfyui, any custom, any typo (the tightest-budget
   rule, now literal).
 * A legacy NULL running row (old wheel) **counts against every candidate's kind** —
   unknown is not free.
@@ -25,7 +23,7 @@ custom should allow 1 only"):
   defaults", the explicit empty dict ``{}`` is the documented opt-out.
 
 Deliberately NOT in the law: cross-KIND admission exclusion. The two-lane worker
-contract (inline warm-model diffusion beside a PAR VLM pool — ai_leads' shipped
+contract (inline warm-model diffusion beside a PAR VLM pool — a shipped host
 topology) requires an ``inprocess`` job and pool LLM work to coexist on one box;
 cross-kind stacking is arbitrated at EXECUTION by the box model lease and the
 residency enforcer, which see what is actually resident rather than a prediction.
@@ -47,7 +45,7 @@ def _q(prefs, model="chat-model-a:latest", module="llm_chat"):
 
 
 def _plain(node_id, module="llm_chat"):
-    """An UNDECLARED no-model gpu row — the ``compose_report`` /
+    """An UNDECLARED no-model gpu row — the ``report_node`` /
     ``comfyui_video`` class this law exists for."""
     return node_queue.enqueue_node_job(
         run_id=make_run(), node_id=node_id, node_module=module, queue="gpu")
@@ -83,7 +81,7 @@ def test_the_kinds_do_not_starve_each_other():
     KEPT under the law on purpose: cross-kind stacking is the box
     lease's and the residency enforcer's call at execution time (they see what is
     actually resident); admission only bounds each kind's own width. This is also
-    the two-lane worker contract — killing it would serialise ai_leads' inline
+    the two-lane worker contract — killing it would serialise a host's inline
     diffusion beside its VLM pool fleet-wide."""
     _q(["ollama"]); _q(["ollama"])
     for _ in range(3):
@@ -115,7 +113,7 @@ def test_a_refused_row_spills_to_another_box():
 def test_an_undeclared_no_model_row_is_stamped_the_default_kind():
     """FLIPS ``test_an_unconstrained_row_is_NOT_dragged_under_the_llm_caps``. The old
     exemption reasoned "a no-model pool job is not LLM-served"; the dispatch layer's
-    own docs name compose_report as an LLM user with exactly this row shape.
+    own docs name such a node as an LLM user with exactly this row shape.
     Undeclared work IS served by something — count it where it will run."""
     _plain("plain")
     got = _claim(["ollama", "vllm"], default_server="ollama")
@@ -124,12 +122,12 @@ def test_an_undeclared_no_model_row_is_stamped_the_default_kind():
 
 def test_undeclared_rows_are_capped_not_exempt():
     """FLIPS ``test_unconstrained_rows_run_beside_a_full_ollama_cap`` — THE SCREENSHOT
-    TEST. box-a: comfyui_video (undeclared → predicted ollama) ran beside
-    compose_report (undeclared ollama user). Same predicted kind, width 1 ⇒
+    TEST. A box ran comfyui_video (undeclared → predicted ollama) beside
+    report_node (undeclared ollama user). Same predicted kind, width 1 ⇒
     the second claim must be refused."""
     _plain("comfyui_video_like", module="llm_chat")
     assert _claim(["ollama", "vllm"], default_server="ollama") is not None
-    _plain("compose_report_like", module="llm_chat")
+    _plain("report_node_like", module="llm_chat")
     assert _claim(["ollama", "vllm"], default_server="ollama") is None, (
         "the pair: two undeclared rows must not run beside each other")
 
@@ -179,8 +177,8 @@ def test_inprocess_width_is_one():
 
 def test_inline_and_pool_lanes_stay_cotenant():
     """The two-lane contract holds: a running in-process diffusion job does NOT
-    block pool LLM work on the same box at admission — that co-tenancy is ai_leads'
-    shipped topology, and execution-time stacking belongs to the lease/residency
+    block pool LLM work on the same box at admission — that co-tenancy is a
+    shipped host topology, and execution-time stacking belongs to the lease/residency
     layer, which sees actual residents instead of predictions."""
     _q(None, model="tts-model-v1")
     assert node_queue.claim_next_gpu_job(
@@ -205,7 +203,7 @@ def test_the_inprocess_kind_literal_matches_llm_probe():
 
 
 def test_the_fallback_default_literal_matches_worker_control():
-    """Drift guard the constant's comment promises (audit LOW #1): node_queue keeps
+    """Drift guard the constant's comment promises: node_queue keeps
     its own literal because worker_control imports node_queue (cycle), so the pair
     must be pinned EQUAL here — behavioural tests pin each side to 'ollama'
     separately, but only this names the pairing."""
@@ -251,7 +249,7 @@ def test_a_legacy_null_row_consumes_one_vllm_slot_not_all():
 
 
 def test_an_unknown_custom_kind_gets_width_one():
-    """D3 chose the TIGHTEST budget for a kind the build has never heard of; the law
+    """The arbiter chose the TIGHTEST budget for a kind the build has never heard of; the law
     keeps that: any custom server kind serialises unless the operator caps it wider."""
     _q(["tgi"]); _q(["tgi"])
     a = _claim(["tgi"])

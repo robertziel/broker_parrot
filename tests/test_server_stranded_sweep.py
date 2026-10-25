@@ -1,4 +1,4 @@
-"""A row no live server can satisfy must be FLAGGED, not silent (analysis #3).
+"""A row no live server can satisfy must be FLAGGED, not silent.
 
 A ``['vllm']``-only job on a fleet where no vLLM answers is claimable by nobody — it
 used to sit ``queued`` forever with no error, no flag and no log. Same failure mode
@@ -71,7 +71,7 @@ def test_unconstrained_rows_are_never_flagged_by_this_sweep():
 
 
 def test_the_two_sweeps_do_not_clear_each_others_flags():
-    """ROUND-3 MED: the 0015 capacity CLEAR un-flagged stranded rows whose model
+    """The 0015 capacity CLEAR un-flagged stranded rows whose model
     happened to FIT a live worker, and the pair thrashed — 5 events in 5 tick-pairs
     against the one-event-per-episode contract. Each sweep now owns its reason."""
     _hb("a-gpu", ["ollama"])
@@ -85,7 +85,7 @@ def test_the_two_sweeps_do_not_clear_each_others_flags():
 
 
 def test_a_serverless_advertising_worker_unstrands_the_row():
-    """ROUND-3 LOW: a fresh worker advertising [] has the claim gate OFF and WILL
+    """A fresh worker advertising [] has the claim gate OFF and WILL
     claim the row — flagging it 'stranded' while a worker is about to run it lies."""
     node_queue.upsert_worker_heartbeat(
         host_label="cold-gpu", queue="gpu", concurrency=1, llm_servers_available=[])

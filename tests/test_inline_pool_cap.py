@@ -13,8 +13,8 @@ jobs were already in flight. So when the pool had claimed a job while the inline
 lane was momentarily idle, and then a model-backed job arrived, the inline lane
 ran it ON TOP → the machine held ``pool_inflight + 1`` jobs, i.e. PAR+1.
 
-Operator symptom: PAR=1 machines (box-b, box-a) showing ``2/1 node jobs`` —
-one inline diffusion stacked on one pool job — while an idle peer (box-a2) sat
+Symptom: PAR=1 machines (box-a, box-b) showing ``2/1 node jobs`` —
+one inline diffusion stacked on one pool job — while an idle peer (box-c) sat
 at ``0/1``. The over-claim drains the shared queue past the machine's own
 capacity, so a busy box keeps taking work that should spill to an idle one.
 

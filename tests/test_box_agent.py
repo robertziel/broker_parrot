@@ -171,7 +171,7 @@ def test_load_manifest_parses_lanes_and_control_dsns(tmp_path):
 def test_load_manifest_preserves_env_null_as_none(tmp_path):
     # a null env value in the manifest means "REMOVE this key from the inherited
     # environment" — needed so a lane running a host app's baked engine install
-    # doesn't inherit the agent's own PYTHONPATH (the NFS engine tree).
+    # doesn't inherit the agent's own PYTHONPATH (e.g. a network-mounted engine tree).
     import json
     p = tmp_path / "box.json"
     p.write_text(json.dumps({"lanes": [

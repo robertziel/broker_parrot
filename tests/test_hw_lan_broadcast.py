@@ -45,8 +45,8 @@ def _reset_config_preserving_db() -> None:
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     """Both spellings cleared so a stray export can't mask a default."""
-    for name in ("QUEUE_WORKFLOWS_BROADCAST_HW_STATS", "AI_LEADS_BROADCAST_HW_STATS",
-                 "QUEUE_WORKFLOWS_HW_BROADCAST_PORT", "AI_LEADS_HW_BROADCAST_PORT"):
+    for name in ("QUEUE_WORKFLOWS_BROADCAST_HW_STATS", "QUEUE_WORKFLOWS_BROADCAST_HW_STATS",
+                 "QUEUE_WORKFLOWS_HW_BROADCAST_PORT", "QUEUE_WORKFLOWS_HW_BROADCAST_PORT"):
         monkeypatch.delenv(name, raising=False)
     _reset_config_preserving_db()
     yield
@@ -110,7 +110,7 @@ def test_configure_enables_the_flag():
 
 
 @pytest.mark.parametrize("var", ["QUEUE_WORKFLOWS_BROADCAST_HW_STATS",
-                                 "AI_LEADS_BROADCAST_HW_STATS"])
+                                 "QUEUE_WORKFLOWS_BROADCAST_HW_STATS"])
 def test_env_knob_enables_the_flag_in_either_spelling(monkeypatch, var):
     monkeypatch.setenv(var, "1")
     _reset_config_preserving_db()

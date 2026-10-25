@@ -1,4 +1,4 @@
-"""``invoke_context`` hook (Phase 6 upstream from a content-generation consumer).
+"""``invoke_context`` hook (upstreamed from a content-generation consumer).
 
 A host wraps each node invoke with setup/teardown + a success-only
 ``context_delta`` finalize, WITHOUT forking ``execute_node``: ``__enter__`` does

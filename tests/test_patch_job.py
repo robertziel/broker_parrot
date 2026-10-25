@@ -1,4 +1,4 @@
-"""PATCH jobs — the operator's "fix an earlier step in place" (mode B).
+"""PATCH jobs — fix an earlier step in place (mode B).
 
 A patch job is a synthetic, NON-DAG node-job row: it re-runs one node's module
 against the CURRENT input image while the run sits parked at an awaiting-input
@@ -98,7 +98,7 @@ def patched_run(tmp_path):
         "widget": "pick_fence",
         "source_abs_path": str(orig),
         "source_rel_path": "remove_car/erase/no_car.jpg",
-        # The consumer (Rails patcher) sets this when it enqueues the patch so
+        # The consumer (the host app) sets this when it enqueues the patch so
         # every polling UI disables the input while the re-run is in flight;
         # the engine MUST clear it on patch completion AND failure.
         "patch_pending": True,

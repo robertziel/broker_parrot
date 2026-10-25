@@ -176,6 +176,48 @@ def test_anti_starvation_ignores_a_FRESH_claimable_job(monkeypatch):
     assert node_queue.vlm_pool_should_defer("bbb", 2) is True   # still defers
 
 
+def _fresh_run_next_job(*, force_box: list[str] | None = None) -> str:
+    """A just-queued no-model gpu row flagged RUN NEXT (``is_priority``) — the shape a
+    gateway's lease takes. Its age can never be what breaks a deferral; only its flag can."""
+    run_id = make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="run-next", node_module="x", queue="gpu",
+        force_box=force_box,
+    )
+    assert node_queue.prioritize_node_job(job_id) is not None
+    return job_id
+
+
+def test_a_run_next_row_is_never_held_for_packing(monkeypatch):
+    """RUN NEXT BEATS FILL-BEFORE-SPILL. Packing is a placement preference; the flag says
+    "run this next". A flagged row this box could claim breaks the deferral at age 0 instead
+    of sitting out the starvation window for a higher peer that merely READS free.
+
+    Without the break, a share of the gateway fallback leases (pinned to the ollama box,
+    which ranks below a box serving vLLM) were claimed only after sitting out the starvation
+    window; so were many of the vLLM leases box-c claimed (most carrying avoid_box={box-b}) —
+    and none of those claimed by box-b, the top-ranked box, which never defers."""
+    _beat("aaa", concurrency=2)   # earlier host, idle → ranks above "bbb"
+    _beat("bbb", concurrency=2)
+    monkeypatch.setattr(node_queue, "VLM_POOL_MAX_DEFER_AGE_S", 600)  # age cannot break it
+    assert node_queue.vlm_pool_should_defer("bbb", 2) is True
+    _fresh_run_next_job()
+    assert node_queue.vlm_pool_should_defer("bbb", 2) is False
+
+
+def test_the_run_next_break_is_placement_aware(monkeypatch):
+    """Only a flagged row THIS box could claim breaks its deferral — the claim's own placement
+    terms. A row pinned to the top box is the top box's to take, so bbb still packs; a row
+    pinned to bbb can never go up the ranking, so bbb claims now."""
+    _beat("aaa", concurrency=2)
+    _beat("bbb", concurrency=2)
+    monkeypatch.setattr(node_queue, "VLM_POOL_MAX_DEFER_AGE_S", 600)
+    _fresh_run_next_job(force_box=["aaa-box"])
+    assert node_queue.vlm_pool_should_defer("bbb", 2, box="bbb-box") is True
+    _fresh_run_next_job(force_box=["bbb-box"])
+    assert node_queue.vlm_pool_should_defer("bbb", 2, box="bbb-box") is False
+
+
 def test_defer_false_when_every_higher_peer_is_full():
     """When every higher-ranked peer is at capacity (running-no-model count >=
     its concurrency), nothing ranks above with room → M claims (no defer)."""

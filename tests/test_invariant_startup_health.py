@@ -36,8 +36,8 @@ def test_start_propagates_recovery_failure(monkeypatch):
         raise RuntimeError("simulated DB unreachable")
 
     monkeypatch.setattr(node_queue, "reclaim_expired_leases", boom)
-    monkeypatch.setenv("AI_LEADS_NODE_POOL_RECOVERY_RETRIES", "2")
-    monkeypatch.setenv("AI_LEADS_NODE_POOL_RECOVERY_BACKOFF_S", "0.0")
+    monkeypatch.setenv("QUEUE_WORKFLOWS_NODE_POOL_RECOVERY_RETRIES", "2")
+    monkeypatch.setenv("QUEUE_WORKFLOWS_NODE_POOL_RECOVERY_BACKOFF_S", "0.0")
 
     pool = node_pool.NodePool(register_builtins=None)
     with pytest.raises(RuntimeError):
@@ -87,8 +87,8 @@ def test_invariant_no_dispatch_thread_when_health_fails(monkeypatch):
         raise RuntimeError("simulated DB unreachable")
 
     monkeypatch.setattr(node_queue, "reclaim_expired_leases", boom)
-    monkeypatch.setenv("AI_LEADS_NODE_POOL_RECOVERY_RETRIES", "1")
-    monkeypatch.setenv("AI_LEADS_NODE_POOL_RECOVERY_BACKOFF_S", "0.0")
+    monkeypatch.setenv("QUEUE_WORKFLOWS_NODE_POOL_RECOVERY_RETRIES", "1")
+    monkeypatch.setenv("QUEUE_WORKFLOWS_NODE_POOL_RECOVERY_BACKOFF_S", "0.0")
 
     pool = node_pool.NodePool(register_builtins=None)
     with pytest.raises(RuntimeError):

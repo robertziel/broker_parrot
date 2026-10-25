@@ -1,4 +1,4 @@
-"""SQLite engine backend — Phase 1: the connection/dialect seam.
+"""SQLite engine backend: the connection/dialect seam.
 
 Proves the SQLite compatibility layer in ``db.py`` gives psycopg parity for the
 constructs the engine relies on: pyformat (``%s`` / ``%(name)s``) paramstyle,
@@ -237,7 +237,7 @@ def test_migration_chain_bootstraps_and_roundtrips(sqlite_engine):
     assert db.current_schema_version() == _SQLITE_CHAIN_HEAD
 
 
-# ── Phase 3: real engine queue round-trips on SQLite ────────────────────────
+# ── real engine queue round-trips on SQLite ────────────────────────
 
 
 def _mk_run(project="", status="running"):

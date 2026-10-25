@@ -46,16 +46,16 @@ def test_resolve_bare_string_and_mapping_forms(tmp_path):
         """
         boxes:
           box-b:     http://127.0.0.1:11434
-          box-a-gpu: { url: http://box-b-fast:11434 }
+          box-a-gpu: { url: http://host-b:11434 }
         """,
     )
     assert topology.resolve(path, "box-b") == {"url": "http://127.0.0.1:11434"}
-    assert topology.resolve(path, "box-a-gpu")["url"] == "http://box-b-fast:11434"
+    assert topology.resolve(path, "box-a-gpu")["url"] == "http://host-b:11434"
 
 
 def test_resolve_falls_back_to_default_then_none(tmp_path):
-    path = _write(tmp_path, "boxes:\n  default: http://box-b-fast:11434\n")
-    assert topology.resolve(path, "whoever")["url"] == "http://box-b-fast:11434"
+    path = _write(tmp_path, "boxes:\n  default: http://host-b:11434\n")
+    assert topology.resolve(path, "whoever")["url"] == "http://host-b:11434"
 
 
 def test_resolve_none_for_missing_file_or_unmatched(tmp_path):
@@ -102,14 +102,14 @@ def _plain_factory():
 
 
 def test_factory_uses_topology_url_keyed_by_host_label(tmp_path, monkeypatch):
-    path = _write(tmp_path, "boxes:\n  box-a-gpu: http://box-b-fast:11434\n")
+    path = _write(tmp_path, "boxes:\n  box-a-gpu: http://host-b:11434\n")
     cfg = get_config()
     monkeypatch.setattr(cfg, "llm_topology_path", path)
     monkeypatch.setenv(cfg.host_label_env, "box-a-gpu")
     f, _ = _plain_factory()
     # No DB row for this host → ollama; the URL comes from the TOPOLOGY (this box's
     # host_label), not the env / localhost default.
-    assert f.get_backend("box-a-gpu", "gpu").base_url == "http://box-b-fast:11434"
+    assert f.get_backend("box-a-gpu", "gpu").base_url == "http://host-b:11434"
 
 
 def test_factory_falls_back_to_default_when_no_topology(monkeypatch):

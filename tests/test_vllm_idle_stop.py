@@ -5,10 +5,10 @@ idle vLLM, but its clock is the BACKEND'S IN-PROCESS counter
 (``mark_request_start``/``mark_request_end``). That only ticks if the node routes its
 HTTP through the backend — and a second consumer's nodes are handed a URL and POST it
 themselves, as does any host-internal caller and any other project sharing the box.
-Against this fleet that clock reads "idle" while the server is flat out, so wiring
+In a shared deployment that clock reads "idle" while the server is flat out, so wiring
 the supervisor as-is would SIGTERM vLLM mid-generation.
 
-This is the same lesson the ollama reaper learned live and records in
+This is the same lesson the ollama reaper learned in production and records in
 its module docstring: the one signal every client shares is the SERVER's. ollama
 exposes it as ``/api/ps`` ``expires_at``; vLLM exposes it as the Prometheus counters
 ``vllm:num_requests_running`` (in flight now) and ``vllm:request_success_total``

@@ -3,7 +3,7 @@
 0017 pooled the queue onto one shared broker and re-keyed ``worker_heartbeats``
 to ``(host_label, queue, project)`` — but left ``worker_controls`` on the old
 2-col PK. On a shared broker ``host_label`` is not globally unique: two projects
-run a worker on the SAME machine + queue (live: ``host-b`` runs both ai_leads'
+run a worker on the SAME machine + queue (e.g. ``host-b`` runs both acme's
 and project-b's gpu worker). Sharing one control row means
 
   * an operator OFF for project A hard-stops project B's worker, and
@@ -36,24 +36,24 @@ def _two_projects():
 def test_off_for_one_project_does_not_park_the_other():
     """The finding this migration exists for."""
     worker_control.set_worker_control(
-        "host-b", "gpu", desired_state="off", project="ai_leads",
+        "host-b", "gpu", desired_state="off", project="acme",
     )
     worker_control.set_worker_control(
         "host-b", "gpu", desired_state="on", project="project-b",
     )
 
-    assert worker_control.desired_state_for("host-b", "gpu", project="ai_leads") == "off"
+    assert worker_control.desired_state_for("host-b", "gpu", project="acme") == "off"
     assert worker_control.desired_state_for("host-b", "gpu", project="project-b") == "on"
 
 
 def test_two_projects_hold_distinct_rows_on_one_host_and_queue():
     worker_control.set_worker_control(
-        "host-b", "gpu", desired_state="off", requested_by="a", project="ai_leads",
+        "host-b", "gpu", desired_state="off", requested_by="a", project="acme",
     )
     worker_control.set_worker_control(
         "host-b", "gpu", desired_state="off", requested_by="b", project="project-b",
     )
-    a = worker_control.get_worker_control("host-b", "gpu", project="ai_leads")
+    a = worker_control.get_worker_control("host-b", "gpu", project="acme")
     b = worker_control.get_worker_control("host-b", "gpu", project="project-b")
     assert a["requested_by"] == "a"
     assert b["requested_by"] == "b"
@@ -72,13 +72,13 @@ def test_upsert_is_idempotent_within_a_project():
 
 def test_llm_config_for_one_project_does_not_reconfigure_the_other():
     worker_control.set_llm_config(
-        "host-b", "gpu", server_type="vllm", parallelism=128, project="ai_leads",
+        "host-b", "gpu", server_type="vllm", parallelism=128, project="acme",
     )
     worker_control.set_llm_config(
         "host-b", "gpu", server_type="ollama", parallelism=1, project="project-b",
     )
 
-    a = worker_control.llm_config_for("host-b", "gpu", project="ai_leads")
+    a = worker_control.llm_config_for("host-b", "gpu", project="acme")
     b = worker_control.llm_config_for("host-b", "gpu", project="project-b")
     assert (a.server_type, a.parallelism) == ("vllm", 128)
     assert (b.server_type, b.parallelism) == ("ollama", 1)

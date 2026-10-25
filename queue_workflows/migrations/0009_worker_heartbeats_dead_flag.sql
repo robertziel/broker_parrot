@@ -27,7 +27,7 @@
 -- recovers (its heartbeat refreshes) has the flag CLEARED by the same heartbeat
 -- upsert, so a future hang re-flags cleanly.
 --
--- Idempotent (``IF NOT EXISTS``) so re-running on the live ai_leads DB is a
+-- Idempotent (``IF NOT EXISTS``) so re-running on an already-migrated DB is a
 -- no-op.
 
 ALTER TABLE worker_heartbeats

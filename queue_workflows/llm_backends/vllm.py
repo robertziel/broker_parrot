@@ -138,7 +138,7 @@ def _default_kill_fn() -> bool:
 
 
 def _default_ensure_up_fn(model_id: str) -> None:
-    """Default bring-up: recreate the sidecar serving ``model_id`` (Phase 6, built).
+    """Default bring-up: recreate the sidecar serving ``model_id``.
 
     This was a NO-OP for as long as the backend existed, and the cost was concrete: the
     cold-start leg relied on docker ``restart: unless-stopped`` returning the container on
@@ -177,34 +177,11 @@ _DOCKER_SOCK = os.environ.get("QUEUE_WORKFLOWS_DOCKER_SOCK", "/var/run/docker.so
 
 def _docker_api(method: str, path: str, body: dict | None = None) -> tuple[int, Any]:
     """One request to the docker Engine API over the UDS. stdlib only (psycopg stays the
-    engine's single hard dependency), so this uses http.client with a unix socket."""
-    import http.client
-    import socket as _socket
+    engine's single hard dependency) — see :mod:`docker_api`, shared with the context
+    lever, which performs the same recreate for a different value."""
+    from queue_workflows.llm_backends import docker_api
 
-    class _UDSConnection(http.client.HTTPConnection):
-        def connect(self):  # noqa: D102
-            self.sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-            # 30 s was not enough: a recreate is stop(t=30) + remove + create + start, and
-            # the stop alone can use the full grace period. The call then timed out MID-CYCLE
-            # on a live box — container removed, replacement not yet created — which is the
-            # worst place to give up. Generous, because the alternative to waiting is a
-            # half-recreated sidecar.
-            self.sock.settimeout(180)
-            self.sock.connect(_DOCKER_SOCK)
-
-    conn = _UDSConnection("localhost")
-    try:
-        payload = json.dumps(body).encode() if body is not None else None
-        conn.request(method, path, body=payload,
-                     headers={"Content-Type": "application/json"} if payload else {})
-        resp = conn.getresponse()
-        raw = resp.read()
-        try:
-            return resp.status, (json.loads(raw) if raw else None)
-        except ValueError:
-            return resp.status, raw.decode("utf-8", "replace")
-    finally:
-        conn.close()
+    return docker_api.call(method, path, body, sock_path=_DOCKER_SOCK)
 
 
 def _docker_inspect_sidecar():

@@ -1,6 +1,6 @@
 -- queue_workflows 0003 — workflow_input_submissions (durable user-input store).
 --
--- Rails inserts a row (status='pending') when the user submits a value for an
+-- The host app inserts a row (status='pending') when the user submits a value for an
 -- awaiting_input node; the Python InputListener polls, claims, calls
 -- dispatcher.resume_after_input, then marks processed. Replaces a transient
 -- notification channel (which dropped submissions on listener restart).

@@ -4,8 +4,8 @@
 -- ``worker_heartbeats`` to ``(host_label, queue, project)`` — but it left
 -- ``worker_controls`` on the old 2-col PK ``(host_label, queue)``. On a shared
 -- broker ``host_label`` is no longer globally unique: two projects can run a
--- worker on the SAME machine + queue (live example: ``host-b`` runs both
--- ai_leads' and project-b's gpu worker). With a 2-col PK those two workers share
+-- worker on the SAME machine + queue (example: one host runs both
+-- project A's and project B's gpu worker). With a 2-col PK those two workers share
 -- ONE control row, so:
 --
 --   * an operator ON/OFF for project A's worker also hard-stops project B's

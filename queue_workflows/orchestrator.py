@@ -54,7 +54,7 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         stream=sys.stdout,
     )
-    argparse.ArgumentParser(prog="queue-orchestrator").parse_args(argv or [])
+    argparse.ArgumentParser(prog="queue-orchestrator").parse_args(argv)
     _install_signal_handlers()
 
     # The orchestrator is the process that MIGRATES, so it must not race a database

@@ -1,22 +1,11 @@
-"""``ingest_store`` — the backend-agnostic ingest-job seam (``db_backend``).
+"""``ingest_store`` — the ingest-job seam the engine's ingest call sites use.
 
-The same data-layer contract must hold on BOTH backends:
-
-* ``pg`` (default) is **byte-identical** to today — the seam just delegates to the
-  existing ``node_queue.*ingest*`` functions against ``ingest_jobs``.
-* ``redis`` runs the ingest family on the StorageBackend SPI with **no**
-  ``ingest_jobs`` table at all.
-
-The redis cases SKIP when ``QUEUE_WORKFLOWS_TEST_REDIS_URL`` is unset/unreachable,
-so the suite still runs Postgres-only; CI must show redis green.
+The seam is a transparent delegate to the ``node_queue.*ingest*`` functions
+against ``ingest_jobs`` (pg or sqlite), and the live call sites (the NodePool
+reclaim sweep) must route through it.
 """
 
 from __future__ import annotations
-
-import os
-import threading
-import time
-import uuid
 
 import pytest
 
@@ -81,253 +70,18 @@ def test_enqueue_validation_rejects_before_write(backend_env):
     assert _ingest_jobs_count() == before  # nothing written on a rejected enqueue
 
 
-# ── redis path: ingest runs on the SPI, no ingest_jobs table ────────────────
+def test_node_pool_ingest_reclaim_routes_through_seam(monkeypatch):
+    """`NodePool._sweep_expired_ingest_leases` must call the ingest seam, not
+    `node_queue` directly — proven with a spy, no live worker needed."""
+    from queue_workflows import node_pool as _np
 
-
-@pytest.fixture
-def redis_ingest(monkeypatch):
-    """Configure the seam onto a fresh redis namespace; skip if redis is down."""
-    url = os.environ.get("QUEUE_WORKFLOWS_TEST_REDIS_URL")
-    if not url:
-        pytest.skip("set QUEUE_WORKFLOWS_TEST_REDIS_URL to exercise the redis path")
-    # The seam's redis backend reads its DSN from cfg.redis_url_env (default env).
-    monkeypatch.setenv("QUEUE_WORKFLOWS_REDIS_URL", url)
-    ns = f"ing_{uuid.uuid4().hex[:12]}"
-    queue_workflows.configure(db_backend="redis", db_namespace=ns)
-    queue_workflows.register_ingest_task("probe_task", _task)
-    from queue_workflows import backends
-
-    try:
-        backends.get_backend().ensure_schema()
-    except Exception as exc:  # driver missing / server down
-        pytest.skip(f"redis unreachable: {type(exc).__name__}: {exc}")
-    yield
-    backends.close_all()  # conftest _reset_engine_config restores db_backend=pg
-
-
-def test_redis_end_to_end_and_no_postgres_rows(redis_ingest):
-    jid = ingest_store.enqueue_ingest_job(
-        task_name="probe_task", queue="fetch", reason="manual", args={"scenario": 5},
+    calls: list[str] = []
+    monkeypatch.setattr(
+        ingest_store, "reclaim_expired_ingest_leases",
+        lambda: calls.append("seam") or [],
     )
-    got = ingest_store.get_ingest_job(jid)
-    assert got is not None and got["status"] == "queued"
-    assert got["task_name"] == "probe_task" and got["reason"] == "manual"
-    assert got["args"] == {"scenario": 5}
-
-    claimed = ingest_store.claim_next_ingest_job("fetch", host="w1", lease_s=30)
-    assert claimed is not None and claimed["id"] == jid
-    assert claimed["status"] == "running" and claimed["task_name"] == "probe_task"
-    assert claimed["args"] == {"scenario": 5}
-    # Nothing claimable left.
-    assert ingest_store.claim_next_ingest_job("fetch", host="w1", lease_s=30) is None
-
-    assert ingest_store.renew_ingest_lease(jid, "w1", lease_s=30) is True
-    assert ingest_store.renew_ingest_lease(jid, "someone_else", lease_s=30) is False
-
-    done = ingest_store.mark_ingest_completed(jid, result={"n": 7}, seconds=0.1)
-    assert done is not None and done["status"] == "completed"
-    assert ingest_store.mark_ingest_completed(jid, result={"n": 99}) is None  # idempotent
-    # No-clobber: the raced 2nd terminal must not overwrite the finalized result.
-    assert ingest_store.get_ingest_job(jid)["result"] == {"n": 7}
-
-    # The whole round-trip touched ZERO Postgres ingest_jobs rows.
-    assert _ingest_jobs_count() == 0
-
-
-def test_redis_mark_failed_idempotent(redis_ingest):
-    jid = ingest_store.enqueue_ingest_job(task_name="probe_task", queue="fetch")
-    ingest_store.claim_next_ingest_job("fetch", host="w1", lease_s=30)
-    failed = ingest_store.mark_ingest_failed(jid, error="boom", seconds=0.2)
-    assert failed is not None and failed["status"] == "failed"
-    assert ingest_store.mark_ingest_failed(jid, error="again") is None
-    # Cannot resurrect a failed job into completed.
-    assert ingest_store.mark_ingest_completed(jid, result={}) is None
-
-
-def test_redis_claim_exactly_once_under_contention(redis_ingest):
-    n = 25
-    ids = {
-        ingest_store.enqueue_ingest_job(task_name="probe_task", queue="fetch")
-        for _ in range(n)
-    }
-    assert len(ids) == n
-
-    claimed: list[str] = []
-    lock = threading.Lock()
-    start = threading.Event()
-
-    def worker(w: int):
-        start.wait()
-        while True:
-            job = ingest_store.claim_next_ingest_job("fetch", host=f"w{w}", lease_s=30)
-            if job is None:
-                return
-            with lock:
-                claimed.append(job["id"])
-
-    threads = [threading.Thread(target=worker, args=(w,)) for w in range(8)]
-    for t in threads:
-        t.start()
-    start.set()
-    for t in threads:
-        t.join(timeout=30)
-
-    assert sorted(claimed) == sorted(ids)        # every job claimed
-    assert len(claimed) == len(set(claimed))     # none claimed twice
-
-
-def test_redis_reclaim_expired_requeues_lapsed_lease(redis_ingest):
-    jid = ingest_store.enqueue_ingest_job(task_name="probe_task", queue="fetch")
-    # Claim with a tiny lease, let it lapse, then reclaim.
-    ingest_store.claim_next_ingest_job("fetch", host="w1", lease_s=1)
-    assert ingest_store.get_ingest_job(jid)["status"] == "running"
-    time.sleep(1.2)
-
-    reclaimed = ingest_store.reclaim_expired_ingest_leases()
-    assert any(r["id"] == jid for r in reclaimed)
-    assert {r["id"]: r["task_name"] for r in reclaimed}[jid] == "probe_task"
-    assert ingest_store.get_ingest_job(jid)["status"] == "queued"
-    # Reclaimed job is claimable again.
-    again = ingest_store.claim_next_ingest_job("fetch", host="w2", lease_s=30)
-    assert again is not None and again["id"] == jid
-
-
-def test_redis_priority_ordering_lower_number_first(redis_ingest):
-    """The seam negates priority for the SPI's DESC claim order, so the engine's
-    ingest convention holds: a LOWER priority number is claimed first. Guards the
-    negation mapping (a dropped negation would invert the order)."""
-    low_first = ingest_store.enqueue_ingest_job(
-        task_name="probe_task", queue="fetch", priority=10,
-    )
-    later = ingest_store.enqueue_ingest_job(
-        task_name="probe_task", queue="fetch", priority=100,
-    )
-    first = ingest_store.claim_next_ingest_job("fetch", host="w1", lease_s=30)
-    second = ingest_store.claim_next_ingest_job("fetch", host="w1", lease_s=30)
-    assert first["id"] == low_first and first["priority"] == 10
-    assert second["id"] == later and second["priority"] == 100
-
-
-def test_redis_snapshot_reflects_state(redis_ingest):
-    ingest_store.enqueue_ingest_job(task_name="probe_task", queue="fetch")
-    ingest_store.enqueue_ingest_job(task_name="probe_task", queue="fetch")
-    ingest_store.claim_next_ingest_job("fetch", host="w1", lease_s=30)
-    from queue_workflows import backends
-
-    backends.get_backend().heartbeat("w1", "fetch")
-
-    snap = ingest_store.ingest_snapshot()["queues"]["fetch"]
-    assert snap["queued"] == 1 and snap["running"] == 1
-    assert snap["workers"] >= 1
-
-
-# ── SPI seam logic, hermetic: a stub backend, no server ─────────────────────
-# The redis/mongo cases above need live servers and SKIP without them, which
-# left the seam's mapping logic (priority inversion, row re-inflation, the
-# reclaim projection) uncovered on the hermetic gate. A stub StorageBackend
-# pins those contracts with no server at all.
-
-
-class _StubBackend:
-    def __init__(self):
-        self.enqueued: list[tuple] = []
-        self.jobs: dict[str, dict] = {}
-        self.calls: list[tuple] = []
-        self.reclaim_ids: list[str] = []
-
-    def enqueue(self, queue, payload, *, job_id, priority):
-        self.enqueued.append((queue, payload, job_id, priority))
-        self.jobs[job_id] = {
-            "id": job_id, "queue": queue, "payload": payload, "priority": priority,
-        }
-        return job_id
-
-    def get(self, job_id):
-        return self.jobs.get(job_id)
-
-    def claim(self, queue, host, *, lease_s):
-        self.calls.append(("claim", queue, host, lease_s))
-        for j in self.jobs.values():
-            if j["queue"] == queue:
-                return j
-        return None
-
-    def renew_lease(self, job_id, host, *, lease_s):
-        self.calls.append(("renew_lease", job_id, host, lease_s))
-        return True
-
-    def mark_completed(self, job_id, *, result=None):
-        self.calls.append(("mark_completed", job_id, result))
-        return self.jobs.get(job_id)
-
-    def mark_failed(self, job_id, *, error=None):
-        self.calls.append(("mark_failed", job_id, error))
-        return self.jobs.get(job_id)
-
-    def reclaim_expired(self):
-        return list(self.reclaim_ids)
-
-    def counts(self, queue):
-        return {"queued": 3, "running": 1}
-
-    def workers(self, queue):
-        return ["w1", "w2"]
-
-
-@pytest.fixture
-def stub_spi(monkeypatch):
-    stub = _StubBackend()
-    monkeypatch.setattr(ingest_store, "_use_spi", lambda: True)
-    monkeypatch.setattr(ingest_store, "_backend", lambda: stub)
-    queue_workflows.register_ingest_task("probe_task", _task)
-    return stub
-
-
-def test_spi_enqueue_negates_priority_and_shapes_payload(stub_spi):
-    # Ingest orders priority ASC (lower = sooner); the SPI claims DESC. The seam
-    # must store the negation or "lower runs first" silently inverts on redis/mongo.
-    jid = ingest_store.enqueue_ingest_job(
-        task_name="probe_task", queue="fetch", reason="manual",
-        priority=25, args={"k": 1},
-    )
-    (queue, payload, job_id, priority), = stub_spi.enqueued
-    assert queue == "fetch" and job_id == jid
-    assert priority == -25
-    assert payload == {"task_name": "probe_task", "reason": "manual", "args": {"k": 1}}
-
-
-def test_spi_claim_reinflates_row_with_defaults(stub_spi):
-    # A claimed SPI Job comes back in the flat ingest-row shape execute_ingest_job
-    # reads; a payload missing reason/args re-inflates to the documented defaults.
-    jid = ingest_store.enqueue_ingest_job(task_name="probe_task", queue="fetch")
-    stub_spi.jobs[jid]["payload"] = {"task_name": "probe_task"}  # sparse payload
-    row = ingest_store.claim_next_ingest_job("fetch", host="h1", lease_s=42)
-    expected = {"id": jid, "task_name": "probe_task", "queue": "fetch",
-                "reason": "tick", "args": {}}
-    assert expected.items() <= row.items()  # re-inflated shape (superset ok)
-    assert ("claim", "fetch", "h1", 42.0) in stub_spi.calls
-
-
-def test_spi_get_and_terminal_delegation(stub_spi):
-    assert ingest_store.get_ingest_job("missing") is None
-    jid = ingest_store.enqueue_ingest_job(task_name="probe_task", queue="load")
-    assert ingest_store.get_ingest_job(jid)["id"] == jid
-    assert ingest_store.renew_ingest_lease(jid, "h1", lease_s=7) is True
-    ingest_store.mark_ingest_completed(jid, result={"ok": 1})
-    ingest_store.mark_ingest_failed(jid, error="boom")
-    kinds = [c[0] for c in stub_spi.calls]
-    assert {"renew_lease", "mark_completed", "mark_failed"} <= set(kinds)
-
-
-def test_spi_reclaim_projects_id_task_queue_and_skips_vanished(stub_spi):
-    jid = ingest_store.enqueue_ingest_job(task_name="probe_task", queue="fetch")
-    stub_spi.reclaim_ids = [jid, "vanished-id"]  # a row deleted between calls
-    out = ingest_store.reclaim_expired_ingest_leases()
-    assert out == [{"id": jid, "task_name": "probe_task", "queue": "fetch"}]
-
-
-def test_spi_snapshot_shape(stub_spi):
-    snap = ingest_store.ingest_snapshot()
-    assert set(snap["queues"]) == set(queue_workflows.get_config().ingest_queues)
-    q = snap["queues"]["fetch"]
-    assert q == {"queued": 3, "running": 1, "completed": 0, "failed": 0, "workers": 2}
+    pool = _np.NodePool()
+    pool._ingest_reclaim_last_run = 0.0          # bypass the interval gate
+    pool._ingest_reclaim_interval_s = 0.0
+    pool._sweep_expired_ingest_leases()
+    assert calls == ["seam"]

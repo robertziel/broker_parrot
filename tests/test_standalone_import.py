@@ -1,4 +1,4 @@
-"""Standalone gate (plan acceptance §7) — the engine runs with only psycopg +
+"""Standalone gate — the engine runs with only psycopg +
 Postgres, no host on the path.
 
 ``import queue_workflows; queue_workflows.configure(...)`` succeeds, all the
@@ -6,7 +6,7 @@ registration hooks are callable, the safe defaults are in place, and a real
 round-trip against the engine's own schema works (insert a run via run_store,
 enqueue a node job, claim it, mark it complete, drain a dispatch event).
 
-These exercise the engine end-to-end WITHOUT any ai_leads node module / model
+These exercise the engine end-to-end WITHOUT any host node module / model
 spec — the workflow provider + a fake node module are supplied in-test, keeping
 the engine suite domain-free.
 """
@@ -35,18 +35,15 @@ def test_default_backend_is_sqlite(monkeypatch):
     monkeypatch.delenv("QUEUE_WORKFLOWS_DB_BACKEND", raising=False)
     from queue_workflows.config import EngineConfig
     assert EngineConfig().db_backend == "sqlite"
-    # env-name defaults are now the CANONICAL library names; the legacy
-    # AI_LEADS_* spellings resolve via envcompat (tests/test_env_compat.py).
+    # env-name defaults are the canonical library names (tests/test_env_compat.py).
     assert EngineConfig().db_url_env == "QUEUE_WORKFLOWS_DB_URL"
-    assert EngineConfig().container_prefix == "ai_leads-"  # a VALUE (cgroup prefix), not an env name — unchanged
+    assert EngineConfig().container_prefix == ""  # no host-specific default: attribution off
 
 
 def test_import_and_configure_with_safe_defaults():
     cfg = queue_workflows.configure()  # no args — all defaults
-    # Defaults keep ai_leads byte-compat ENV NAMES (the db_backend default is
-    # sqlite now — see test_default_backend_is_sqlite).
     assert cfg.db_url_env  # set by conftest to the test env
-    assert cfg.container_prefix == "ai_leads-"
+    assert cfg.container_prefix == ""
     # Safe defaults: empty video set, no node package, no-op registrar.
     assert isinstance(cfg.video_model_ids, frozenset)
     # builtin_model_registrar default is a no-op (callable, returns None).

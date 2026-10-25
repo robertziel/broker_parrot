@@ -1,7 +1,7 @@
 """One queue, all 3 projects, via the CLIENT LIBRARY — end-to-end + isolation.
 
 The headline guarantee of the consolidation, proven at the *full lifecycle* level
-(not just the queue primitives): three real projects — ai_leads, alpha,
+(not just the queue primitives): three real projects — acme, alpha,
 beta — each wired ONLY through the public client API
 (``configure(project=…)`` + the workflow/node hooks + ``dispatcher.start_run`` +
 ``ClaimWorker`` + ``NodePool``) share ONE broker database and each runs a
@@ -30,7 +30,7 @@ from queue_workflows.claim_worker import ClaimWorker
 from queue_workflows.db import connection
 from tests._helpers import force_lease, make_run, row
 
-PROJECTS = ["ai_leads", "alpha", "beta"]
+PROJECTS = ["acme", "alpha", "beta"]
 
 # ── shared client wiring (one fake workflow + node, used by every project) ──
 _RAN: list[str] = []  # the project each worker was configured as when it executed
@@ -92,13 +92,13 @@ def test_three_projects_one_broker_full_lifecycle():
     assert {r["project"] for r in rows} == set(PROJECTS)
     assert all(r["queue"] == "cpu" and r["n"] == 1 for r in rows)
 
-    # 2) ISOLATION: ai_leads' worker runs ONLY ai_leads' job; alpha &
+    # 2) ISOLATION: acme' worker runs ONLY acme' job; alpha &
     #    beta jobs stay queued (the worker never claimed them).
-    assert _client_drain_queue("ai_leads") == 1
-    assert _RAN == ["ai_leads"]                                   # only ai_leads ran
+    assert _client_drain_queue("acme") == 1
+    assert _RAN == ["acme"]                                   # only acme ran
     by_project = {p: node_queue.list_jobs_for_run(runs[p])[0] for p in PROJECTS}
-    assert by_project["ai_leads"]["status"] == "completed"
-    assert by_project["ai_leads"]["project"] == "ai_leads"
+    assert by_project["acme"]["status"] == "completed"
+    assert by_project["acme"]["project"] == "acme"
     assert by_project["alpha"]["status"] == "queued"          # untouched
     assert by_project["beta"]["status"] == "queued"
 
@@ -171,7 +171,7 @@ def test_reclaim_preserves_project_tag_on_shared_broker():
     by the wrong tenant. With 2 projects on the shared broker: reclaim A's expired
     orphan, assert its tag survives, and that B's worker claims only B's job and
     NOT the re-queued A orphan."""
-    queue_workflows.configure(project="ai_leads")
+    queue_workflows.configure(project="acme")
     a_job = node_queue.enqueue_node_job(run_id=make_run(), node_id="a",
                                         node_module="m", queue="cpu")
     force_lease(a_job, expires_in_s=-30)              # running + expired lease
@@ -182,13 +182,13 @@ def test_reclaim_preserves_project_tag_on_shared_broker():
     reclaimed = [r["id"] for r in node_queue.reclaim_expired_leases()]  # broker-wide
     assert a_job in reclaimed
     assert row(a_job)["status"] == "queued"
-    assert row(a_job)["project"] == "ai_leads"        # TAG PRESERVED
+    assert row(a_job)["project"] == "acme"        # TAG PRESERVED
 
-    # alpha's worker claims ONLY its own job, never the re-queued ai_leads orphan
+    # alpha's worker claims ONLY its own job, never the re-queued acme orphan
     got = node_queue.claim_next_cpu_job(0, host="alpha-w", project="alpha")
     assert got["id"] == b_job
     assert node_queue.claim_next_cpu_job(0, host="alpha-w", project="alpha") is None
-    assert row(a_job)["status"] == "queued"           # still waiting for ai_leads
+    assert row(a_job)["status"] == "queued"           # still waiting for acme
 
 
 def test_no_cross_project_claim_on_shared_queue():
@@ -202,6 +202,6 @@ def test_no_cross_project_claim_on_shared_queue():
     w = ClaimWorker(queue="cpu", host="beta-cpu")
     assert w.run_once() is True                       # its own job
     assert w.run_once() is False                      # empty for it now
-    # ai_leads & alpha jobs are still queued — beta's worker never touched them.
-    assert node_queue.list_jobs_for_run(runs["ai_leads"])[0]["status"] == "queued"
+    # acme & alpha jobs are still queued — beta's worker never touched them.
+    assert node_queue.list_jobs_for_run(runs["acme"])[0]["status"] == "queued"
     assert node_queue.list_jobs_for_run(runs["alpha"])[0]["status"] == "queued"

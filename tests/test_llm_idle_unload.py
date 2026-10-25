@@ -56,7 +56,7 @@ def test_default_ttl_is_five_minutes():
 
 def test_ttl_resolves_from_configure(monkeypatch):
     monkeypatch.delenv("QUEUE_WORKFLOWS_LLM_SERVER_IDLE_TTL_S", raising=False)
-    monkeypatch.delenv("AI_LEADS_LLM_SERVER_IDLE_TTL_S", raising=False)
+    monkeypatch.delenv("QUEUE_WORKFLOWS_LLM_SERVER_IDLE_TTL_S", raising=False)
     queue_workflows.configure(llm_server_idle_ttl_s=120)
     assert llm_idle_unload.resolve_llm_idle_ttl_s() == 120.0
     # …and a reaper armed AFTER configure() picks it up (call-time, not import-time)
@@ -75,7 +75,7 @@ def test_ttl_env_knob_overrides_configure(monkeypatch):
 
 def test_ttl_defaults_when_nothing_set(monkeypatch):
     monkeypatch.delenv("QUEUE_WORKFLOWS_LLM_SERVER_IDLE_TTL_S", raising=False)
-    monkeypatch.delenv("AI_LEADS_LLM_SERVER_IDLE_TTL_S", raising=False)
+    monkeypatch.delenv("QUEUE_WORKFLOWS_LLM_SERVER_IDLE_TTL_S", raising=False)
     assert llm_idle_unload.resolve_llm_idle_ttl_s() == 300.0
 
 
@@ -225,7 +225,7 @@ def test_loaded_models_empty_on_nothing_or_unreachable():
 
 
 def test_loaded_models_info_carries_the_expiry_as_mru():
-    ps = {"models": [{"name": "chat-model-c", "expires_at": "2026-07-19T21:00:00.123456789Z"}]}
+    ps = {"models": [{"name": "chat-model-c", "expires_at": "2024-01-01T00:00:00.123456789Z"}]}
     got = llm_probe.loaded_models_info("http://box:11434", get_json_fn=lambda u, t: ps)
     assert got[0]["name"] == "chat-model-c" and got[0]["mru"] > 0
 

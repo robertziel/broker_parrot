@@ -47,5 +47,5 @@ dispatcher.
   [use cases 1–4](01_box_power_loss.md): a lost box re-runs *only that node*,
   at the front of the queue, and the run continues.
 
-See the end-to-end worked example in the [README](../../README.md#-example-implementation)
+See the end-to-end worked example in the [README](../../README.md#quickstart)
 and the mental model in [`../architecture.md`](../architecture.md).

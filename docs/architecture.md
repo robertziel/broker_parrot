@@ -2,7 +2,7 @@
 
 *The mental model: Postgres is the message bus, three processes share it, and everything domain-specific is an injected hook.*
 
-This doc is the map. For the liveness/lease/watchdog detail see [watchdogs](watchdogs.md); for table shapes see [schema](schema.md); for the full config-hook reference see [configuration](configuration.md); for how the v2 `broker_service` inverts part of this model see [broker](broker.md).
+This doc is the map. For the liveness/lease/watchdog detail see [watchdogs](watchdogs.md); for table shapes see [schema](schema.md); for the full config-hook reference see [configuration](configuration.md); for sharing one queue across projects see [broker](broker.md).
 
 ## 1. The database is the message bus
 
@@ -163,7 +163,7 @@ The engine carries two independent job shapes over the same claim/lease/watchdog
 | | DAG node-jobs | Ingest jobs |
 |---|---|---|
 | Table | `workflow_node_jobs` | `ingest_jobs` |
-| Queues | `cpu` / `gpu` (reserved) | host-defined (`config.ingest_queues`, default `{fetch, load}`) |
+| Queues | `cpu` / `gpu` / `download` (reserved) | host-defined (`config.ingest_queues`, default `{fetch, load}`) |
 | Enqueued by | the dispatcher, fanning out a run | the scheduler ticker, or any host directly |
 | Shape | one node inside a pipeline DAG | a single self-contained task, no dependencies |
 | Carries | resolved `$from` inputs from upstream nodes | optional per-job `args JSONB` |
@@ -179,10 +179,10 @@ The full hook reference (workflow/pipeline provider, node-module resolver, built
 ## Where to go next
 
 - **Liveness in depth** (leases, the three watchdogs, the dead-worker last-resort layer) → [watchdogs](watchdogs.md)
-- **Table-by-table schema, migration chain (0001–0019)** → [schema](schema.md)
+- **Table-by-table schema, migration chain (0001–0030)** → [schema](schema.md)
 - **All config hooks + env knobs** → [configuration](configuration.md)
-- **Storage backend seam** (sqlite/pg vs redis/mongodb) → [storage_backends](storage_backends.md)
+- **Storage backend seam** (sqlite vs pg) → [storage_backends](storage_backends.md)
 - **Operator ON/OFF control plane** → [worker_control](worker_control.md)
 - **GPU model cache + LLM server resolution** → [gpu_and_llm](gpu_and_llm.md)
-- **The v2 `broker_service`** — inverts this doc's autonomous-worker model into a central pull→grant broker; the process roles above still run underneath it → [broker](broker.md)
+- **Sharing one queue across projects** (the `project` tag) → [broker](broker.md)
 - **Deploying the fleet** → [deployment](deployment.md)

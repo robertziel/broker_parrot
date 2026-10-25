@@ -1,7 +1,7 @@
 """The PG-native ingest ticker (``scheduler``).
 
 The ticker ENQUEUEs claim-able ``ingest_jobs`` rows on an injected schedule
-(plan §1f — the engine ships the machinery; the host supplies the SCHEDULE +
+(the engine ships the machinery; the host supplies the SCHEDULE +
 task map). These tests register a fake schedule + fake ingest tasks, then pin:
 
   * the pure next-fire / soonest schedule math (injected clock, no real sleep);
@@ -21,7 +21,7 @@ from queue_workflows import scheduler
 from queue_workflows.db import connection
 
 
-# A fake host schedule, mirroring the shape ai_leads uses (fetch@:37,
+# A fake host schedule, mirroring the shape a host uses (fetch@:37,
 # load@:47, freshness@:07) but registered via the public hook.
 _FAKE_SCHEDULE = [
     scheduler.ScheduleEntry("ingest-fetch-hourly", 37, "run_fetch_all", "fetch"),

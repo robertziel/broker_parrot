@@ -1,6 +1,6 @@
 """Shared engine-test helpers (domain-free).
 
-The ai_leads engine tests built a parent run via ``repo.upsert_parcel`` +
+The original host app's engine tests built a parent run via ``repo.upsert_parcel`` +
 ``repo.insert_run`` (a parcel FK + the SQLModel ORM). The engine suite must
 stay domain-free, so we insert the run through the engine's own
 :func:`queue_workflows.run_store.insert_run` — ``workflow_runs`` is parcel-

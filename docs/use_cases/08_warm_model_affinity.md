@@ -21,11 +21,14 @@ models constantly — the fleet spends its life in `load_state_dict`.
 
 ```
 ORDER BY is_priority DESC,          -- machine-loss requeues + operator "run next"
+         affinity DESC,             -- required_model IS NOT DISTINCT FROM current_model
+         warm (server, model) DESC, -- the box's warm LLM server already serves it
          priority ASC,              -- the band
-         affinity (warm model), host_priority, created_at …
+         created_at × host_dir ASC  -- host_priority: head or tail of the queue
 ```
 
-Affinity is a **tiebreak, not a law**: a front-of-queue job (see
+Affinity outranks the `priority` band (a warm-model job runs before a colder
+one from a better band) but is an ORDER BY term, never a filter: a front-of-queue job (see
 [use case 1](01_box_power_loss.md) / [09](09_urgent_job_run_next.md)) may
 force a model swap on a healthy box — deliberately, because the box with the
 warm copy may be the one that just died.

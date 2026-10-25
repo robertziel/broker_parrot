@@ -63,6 +63,14 @@ LLM_SERVER_SLOT = "__llm_server__"
 #: ComfyUI URL) and the job carries no ``required_model``.
 COMFYUI_SERVER_SLOT = "__comfyui_server__"
 
+#: The lease key for a CLUSTER RESERVATION (``node_queue.CLUSTER_SERVER_KIND``): the card is
+#: held for a server the engine did not start and cannot see — e.g. an external multi-GPU vLLM spanning
+#: several boxes — so it is an occupant of its own. It is neither the LLM server (the hold stops that
+#: one) nor a ComfyUI render (such a box may serve both, and a reservation keyed there would share
+#: the card with a render), and while it is held every other project's occupant is denied and
+#: spills.
+CLUSTER_RESERVATION_SLOT = "__cluster_reservation__"
+
 #: Prefix for SELF-MANAGING GPU work — a node that puts its OWN thing on the card
 #: and needs no server at all (Blender/EEVEE, a bespoke CUDA kernel, a rasteriser).
 #:
@@ -101,9 +109,30 @@ def describe_slot(slot: str | None) -> str:
         return "LLM server"
     if slot == COMFYUI_SERVER_SLOT:
         return "ComfyUI render"
+    if slot == CLUSTER_RESERVATION_SLOT:
+        return "cluster reservation"
     if slot.startswith(SELF_MANAGED_SLOT_PREFIX):
         return f"GPU job: {slot[len(SELF_MANAGED_SLOT_PREFIX):]}"
     return slot                      # a real model id — already human-readable
+
+
+def is_sentinel_slot(slot: str | None) -> bool:
+    """Is this lease key a SENTINEL — an occupant that is not a model?
+
+    Every sentinel in this module is written ``__name__`` (:data:`LLM_SERVER_SLOT`,
+    :data:`COMFYUI_SERVER_SLOT`, ``claim_worker.SWITCH_SLOT``) or ``__gpu__:<module>``
+    (:func:`self_managed_slot`), and a model id never looks like either — so the
+    CONVENTION is the test, and a sentinel added later is covered without editing a
+    list that someone would forget. ``tests/test_gpu_box_model_lease_gate.py`` pins the
+    named ones to the convention so a rename that breaks it fails loudly.
+
+    Only a non-sentinel belongs in a field called ``current_model``."""
+    if not slot:
+        return False
+    text = str(slot)
+    if text.startswith(SELF_MANAGED_SLOT_PREFIX):
+        return True
+    return text.startswith("__") and text.endswith("__")
 
 
 def is_llm_slot(slot: str | None) -> bool:
@@ -219,10 +248,10 @@ class FileLeaseStore:
                     os.chmod(path, 0o666)  # nosec B103 — deliberate: cross-uid flock target (root containers + host procs)
                 except OSError:
                     pass
-            # NON-BLOCKING with a bounded retry — found live on box-c: a plain
+            # NON-BLOCKING with a bounded retry — a plain
             # LOCK_EX blocks FOREVER when a crashed/stuck peer keeps the fd open,
             # and this lock is taken on the HEARTBEAT thread (the switch hold, the
-            # lease tick) — the wedge froze heartbeats for 18 minutes. A lease that
+            # lease tick) — a wedge there freezes heartbeats indefinitely. A lease that
             # cannot be locked within ~2 s is treated as CONTENDED: acquire/renew
             # read that as DENIED (the caller spills — its documented behaviour),
             # release leaves the TTL to expire the entry. Liveness beats fairness

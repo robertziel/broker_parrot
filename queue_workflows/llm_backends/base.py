@@ -26,7 +26,7 @@ DESIGN — what the backend owns, and what it does NOT.
     the call with :meth:`mark_request_start` / :meth:`mark_request_end`. Keeping
     the transport out of the backend is what lets this module stay free of any
     HTTP client dependency and import nothing but stdlib + ``queue_workflows.*``
-    (the Phase-6 inversion guard).
+    (the host-import guard test).
   * It is deliberately **OpenAI-chat-shape biased and vendor-coupled** to exactly
     ollama + vllm. This is not a general LLM abstraction; both backends speak the
     same ``POST /…/chat`` request shape, so the host node is written once. A third

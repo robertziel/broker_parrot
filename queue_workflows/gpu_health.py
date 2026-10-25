@@ -67,7 +67,7 @@ log = logging.getLogger(__name__)
 # Where a cgroup-v2 container sees its OWN memory accounting (namespaced root).
 _CGROUP_MEMORY_CURRENT = "/sys/fs/cgroup/memory.current"
 
-# pmon single-sample call is cheap (~0.06 s on box-c); cap it hard so a stuck
+# pmon single-sample call is cheap (~0.06 s); cap it hard so a stuck
 # nvidia-smi can never block the watchdog's poll thread.
 _PMON_TIMEOUT_S = 4
 
@@ -97,7 +97,7 @@ def _nvidia_pmon_container_sm_pct() -> int | None:
 
     Returns ``None`` (→ caller falls back to box level) when pmon is absent /
     errors / prints only its header. A row whose ``sm%`` is ``-`` (N/A — the
-    common box-c case for a process not actively issuing SM work) counts as 0.
+    common case for a process not actively issuing SM work) counts as 0.
     """
     try:
         raw = subprocess.check_output(

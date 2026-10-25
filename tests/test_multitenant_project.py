@@ -174,7 +174,7 @@ def test_snapshot_counts_filter_by_project():
     assert node_queue.snapshot()["counts"].get("cpu_queued") == 2
 
 
-# ── orchestrator row-pickup paths are project-scoped too (audit fixes) ───────
+# ── orchestrator row-pickup paths are project-scoped too ─────────────────────
 
 
 def test_dispatch_run_selection_is_project_scoped():
@@ -259,7 +259,7 @@ def test_requeue_running_for_worker_is_project_scoped():
     assert node_queue.get_node_job(b)["status"] == "running"  # beta untouched
 
 
-# ── orchestrator startup + periodic recovery paths are scoped (audit round 2) ─
+# ── orchestrator startup + periodic recovery paths are scoped ───────────────────
 
 
 def _running_job(project: str, claimed_by: str = "hostX") -> str:

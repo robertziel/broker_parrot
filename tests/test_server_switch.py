@@ -1,9 +1,9 @@
 """ONE SERVER AT A TIME — the drain-based switch state machine.
 
-Moving a box from ollama to vLLM is not "unload then start". vLLM needs ~8 minutes to
-load 35 GB, and a box that keeps claiming during those 8 minutes reloads the server it
-just unloaded. Observed live on box-a: peak 117.7/121 GB with BOTH resident, ~3 GB
-from OOM on a machine that has already died of OOM once, followed by the incoming vLLM
+Moving a box from ollama to vLLM is not "unload then start". vLLM needs minutes to
+load a large model, and a box that keeps claiming during those minutes reloads the server it
+just unloaded. The result: peak memory near the box's total with BOTH resident, a few GB
+from OOM, followed by the incoming vLLM
 losing the residency vote (it had no traffic yet) and being killed — forever.
 
 The missing thing is an OUT-OF-SERVICE WINDOW, not an ordering. These pin it.
@@ -90,9 +90,9 @@ def test_draining_waits_for_in_flight_to_reach_zero():
 
 
 def test_drained_box_unloads_FIRST_and_does_not_start_in_the_same_breath():
-    """AUDIT D1. The unload and the start must not be issued together: an unload can
+    """The unload and the start must not be issued together: an unload can
     silently fail (the lever returns what it actually freed, and it may free nothing),
-    and starting anyway is exactly how the box ended up holding two 34 GB copies."""
+    and starting anyway is exactly how the box ended up holding two full copies of the weights."""
     m, _ = _m()
     m.request("vllm")
     acts = m.tick(in_flight=0, outgoing_loaded=True, incoming_ready=False)
@@ -112,7 +112,7 @@ def test_the_incoming_starts_only_once_the_outgoing_is_OBSERVED_gone():
 
 
 def test_an_unload_that_never_takes_effect_ABORTS_instead_of_starting():
-    """AUDIT D1, the sharp end: a silently-failed unload must cost a slow queue, not
+    """The sharp end of the same rule: a silently-failed unload must cost a slow queue, not
     an OOM. The incoming server is never started on top of the outgoing one."""
     m, clock = _m(drain_timeout_s=60.0, unload_timeout_s=60.0)
     m.request("vllm")
@@ -151,7 +151,7 @@ def test_an_already_unloaded_outgoing_skips_straight_to_the_start():
 
 
 def test_a_failed_START_is_retried_so_the_box_is_not_left_with_NO_server():
-    """AUDIT D2. Actions are emitted once; if the caller's start hook raises, the box
+    """Actions are emitted once; if the caller's start hook raises, the box
     would otherwise sit out the whole warm window having unloaded one server and
     started none."""
     m, clock = _m(retry_every_s=30.0, warm_timeout_s=600.0)
@@ -292,8 +292,8 @@ def test_a_completed_switch_can_be_followed_by_another():
 
 # ═══ WIRING — a state machine nothing calls is worthless ═════════════════════
 #
-# AUDIT D6: the unit tests above never touched claim_worker, which is exactly where
-# the two real defects (D1: start-on-failed-unload; D2: actions never retried) lived.
+# The unit tests above never touch claim_worker, which is exactly where the two real
+# defects (start-on-failed-unload; actions never retried) lived.
 
 
 def _gpu_worker():
@@ -341,8 +341,8 @@ def test_both_lanes_serve_again_once_the_switch_aborts():
         w.host_priority = 0
         w._claim_pool()
         assert len(calls) == 1, "pool lane must attempt a claim after the abort"
-        # …and the INLINE lane too (round-2 delta: the test name said both, the
-        # body drove one).
+        # …and the INLINE lane too (the test name says both, so the body
+        # drives both).
         w.model_cache = type("MC", (), {"current_model": None})()
         w._gpu_capacity_for_claim = lambda: (None, [], False)
         w._claim()
@@ -352,7 +352,7 @@ def test_both_lanes_serve_again_once_the_switch_aborts():
 
 
 def test_the_enforcer_is_given_the_switchs_protected_kind(monkeypatch):
-    """AUDIT (round 1 D6, round 2 MEDIUM): the protection has to REACH the vote. The
+    """The protection has to REACH the vote. The
     first version of this test was a source grep — it stayed green with the wiring
     commented out. Now the real arm method runs and the captured constructor kwarg
     must BE the switch's bound method, so dead wiring fails."""
@@ -383,14 +383,14 @@ def test_the_enforcer_is_given_the_switchs_protected_kind(monkeypatch):
     assert captured["protected_server_fn"]() == "vllm"
 
 
-# ═══ AUDIT ROUND 2 ═══════════════════════════════════════════════════════════
+# ═══ WARMING retries and the outgoing server ═════════════════════════════════
 
 
 def test_the_WARMING_retry_never_starts_while_the_outgoing_is_back():
-    """ROUND-2 HIGH: the D2 retry re-opened D1. The retry re-issued START_INCOMING
+    """The start retry must not re-open the unload-first rule. The retry re-issued START_INCOMING
     without re-checking the world — but the outgoing server can REAPPEAR mid-warm (a
     peer worker on the same box reloads it; the switch is per-process). Starting then
-    is the two-copies bug again, through the retry door. 1,486/12,000 fuzz violations
+    is the two-copies bug again, through the retry door. A fuzz run found violations
     before the fix, all in WARMING."""
     m, clock = _m(retry_every_s=30.0, warm_timeout_s=600.0)
     m.request("vllm")
@@ -411,7 +411,7 @@ def test_the_WARMING_retry_never_starts_while_the_outgoing_is_back():
 
 
 def test_SWITCHING_retry_honours_the_stated_cadence():
-    """ROUND-2 INFO: entering SWITCHING zeroed the retry clock, so the first retry
+    """Entering SWITCHING zeroed the retry clock, so the first retry
     fired on the very next tick (11 pulls in 300 s at retry_every_s=30)."""
     m, clock = _m(drain_timeout_s=600.0, retry_every_s=30.0)
     m.request("vllm")
@@ -447,7 +447,7 @@ def test_retry_interval_constant_is_exported():
 
 
 def test_blocks_claims_self_aborts_when_nobody_ticks():
-    """Analysis #6 / audit D4: the timeout escapes lived only in tick(), so a box
+    """The timeout escapes lived only in tick(), so a box
     whose heartbeat stopped (config-reachable kill-switch) stayed blocked forever.
     The claim path calls blocks_claims() every loop — it must be its own escape."""
     m, clock = _m(drain_timeout_s=60.0)
@@ -555,7 +555,7 @@ def test_the_switch_HOLDS_the_box_lease_and_releases_on_resolution(monkeypatch):
 
 
 def test_the_lease_tick_never_clobbers_the_switch_slot(monkeypatch):
-    """ROUND-3 HIGH. _box_lease_tick drives the switch (which acquires SWITCH_SLOT)
+    """_box_lease_tick drives the switch (which acquires SWITCH_SLOT)
     and then renewed its held MODEL one line later — renew() being acquire() on the
     single-slot store, the switch's hold survived 1 of 6 ticks and peers kept
     reloading the outgoing server. While a switch is active, the slot is the
@@ -594,8 +594,8 @@ def test_the_lease_tick_never_clobbers_the_switch_slot(monkeypatch):
 
 
 def test_switch_timeouts_are_env_overridable(monkeypatch):
-    """A box loading vLLM weights from network storage took 887 s against what was a 905 s window —
-    18 s of margin. The budget must be a deployment knob, not a constant edit."""
+    """A box loading vLLM weights from network storage took nearly its whole warm window —
+    seconds of margin. The budget must be a deployment knob, not a constant edit."""
     from queue_workflows import claim_worker
     monkeypatch.setenv("QUEUE_WORKFLOWS_SWITCH_WARM_TIMEOUT_S", "2400")
     monkeypatch.setenv("QUEUE_WORKFLOWS_SWITCH_DRAIN_TIMEOUT_S", "120")
@@ -608,7 +608,7 @@ def test_switch_timeout_defaults_have_real_headroom(monkeypatch):
     monkeypatch.delenv("QUEUE_WORKFLOWS_SWITCH_DRAIN_TIMEOUT_S", raising=False)
     from queue_workflows import claim_worker
     _, warm = claim_worker._switch_timeouts()
-    assert warm >= 1800, "887 s observed NFS load demands >2x headroom, not 18 s"
+    assert warm >= 1800, "a slow network-storage load demands >2x headroom, not seconds"
 
 
 def test_malformed_timeout_env_falls_through(monkeypatch):
@@ -622,7 +622,7 @@ def test_malformed_timeout_env_falls_through(monkeypatch):
 
 
 def test_a_resumed_vllm_switch_on_a_vllm_less_box_is_ABANDONED(tmp_path, monkeypatch):
-    """Found live: box-c (ROCm, bare topology URL ⇒ no distinct vLLM endpoint)
+    """A box (ROCm, bare topology URL ⇒ no distinct vLLM endpoint)
     resumed a persisted vllm switch after a restart and sat OUT OF SERVICE warming
     a server that can never exist."""
     from queue_workflows import claim_worker

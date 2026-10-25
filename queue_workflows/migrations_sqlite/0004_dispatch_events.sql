@@ -8,8 +8,8 @@
 -- next tick retries. Exhausted retries flip the run to failed so the user sees
 -- something instead of a stall.
 --
--- = old migration 015. Idempotent (`IF NOT EXISTS`) so re-running on the live
--- ai_leads DB is a no-op.
+-- = old migration 015. Idempotent (`IF NOT EXISTS`) so re-running on an
+-- already-migrated DB is a no-op.
 
 CREATE TABLE IF NOT EXISTS workflow_dispatch_events (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,

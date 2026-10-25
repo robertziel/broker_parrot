@@ -313,7 +313,7 @@ def test_unsupported_sleep_state_reflected_after_attempt():
 
 
 def test_ensure_ready_switch_mismatch_raises_runtimeerror():
-    """The HIGH audit bug. On a model SWITCH the slow path kills + brings the
+    """The bug: on a model SWITCH the slow path kills + brings the
     sidecar up — but docker ``restart: unless-stopped`` resurrects it serving its
     BAKED ``--model`` flag, NOT the requested one. So after the health wait the
     /v1/models probe names a DIFFERENT served id than we asked for. ensure_ready
@@ -452,9 +452,9 @@ def test_supervisor_reaps_idle_vllm_backend(monkeypatch):
     stop_server (kill called). Proves the backend satisfies the supervisor's
     duck-typed surface (server_type / inflight / idle_seconds / idle_ttl_s /
     is_running / stop_server)."""
-    # conftest sets AI_LEADS_DISABLE_LLM_SUPERVISOR session-wide; clear it so the
+    # conftest sets QUEUE_WORKFLOWS_DISABLE_LLM_SUPERVISOR session-wide; clear it so the
     # backend's own server_type/ttl decide _enabled (we only call reap directly).
-    monkeypatch.delenv("AI_LEADS_DISABLE_LLM_SUPERVISOR", raising=False)
+    monkeypatch.delenv("QUEUE_WORKFLOWS_DISABLE_LLM_SUPERVISOR", raising=False)
     from queue_workflows.llm_backends.supervisor import LLMSupervisor
 
     cell, now = _clock()

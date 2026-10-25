@@ -2,19 +2,13 @@
 
 *How `queue_workflows` lays out its Postgres/SQLite tables, why each migration exists, and the idempotency contracts the engine code leans on.*
 
-This is the single schema reference — it replaces the old `broker_db_schema.md`
-(Postgres) and `client_db_schema.md` (SQLite) docs, which duplicated most of
-this content twice. One schema, two dialect renderings, documented once.
-
 > Sibling docs: [architecture.md](architecture.md) (the three process roles
 > that read/write this schema), [configuration.md](configuration.md) (the
 > `db_backend` / `db_url_env` / `project` knobs), [storage_backends.md](storage_backends.md)
-> (the non-relational `redis`/`mongodb` backends, which do **not** use this
-> schema), [watchdogs.md](watchdogs.md) (the liveness model behind the lease +
+> (sqlite vs pg, the two backends that share this schema), [watchdogs.md](watchdogs.md) (the liveness model behind the lease +
 > `watchdog_retries` columns), [worker_control.md](worker_control.md) (the
-> `worker_controls` table in depth), [broker.md](broker.md) (the v2
-> `bw_jobs`/`bw_workers` schema, which is deliberately **not** part of this
-> chain).
+> `worker_controls` table in depth), [broker.md](broker.md) (the shared
+> multi-project broker).
 
 ## 1. Two migration chains, one database
 
@@ -40,12 +34,14 @@ per applied migration, `(version, applied_at)`).
   polls `current_schema_version()` until the ledger reaches `min_version` (or
   raises `TimeoutError` after 120 s). This avoids two processes racing the
   migration run.
-- **Per-queue minimum version** — `claim_worker.py` maps `_NODE_REQUIRED_VERSION
-  = 6` (the lease columns + `node_job_ready` trigger a `cpu`/`gpu` worker's
-  claim loop needs) and `_INGEST_REQUIRED_VERSION = 8` (multi-tenant ingest —
-  host-defined queue names + `args`) via `ClaimWorker.await_schema()`. A
-  `cpu`/`gpu` worker blocks until version ≥ 6; an ingest-family worker (the
-  host's `config.ingest_queues`) blocks until ≥ 8.
+- **Per-queue minimum version** — `ClaimWorker._min_schema_version` (used by
+  `ClaimWorker.await_schema()`) picks one of four constants in `claim_worker.py`:
+  `cpu` ≥ 6 (`_NODE_REQUIRED_VERSION`, the lease columns + `node_job_ready`
+  trigger), ingest-family queues (`config.ingest_queues`) ≥ 8
+  (`_INGEST_REQUIRED_VERSION`, host-defined queue names + `args`), `download`
+  ≥ 25 (`_DOWNLOAD_REQUIRED_VERSION`, the queue CHECK drop), `gpu` ≥ 29
+  (`_GPU_REQUIRED_VERSION`, the context-window + vLLM-profile columns its claim
+  reads).
 - **Worker-control is read-optional**, not gated at all: `get_worker_control()`
   swallows Postgres's `UndefinedTable` and treats a missing `worker_controls`
   table — i.e. a DB that predates migration 0012 — as "every worker is ON".
@@ -116,10 +112,9 @@ Two seams make one Python codebase run unmodified against either dialect:
 
 Selecting the backend is a `configure()` concern, not a schema concern — see
 [configuration.md](configuration.md) for `db_backend` / `db_url_env` defaults,
-and [storage_backends.md](storage_backends.md) for the `redis`/`mongodb`
-backends, which bypass this schema entirely via the `StorageBackend` SPI.
+and [storage_backends.md](storage_backends.md) for how sqlite and pg differ.
 
-## 3. The chain, migration by migration (0001–0020)
+## 3. The chain, migration by migration (0001–0030)
 
 Every migration below applies to *both* dialect directories in lockstep
 (dialect differences per §2); the "why" is dialect-independent.
@@ -153,6 +148,10 @@ Every migration below applies to *both* dialect directories in lockstep
 | **0025** `download_queue` | drops the `workflow_node_jobs` cpu/gpu queue `CHECK` (matched by *definition*, not name; sqlite twin = the one-time table rebuild); adds `workflow_node_jobs.dedup_key TEXT` + a partial `(project, dedup_key) WHERE completed` index | The **`download` node-job queue** — the network-WAIT lane. The queue allow-list moves host-side into `enqueue_node_job` (the 0008 move), so `download` — and any future lane — needs no further schema change. A schema opts a node in with `download: true`; the claim (`claim_next_download_job`) enforces a **fleet-wide per-project width cap** (`download_max_concurrent`, default 1) with a (queue, project)-keyed advisory-lock serializer — no `claimed_by` scope, any box's running download occupies the lane. `dedup_key` is the opt-in output identity behind "one file is never downloaded twice": `execute_node` finalizes a keyed job as completed (twin's `context_delta` + `_deduped_from` marker, dispatch event included) when a completed same-`(project, dedup_key)` twin exists — the body never runs. Download workers gate on schema ≥ 25; the down re-adds the cpu/gpu `CHECK` (fails if download rows remain) and drops the column. |
 | **0026** `model_catalog` | new `llm_model_catalog (host_label, server_type, model_id, enabled, observed_at)` + two partial indexes (`WHERE enabled`); `workflow_node_jobs.required_models JSONB` + `required_model_ids TEXT[]` + `resolved_model TEXT` (sqlite twin = `TEXT` JSON) | **Which box can serve which model — observed, not declared.** The claim worker's heartbeat probe publishes what each box's servers report (ollama `/api/tags`: everything installed; vLLM `/v1/models`: the one pinned model); an empty catalog means "we do not know" and the matcher treats it as cannot-serve. A node-job may name an **ordered array** of acceptable `{model, server_types}` entries — the order is a priority, and `resolved_model` records which entry the claim actually picked. `required_model` is unchanged and dual-written as the array's head, so an un-upgraded worker still claims a new row correctly (no flag day). `enabled` doubles as the operator's park lever and the publisher's retire flag for a model a probe stopped listing. |
 | **0027** `resolved_artifact` | `llm_model_catalog.digest TEXT NOT NULL DEFAULT ''`; `workflow_node_jobs.resolved_artifact TEXT` | **Which BYTES a claim ran.** A role tag is stable across promotions, so `resolved_model` can never say which weights served a job. The catalog now keeps each tag's server-reported content digest, and the claim worker stamps `resolved_artifact` — the immutable artifact tag (`<role>-v<N>-<precision>-<server>`) whose digest matches the role tag's on that box (or vLLM's served id when it is itself an artifact tag). NULL when nothing matches — an absent answer, never a guessed one. |
+
+| **0028** `llm_context` | `workflow_node_jobs.context_length INTEGER`; `worker_heartbeats.llm_context_length INTEGER` + `llm_context_max INTEGER` | **The context WINDOW, as a routing fact.** A node-job may declare the window its requests need, because the alternative is silent: ollama truncates an over-long prompt to fit its runner and answers HTTP 200 (measured — a ~12k-token prompt came back with `prompt_tokens` 4098 at an 8192 window). The two heartbeat columns are what each GPU box answers with: `llm_context_length` is the window its server serves NOW (for ollama the CONFIGURED value, not a loaded runner's — another client can load one natively at a bigger window and the next `/v1` call undoes it), `llm_context_max` the biggest it could switch to **within the memory the box has free**, recomputed every heartbeat. The claim gives a sized row only to a box that fits it (`context_length <= serving_context`); a box that cannot state its window claims only unsized rows. A sized job no live box can reach is red-flagged by the existing `unassignable` sweep (0015), with model and window judged **on the same box**. All three columns NULL ⇒ every pre-0028 row and worker is byte-identical. See `docs/gpu_and_llm.md` §2. |
+| **0029** `vllm_profile` | `llm_model_catalog.profile JSONB` | **What a model COSTS on a box, as its own server reported it.** vLLM prints, once per start, the weights it loaded, the KV cache it could allocate, that cache in tokens, and the concurrency that means at the window; the gpu worker reads them off the container's log once per start and stores them here per `(host_label, 'vllm', model_id)` with the fingerprint of the command line they belong to (everything but the window / pool / concurrency flags the engine changes). The next start of that model is sized to what N requests of the window NEED (`llm_context.vllm_plan`) instead of to what is free, and N to what fits — started with that `--max-num-seqs`. The observation upsert never touches the column; NULL = never observed. The gpu lane waits for schema ≥ 29. |
+| **0030** `node_job_gpu_slots` | `workflow_node_jobs.gpu_slots text` (NULL by default) | Per-node-job **GPU WEIGHT**: how much of the claiming box's GPU budget (`max_running`) one job occupies at the box-slot arbiter. Values: NULL = 1 (every pre-0030 row), `'half'`, `'all'` (both resolved against the claiming box's own budget), or an integer ≥ 2 as text, measured as `LEAST(n, max_running)` so an over-wide row runs alone instead of starving. A row that owns the whole server (e.g. a lease on the box's vLLM) takes `'all'`, so nothing else is co-scheduled into it. The value set is enforced host-side in `enqueue_node_job` (SQLite cannot `ADD CONSTRAINT`), the 0024 direction; additive + idempotent. |
 
 `0017`'s and `0019`'s down-migrations are the two genuinely **destructive**
 reversals in the chain: collapsing the 3-column PK back to 2 columns only
@@ -205,7 +204,7 @@ PK `(id)`. Indexes: `workflow_runs_claim_idx (priority, queued_at) WHERE status=
 | `node_id` | text | no | | logical id inside the workflow JSON |
 | `node_module` | text | no | | importable name via the host node-module hook |
 | `pipeline_name` | text | yes | | parent pipeline ref |
-| `queue` | text | no | | `CHECK (queue IN ('cpu','gpu'))` |
+| `queue` | text | no | | `cpu`/`gpu`/`download`; host-validated in `enqueue_node_job` (the original `cpu`/`gpu` CHECK was dropped in 0025) |
 | `required_model` | text | yes | | `CHECK (queue='gpu' OR required_model IS NULL)` |
 | `status` | text | no | | `queued`/`running`/`completed`/`failed`/`cancelled`/`awaiting_input`/`skipped` |
 | `priority` | smallint | no | `100` | |
@@ -378,19 +377,3 @@ as the state change they record (the same outbox-atomicity pattern as
 `workflow_dispatch_events`); every other event type is written best-effort, on
 its own connection, swallowing failures, so an event-log blip can never fail
 the load-bearing claim/terminal/watchdog path.
-
-## 6. What's outside this chain: the v2 broker_service schema
-
-`queue_workflows/broker_service/schema.py` defines a **second, separate, and
-deliberately un-ledgered** schema for the v2 broker orchestration core:
-`bw_jobs` (the shared cpu/gpu queue across all projects, `status`: `queued →
-granted → running → done | failed | killed`) and `bw_workers` (the worker
-registry + liveness, `state`: `waiting` / `running` / `dead`). It coexists in
-the same relational store (pg or sqlite) via the same `db.connection()` /
-`dialect.py` seam this document's chain uses, but it is created by a single
-idempotent `ensure_schema()` (`CREATE TABLE IF NOT EXISTS`) — no `NNNN_*.sql`
-files, no version ledger, no down-migrations. This is a deliberate "clean
-slate, no migrations" design choice for the v2 control plane, not an
-oversight; it coexists with the legacy 0001–0019 chain so a later pass can
-retire the old engine tables without a data migration. See
-[broker.md](broker.md) for the full v2 design and API.

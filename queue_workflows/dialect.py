@@ -11,11 +11,10 @@ forking every module, the divergent fragments are produced by a process-wide
   the engine has always used, so the live Postgres deploy is byte-identical.
 * ``db_backend="sqlite"`` (default, v1.0.0) → :class:`SqliteDialect` — the SQLite renderings.
 
-``redis``/``mongodb`` select the *flat-queue* ``StorageBackend`` SPI
-(``backends/``) and do NOT host the relational DAG engine — so for the engine's
-own connection (:mod:`queue_workflows.db`) the only two relational dialects are
-``pg`` and ``sqlite``; any other value falls back to the Postgres dialect (the
-engine still needs a relational store and pg is the default).
+These are the only two engine backends: ``configure()`` and the
+``QUEUE_WORKFLOWS_DB_BACKEND`` env default reject every other value
+(:func:`queue_workflows.config.canonical_db_backend`), so ``db_backend`` is
+always exactly ``"pg"`` or ``"sqlite"`` by the time a dialect is chosen.
 
 DESIGN: the dialect returns SQL *fragments* in **pyformat** placeholders
 (``%s`` / ``%(name)s``) — the SAME paramstyle the engine writes everywhere — so a
@@ -74,6 +73,10 @@ class Dialect:
     def least(self, *exprs: str) -> str:
         """Scalar minimum of N expressions (``LEAST`` on pg)."""
         return f"LEAST({', '.join(exprs)})"
+
+    def greatest(self, *exprs: str) -> str:
+        """Scalar maximum of N expressions (``GREATEST`` on pg)."""
+        return f"GREATEST({', '.join(exprs)})"
 
     # ── claim concurrency ─────────────────────────────────────────────────
     @property
@@ -137,7 +140,7 @@ class Dialect:
         if array_param.startswith("%"):
             # Any bound parameter (named %(x)s OR positional %s) needs the cast; a
             # column reference never starts with '%'. The old '%(' test silently
-            # dropped the cast for positional params (round-3 audit, LOW).
+            # dropped the cast for positional params.
             return f"{array_col} && {array_param}::text[]"
         return f"{array_col} && {array_param}"
 
@@ -236,6 +239,9 @@ class SqliteDialect(Dialect):
         # SQLite overloads MIN/MAX as scalar funcs with N args.
         return f"MIN({', '.join(exprs)})"
 
+    def greatest(self, *exprs: str) -> str:
+        return f"MAX({', '.join(exprs)})"
+
     @property
     def skip_locked(self) -> str:
         # SQLite serializes writers (WAL + busy_timeout), so the single-statement
@@ -305,9 +311,8 @@ _SQLITE = SqliteDialect()
 
 def get_dialect() -> Dialect:
     """Return the process-wide dialect for the engine's relational store, chosen
-    from ``config.db_backend``. ``sqlite`` → :class:`SqliteDialect`; everything
-    else (``pg``/``redis``/``mongodb``/unset) → :class:`PgDialect` (the engine's
-    own connection is Postgres unless explicitly sqlite)."""
+    from ``config.db_backend``. ``sqlite`` → :class:`SqliteDialect`; ``pg`` →
+    :class:`PgDialect` (the only other value the validator admits)."""
     from queue_workflows.config import get_config
     return _SQLITE if get_config().db_backend == "sqlite" else _PG
 

@@ -168,8 +168,8 @@ def test_cap_env_default_is_one(monkeypatch):
 def test_loaded_models_info_parses_names_and_recency():
     from queue_workflows import llm_probe
     ps = {"models": [
-        {"name": "a", "expires_at": "2026-07-16T11:00:00.123456789Z"},
-        {"name": "b", "expires_at": "2026-07-16T12:00:00Z"},
+        {"name": "a", "expires_at": "2024-01-01T11:00:00.123456789Z"},
+        {"name": "b", "expires_at": "2024-01-01T12:00:00Z"},
     ]}
     got = llm_probe.loaded_models_info("http://box:11434", get_json_fn=lambda u, t: ps)
     assert [m["name"] for m in got] == ["a", "b"]

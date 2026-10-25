@@ -10,7 +10,7 @@ Covers:
 - run status transitions (queued→running→completed/failed)
 
 The dispatcher DAG tests drive an in-test dict-backed workflow provider (via
-``queue_workflows.set_workflow_provider``) instead of the ai_leads filesystem
+``queue_workflows.set_workflow_provider``) instead of a host's filesystem
 registry — keeping the engine suite domain-free.
 """
 
@@ -185,9 +185,9 @@ def test_terminal_jobs_stamp_host_label_from_claimed_by():
     # failed → host_label stamped from claimed_by
     f_id = node_queue.enqueue_node_job(run_id=run_id, node_id="f", node_module="x", queue="cpu")
     node_queue.claim_next_cpu_job(0)
-    _set_claimed_by(f_id, "box-a2")
+    _set_claimed_by(f_id, "box-b")
     frow = node_queue.mark_failed(f_id, error="boom", seconds=0.1)
-    assert frow["host_label"] == "box-a2"
+    assert frow["host_label"] == "box-b"
     # completed → same stamp
     c_id = node_queue.enqueue_node_job(run_id=run_id, node_id="c", node_module="x", queue="cpu")
     node_queue.claim_next_cpu_job(0)

@@ -1,6 +1,6 @@
 """A box must advertise the LLM server it ACTUALLY serves — not one it might have.
 
-WHY THIS EXISTS (the incident it pins). ``worker_heartbeats.llm_servers_available``
+WHY THIS EXISTS. ``worker_heartbeats.llm_servers_available``
 (migration 0014) is documented as OBSERVED capability, but nothing ever observed
 anything: the column DEFAULTs to ``{ollama}`` and the worker published a static
 ``EngineConfig.llm_servers_available`` that also defaults to ``["ollama"]``. So a GPU
@@ -168,7 +168,7 @@ def test_local_endpoints_are_local(url):
 
 
 @pytest.mark.parametrize("url", [
-    "http://box-b-fast:11434",
+    "http://host-b:11434",
     "http://10.0.0.2:11434",
     "http://10.0.0.3:11434",
 ])
@@ -183,9 +183,51 @@ def test_unparseable_endpoint_is_not_local():
     assert llm_probe.is_local_endpoint(None) is False
 
 
+# ── the card, not the URL: this box's own ollama through the docker host gateway ──
+#
+# The failure mode, on a lane HOLDING its box for a multi-GPU cluster, logged as:
+#
+#   [llm] box-c-gpu: serving ollama from a REMOTE box's server at http://172.17.0.1:11434
+#
+# 172.17.0.1 is the docker host gateway — the NUMERIC form of `host.docker.internal`, which is
+# what a topology entry or an OLLAMA_URL usually carries. It is this box's OWN ollama, on the
+# very card the cluster was waiting for, and the engine called it somebody else's.
+
+
+def test_the_docker_host_gateway_ip_is_this_box(monkeypatch):
+    """The gateway this container routes through IS its own host. Named or numeric, the verdict
+    must be the same one — the question is "is this my own card's server?", and a card cannot be
+    answered by a hostname spelling."""
+    llm_probe.reset_locality_cache_for_tests()
+    monkeypatch.setattr(llm_probe, "_read_default_gateway", lambda: "172.17.0.1")
+    assert llm_probe.is_local_endpoint("http://172.17.0.1:11434") is True
+    assert "its OWN" in llm_probe.describe_endpoint(
+        "box-c-gpu", "http://172.17.0.1:11434", ["ollama"])
+
+
+def test_a_peers_server_is_still_remote_when_a_gateway_is_known(monkeypatch):
+    """The genuine remote case must keep working: a box that legitimately dispatches to ANOTHER
+    machine's ollama is still REMOTE, and must still be said out loud."""
+    llm_probe.reset_locality_cache_for_tests()
+    monkeypatch.setattr(llm_probe, "_read_default_gateway", lambda: "172.17.0.1")
+    for url in ("http://host-b:11434", "http://10.0.0.2:11434", "http://172.17.0.9:11434"):
+        assert llm_probe.is_local_endpoint(url) is False, url
+    assert "a REMOTE box's" in llm_probe.describe_endpoint(
+        "box-c-gpu", "http://host-b:11434", ["ollama"])
+
+
+def test_a_box_with_no_readable_gateway_is_unchanged(monkeypatch):
+    """No /proc/net/route (or no default route) degrades to the static set — never worse than
+    before, and never an exception into a probe path."""
+    llm_probe.reset_locality_cache_for_tests()
+    monkeypatch.setattr(llm_probe, "_read_default_gateway", lambda: None)
+    assert llm_probe.is_local_endpoint("http://127.0.0.1:11434") is True
+    assert llm_probe.is_local_endpoint("http://172.17.0.1:11434") is False
+
+
 # ── GPU placement: is the server ACTUALLY on the GPU, or fell back to CPU? ────
 #
-# THE SECOND INCIDENT. A box's ollama can silently serve a model on CPU — it lost
+# A SECOND FAILURE MODE. A box's ollama can silently serve a model on CPU — it lost
 # the GPU to a cgroup event (NVML "Unknown Error"), or the model didn't fit VRAM so
 # ollama offloaded it. `ollama ps` then reads "100% CPU". The endpoint still ANSWERS,
 # so the existence probe above says "ollama" and the box keeps claiming GPU jobs it

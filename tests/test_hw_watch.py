@@ -1,8 +1,8 @@
 """Hardware flight-recorder (migration 0021, ``queue_workflows/hw_watch.py``).
 
-Two-tier persisted hardware telemetry — the productized descendant of the
-ad-hoc "box-b blackbox" scripts that caught a unified-memory GPU box's firmware thermal
-kill (HW slowdown 0x48 asserted 7 s before an OS-invisible power cut):
+Two-tier persisted hardware telemetry — built to catch a
+firmware thermal kill on a unified-memory GPU box (an HW slowdown bit asserted seconds
+before an OS-invisible power cut):
 
 * ``detail``  tier — super-detailed samples (default every 2 s), retained 1 h.
 * ``history`` tier — coarse samples (default every 60 s), retained 24 h.
@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from queue_workflows import hw_watch
+from queue_workflows import envcompat, hw_watch
 
 
 def _utc(offset_s: float = 0.0) -> datetime:
@@ -235,8 +235,8 @@ def test_deep_sample_collects_real_probe_data():
 # The raw NVML throttle-reason mask (``0x0000000000000048``) is the smoking-gun
 # field but doesn't graph. ``throttle_index`` collapses it to a 0-100 severity
 # (max over active bits — one HW-thermal bit already means "at the wall"), and
-# ``throttle_reasons`` decodes the bit names for tooltips. Calibration from the
-# unified-memory GPU box incident: the box died seconds after 0x48 (HW slowdown + HW brake).
+# ``throttle_reasons`` decodes the bit names for tooltips. Calibration: a unified-memory GPU
+# box can die seconds after 0x48 (HW slowdown + HW thermal).
 
 
 def test_throttle_index_severity_ladder():
@@ -247,8 +247,8 @@ def test_throttle_index_severity_ladder():
     assert hw_watch.throttle_index("0x0000000000000008") == 85   # HW slowdown
     assert hw_watch.throttle_index("0x0000000000000080") == 90   # HW power brake
     assert hw_watch.throttle_index("0x0000000000000040") == 100  # HW thermal
-    # Combined mask scores its WORST bit (the incident's 0x48 = HW slowdown
-    # + SW power cap... 0x40|0x08): max wins.
+    # Combined mask scores its WORST bit (0x48 = HW thermal 0x40
+    # | HW slowdown 0x08): max wins.
     assert hw_watch.throttle_index("0x0000000000000048") == 100
     assert hw_watch.throttle_index("0x0000000000000024") == 50
 
@@ -282,8 +282,8 @@ def test_deep_sample_carries_throttle_index(monkeypatch):
 
 # ── power-brake detection (the PSU watchdog signal) ──────────────────────
 #
-# unified-memory GPU box exposes NO input-rail telemetry (no power_supply/typec/regulator
-# surfaces — verified on the incident box), so the GPU-side brake bits are
+# a unified-memory GPU box may expose NO input-rail telemetry (no power_supply/typec/regulator
+# surfaces), so the GPU-side brake bits are
 # the only software-visible echo of a power-delivery event: 0x08 hw_slowdown
 # (NVML: thermal OR *external power brake assertion*) and 0x80 hw_power_brake.
 # "Pure" = brake with no thermal bit alongside — the power-side signature.
@@ -444,7 +444,7 @@ def test_net_iface_meta_virtual_iface_reports_no_real_speed(tmp_path):
 def test_iface_virtual_classification():
     # loopback, container/bridge plumbing, and VPN/tunnels (double-count the wire)
     for v in ("lo", "docker0", "veth1a2b3c", "br-abc123", "virbr0", "cni0",
-              "tailscale0", "wg0", "zt5u4"):
+              "tailscale0", "wg0", "zt0"):
         assert hw_watch._iface_is_virtual(v), v
     for real in ("eth0", "enp3s0", "wlan0", "bond0"):   # bond = REAL aggregate
         assert not hw_watch._iface_is_virtual(real), real
@@ -514,22 +514,22 @@ def test_deep_sample_collects_real_net_probe():
     assert "net_rx_bytes" in sample and "net_speed_mbps" in sample
 
 
-# ── env knobs (envcompat: canonical + legacy twin) ───────────────────────
+# ── env knobs (envcompat: canonical names) ───────────────────────────────
 
 
 def test_disabled_by_default(monkeypatch):
     monkeypatch.delenv("QUEUE_WORKFLOWS_HW_WATCH", raising=False)
-    monkeypatch.delenv("AI_LEADS_HW_WATCH", raising=False)
+    monkeypatch.delenv("QUEUE_WORKFLOWS_HW_WATCH", raising=False)
     assert hw_watch.enabled() is False
 
 
-def test_enabled_via_canonical_and_legacy_env(monkeypatch):
-    monkeypatch.delenv("AI_LEADS_HW_WATCH", raising=False)
+def test_enabled_via_canonical_env(monkeypatch):
+    monkeypatch.delenv("QUEUE_WORKFLOWS_HW_WATCH", raising=False)
     monkeypatch.setenv("QUEUE_WORKFLOWS_HW_WATCH", "1")
     assert hw_watch.enabled() is True
 
     monkeypatch.delenv("QUEUE_WORKFLOWS_HW_WATCH", raising=False)
-    monkeypatch.setenv("AI_LEADS_HW_WATCH", "1")
+    monkeypatch.setenv("QUEUE_WORKFLOWS_HW_WATCH", "1")
     assert hw_watch.enabled() is True
 
 
@@ -552,7 +552,7 @@ def test_interval_knobs_have_sane_defaults(monkeypatch):
         "QUEUE_WORKFLOWS_HW_WATCH_HISTORY_RETENTION_S",
     ):
         monkeypatch.delenv(var, raising=False)
-        monkeypatch.delenv(var.replace("QUEUE_WORKFLOWS", "AI_LEADS"), raising=False)
+        monkeypatch.delenv(envcompat.LEGACY_PREFIX + var[len(envcompat.CANONICAL_PREFIX):], raising=False)
     assert hw_watch.detail_interval_s() == 2.0
     assert hw_watch.history_interval_s() == 60.0
     assert hw_watch.detail_retention_s() == 3600
@@ -564,7 +564,7 @@ def test_interval_knobs_have_sane_defaults(monkeypatch):
 # Regression fence for the blind spot that masked a CPU-thermal hard-power-off:
 # _read_cpu_temp_c() only knew x86/AMD CPU sensors, so on the ARM unified-memory GPU box (whose SoC
 # temp is exposed only via generic acpitz zones) it returned None → "CPU TEMP: no
-# data" while the SoC was actually at ~95-98C.
+# data" while the SoC was actually running hot.
 
 def _fake_sysfs(monkeypatch, tmp_path, *, hwmon=None, zones=None):
     """Redirect /sys/class/{hwmon,thermal} globs to a tmp tree; real glob otherwise."""

@@ -1,57 +1,71 @@
 <div align="center">
 
-<img src="docs/images/logo.svg" width="112" alt="broker_parrot — a parrot perched on a database, dispatching queue jobs">
+<img src="docs/images/logo.svg" width="112" alt="broker_parrot logo: a cute green parrot perched on a database">
 
 # broker_parrot
 
-_A self-hosted job fleet on the database you already run — Postgres or SQLite._
+**A self-hosted job fleet on the database you already run: Postgres or SQLite.**
 
-### Turn the machines you already own into one self-healing job fleet.
-
-> A workflow engine that uses your database as the queue and message bus — dispatching DAG and periodic jobs across worker processes, keeping GPU models warm, and recovering from crashes on its own.
-
-Orchestrate work across a handful of heterogeneous CPU/GPU boxes with nothing but a database you already run. No Celery, no Redis to babysit, no cluster scheduler. Insert a row and the work is enqueued; a dead worker's lease lapses and its job re-runs somewhere healthy.
-
-[![License: AGPL v3](https://img.shields.io/badge/license-AGPL%20v3%20or%20later-blue.svg)](LICENSE)
-[![Free for open source](https://img.shields.io/badge/free-open%20source%20%26%20personal-brightgreen.svg)](#️-license--free-for-open-use-commercial-licensing-available)
-[![Commercial license](https://img.shields.io/badge/commercial%20license-hello%40robertz.co-orange.svg)](mailto:hello@robertz.co)
-[![Agent friendly](https://img.shields.io/badge/🤖%20agent-friendly-8A2BE2.svg)](#-agent-friendly--just-type-it)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](#installation)
 [![SQLite](https://img.shields.io/badge/sqlite-default-003B57.svg)](#installation)
 [![Postgres](https://img.shields.io/badge/postgres-14%2B-336791.svg)](#installation)
+[![Agent friendly](https://img.shields.io/badge/🤖%20agent-friendly-8A2BE2.svg)](#hand-it-to-a-coding-agent)
 
-**[Quickstart](#-quickstart--60-seconds-zero-servers)** ·
-**[Agent setup](#-agent-friendly--just-type-it)** ·
-**[Docs](#-documentation)** ·
-**[License](#️-license--free-for-open-use-commercial-licensing-available)**
-
-_Free for personal, research & open-source use (AGPL). Commercial license? **[hello@robertz.co](mailto:hello@robertz.co)**_
+[Quickstart](#quickstart) · [How it works](#how-it-works) · [Docs](#documentation) · [License](#license)
 
 </div>
 
-**broker_parrot** is a small, self-hosted workflow engine where **the database _is_ the message bus**. Inserting a row enqueues work; a trigger fires `LISTEN/NOTIFY` inside the writer's own transaction, so there's never a "queued but never woken" gap. Workers claim jobs with `SELECT … FOR UPDATE SKIP LOCKED`, renew a lease while they run, and a dead or wedged worker's job is automatically re-queued onto a healthy peer. It runs DAG node-jobs and periodic background jobs across boxes you already own, lets you flip any machine's worker **ON/OFF** on demand, and keeps a GPU model resident across same-model jobs.
+broker_parrot is a workflow engine that uses your database as the message bus. There is no Redis, no RabbitMQ and no Celery to set up, monitor and back up.
 
-As of **v1.0.0 the default backend is SQLite** — a daemon-less local file, zero server to stand up — so you can `import`, `configure()`, and run with nothing else installed. Point it at **Postgres** for a real fleet with one line.
+- **Enqueue** by inserting a row.
+- **Claim** with `SELECT … FOR UPDATE SKIP LOCKED`.
+- **Recover** from crashes automatically: a dead worker's lease lapses and a sweep puts its job back in the queue.
+
+It is built for a handful of mixed CPU/GPU machines you already own. You can turn any machine's worker on or off, keep GPU models loaded between jobs, and let each job run on whichever box has room, all without a cluster scheduler.
+
+<p align="center">
+  <img src="docs/images/flight-deck.webp" width="960" alt="Flight Deck: three hosts side by side with live CPU, GPU and memory gauges, per-queue worker toggles, the jobs running on each box, and an hour of thermal, power and clock history per host">
+</p>
+
+<p align="center"><sub><b>Flight Deck</b>, a custom front-end built on the engine's telemetry: per box, an hour of thermal, power and clock history, the jobs running on it, and an on/off toggle per queue. The telemetry is ordinary rows and notifications, so a view like this is easy to build.</sub></p>
 
 ---
 
-## ⚡ Quickstart — 60 seconds, zero servers
+## Contents
 
-The whole engine in one file. No database server, no broker, no YAML — SQLite is the default backend, and every line below is the public API:
+- [Quickstart](#quickstart)
+- [Why use the database as the queue?](#why-use-the-database-as-the-queue)
+- [How it works](#how-it-works)
+- [Two job families](#two-job-families)
+- [GPU fleets](#gpu-fleets)
+- [Turning workers on and off](#turning-workers-on-and-off)
+- [One broker for many projects](#one-broker-for-many-projects)
+- [Hand it to a coding agent](#hand-it-to-a-coding-agent)
+- [Installation](#installation) · [Running in production](#running-in-production) · [Migrations](#migrations) · [Tests](#tests)
+- [When not to use it](#when-not-to-use-it) · [How it compares](#how-it-compares)
+- [Documentation](#documentation) · [Contributing](#contributing) · [License](#license)
+
+---
+
+## Quickstart
+
+No database server needed: SQLite is the default backend, and every line below is public API.
 
 ```bash
 pip install "queue_workflows @ git+https://github.com/robertziel/broker_parrot"
 ```
 
 ```python
-# quickstart.py — run it with:  python quickstart.py
-import types, uuid
+# quickstart.py: run it with `python quickstart.py`
+import os, types, uuid
 
 import queue_workflows
 from queue_workflows import db, dispatcher, node_queue, run_store
 from queue_workflows.claim_worker import ClaimWorker
 
-queue_workflows.configure()                     # SQLite file — nothing to install or run
+os.environ.setdefault("QUEUE_WORKFLOWS_DB_URL", "quickstart.db")   # the queue is this file
+queue_workflows.configure()                     # SQLite is the default backend
 
 # A "node" is any module with a run() function. Register one inline:
 hello = types.ModuleType("hello")
@@ -75,19 +89,195 @@ ClaimWorker(queue="cpu", host="laptop").run_once()        # claim + execute the 
 print(node_queue.list_jobs_for_run(run_id)[0]["status"])  # -> completed
 ```
 
-That's the whole loop: **a row went in, a worker claimed it with `SKIP LOCKED`, the node ran, the terminal state and its dispatch event committed in one transaction.** Growing up from here is configuration, not rearchitecture:
+A row went in, a worker claimed it, the node ran, and its final status and dispatch event were saved in one transaction. Scaling up from here is configuration, not new code:
 
-1. **Real project layout** — nodes as modules, pipelines/workflows as JSON files → [`docs/setup.md`](docs/setup.md)
-2. **A real fleet** — `configure(db_backend="pg")` + one process per role (`queue-orchestrator`, `queue-claim-worker --queue cpu|gpu`, `queue-scheduler`) → [`docs/deployment.md`](docs/deployment.md)
-3. **GPU boxes** — warm-model cache, affinity routing, watchdogs, per-box arbitration → [`docs/gpu_and_llm.md`](docs/gpu_and_llm.md)
+1. **A real project layout**: nodes as modules, pipelines and workflows as JSON. See [`docs/setup.md`](docs/setup.md).
+2. **A real fleet**: `configure(db_backend="pg")` with a Postgres DSN in `QUEUE_WORKFLOWS_DB_URL`, one process per role. See [`docs/deployment.md`](docs/deployment.md).
+3. **GPU boxes**: warm-model cache, affinity routing, watchdogs. See [`docs/gpu_and_llm.md`](docs/gpu_and_llm.md).
 
 ---
 
-## 🤖 Agent-friendly — just type it
+## Why use the database as the queue?
 
-This repo is written to be **driven by a coding agent** (Claude Code, Cursor, Codex, …): the docs are the spec, the test suite is the behavioral contract, all host wiring funnels through one `configure()` seam, and the safe-by-default SQLite backend means an agent can verify its own work end-to-end without touching your infrastructure. **You describe the jobs; the agent wires the engine.**
+The usual answer to "I need a job queue" is Redis plus a worker framework, and at a certain scale that is the right choice. But it is a second stateful system next to your database: one more thing to set up, secure, make highly available and keep consistent with your data.
 
-Copy-paste this into your agent, edit the two bracketed lines, and let it work:
+A classic bug hides between the two: you commit a row, then enqueue a job, and the process dies in between. Now you have a row with no job, or a job with no row.
+
+If the work already lives next to your data, the database can be the queue. The enqueue and your own write happen **in one transaction**, and that gap disappears. The cost is that the queue mechanics have to be done carefully, which is what this engine provides.
+
+SQLite is the default because a single box then needs no server process at all: the queue is a file. Move to Postgres when you add a second machine.
+
+| Backend | Full DAG | Warm-model affinity | Multi-tenant | Where it fits |
+|---|---|---|---|---|
+| **SQLite** (default) | yes | yes | no, single tenant | Local dev, single-box fleet, zero servers |
+| **Postgres 14+** | yes | yes | yes, via `project` | Multi-box fleet, shared broker |
+
+See [`docs/storage_backends.md`](docs/storage_backends.md).
+
+---
+
+## How it works
+
+Three plain processes point at one database and never talk to each other directly: every interaction is a row written to, or read from, that database.
+
+<p align="center"><img src="docs/images/architecture.svg" width="760" alt="Three processes around one database: the orchestrator and scheduler insert and notify; claim and ingest workers are woken and claim with SKIP LOCKED; the orchestrator drains the outbox and reclaims leases"></p>
+
+| Process | What it does |
+|---|---|
+| **Orchestrator** | Runs migrations, expands runs into node-jobs, drains the outbox, reclaims lapsed leases, flags dead workers. It never runs node code itself. |
+| **Claim worker** | One process is one worker, running one job at a time by default. It `LISTEN`s, claims, runs the job, renews its lease, and writes the result. |
+| **Scheduler** | A ticker that enqueues periodic ingest jobs at scheduled minutes. You don't need cron. |
+
+### The claim: `SKIP LOCKED`, with a wake-up that can't be lost
+
+Claiming the next job is one atomic statement (`node_queue._CLAIM_SQL`, trimmed to its core):
+
+```sql
+UPDATE workflow_node_jobs AS j
+   SET status = 'running', started_at = now(),
+       claimed_by = %(host)s, lease_expires_at = {lease_expr}
+ WHERE j.id = (
+   SELECT c.id FROM workflow_node_jobs c
+    WHERE c.queue = %(queue)s AND c.status = 'queued' AND c.project = %(project)s
+      AND EXISTS (SELECT 1 FROM workflow_runs r
+                   WHERE r.id = c.run_id AND r.status NOT IN ('cancelled', 'failed'))
+    ORDER BY {order}
+    FOR UPDATE SKIP LOCKED          -- N workers claim N distinct jobs, no coordination
+    LIMIT 1
+ )
+RETURNING *;
+```
+
+`{order}` is built only from validated integers and fixed SQL fragments, never from strings a caller passes in. The scheduling policy lives in that ordering. On GPU queues, one extra term sends work to the box that already has the model loaded:
+
+```sql
+is_priority DESC,
+(required_model IS NOT DISTINCT FROM current_model) DESC,   -- warm-model affinity
+priority ASC,
+created_at
+```
+
+On Postgres, a row trigger fires `pg_notify('node_job_ready', <queue>)` **inside the writer's transaction**, so there is never a moment when a row is queued but no worker has been woken. A 1-second safety poll covers a dropped notification: the worst case is one second of delay, never a stuck job. SQLite has no `NOTIFY`, so there the worker runs on that 1-second poll alone.
+
+### Liveness: one lease, five ways to die
+
+<p align="center"><img src="docs/images/job-lifecycle.svg" width="760" alt="Job lifecycle: queued, claimed with SKIP LOCKED into running, renewed every 10 s with a 600 s lease, then completed or failed; a lapsed lease or watchdog exit goes to the reclaim sweep, which re-queues and notifies"></p>
+
+While a job runs, the worker renews its lease every **10 s**; each lease lasts **600 s**. Lease length is therefore independent of job length: a 40-minute render and a 40 ms task use the same lease. If a worker dies, it stops renewing, the lease lapses, and the orchestrator's reclaim sweep (every 5 s) puts the row back in the queue. That sweep is the only recovery path for an orphaned job.
+
+A worker can also be alive but stuck, for example on a wedged CUDA kernel or a hung driver call. Five guard threads cover those cases. Each exits with its own code, so the cause is readable from the exit status alone:
+
+| Exit | Guard | Trips when | Outcome |
+|---|---|---|---|
+| `75` | wall-clock | the job runs past its time budget (CPU, download and ingest jobs) | re-queue and retry up to the limit, then fail |
+| `76` | stall | no progress beat for 120 s, confirmed by 3 samples of idle GPU **and** static RAM | re-queue and retry |
+| `77` | job-status | the row was cancelled or handed to another worker | self-kill only |
+| `78` | GPU health | the GPU sat idle **and** RAM did not change across a 300 s window | re-queue and retry |
+| `79` | worker control | an operator set `desired_state = 'off'` | re-queue, with no retry counted |
+
+Every guard exits with `os._exit()`, which kills the process outright: a wedged CUDA kernel ignores a polite cancel flag, and killing the process is the only reliable way to free the VRAM. Retries are capped by `QUEUE_WORKFLOWS_WATCHDOG_MAX_RETRIES` (default 3). Every attempt is also written to the append-only `workflow_node_events` log for later debugging.
+
+A hang that holds Python's GIL stops those threads from running at all. To catch it, the orchestrator, a separate process, flags any worker whose heartbeat is more than 30 s old while it still owns a running job. Details: [`docs/watchdogs.md`](docs/watchdogs.md).
+
+### DAG dispatch and the durable outbox
+
+<p align="center"><img src="docs/images/durable-outbox.svg" width="760" alt="The durable outbox: the claim worker writes the node's completed status and a dispatch event in one transaction; the orchestrator drains the outbox, retrying and poison-flagging after 10 attempts, and enqueues the downstream nodes whose dependencies are met"></p>
+
+A worker never calls the dispatcher directly. When a node finishes, the worker writes the node's final status **and** a `workflow_dispatch_events` row in one transaction:
+
+```python
+with _db_connection() as conn, conn.cursor() as cur:
+    row = node_queue.mark_completed_in_txn(cur, job_id, ...)
+    if row is None:
+        return "skipped"                     # already terminal: idempotent
+    node_queue.enqueue_dispatch_event_in_txn(cur, job["run_id"], job["node_id"], "completed")
+```
+
+The orchestrator reads that outbox and queues the downstream nodes. A failed hand-off is retried on the next tick; after 10 failed attempts the event is flagged as poison and the run is failed, so an operator sees a clear error instead of a run that silently stops. No event is ever lost, because it is saved together with the status change.
+
+---
+
+## Two job families
+
+| | DAG node-jobs | Ingest jobs |
+|---|---|---|
+| Table | `workflow_node_jobs` | `ingest_jobs` |
+| Queues | `cpu`, `gpu`, `download` (reserved) | your own names (`fetch`, `load`, …) |
+| Shape | one node in a DAG | standalone, periodic or with arguments |
+| Enqueued by | the dispatcher | the scheduler, or your app directly |
+| Payload | `$from` inputs resolved upstream | per-job `args` JSON |
+| On watchdog trip | re-queue and retry, up to 3 times | fail immediately |
+
+The ingest path accepts your own database connection, so the enqueue is part of **your** transaction:
+
+```python
+queue_workflows.configure(db_backend="pg", db_url_env="MY_DB_URL",
+                          ingest_queues=frozenset({"etl", "reports"}))
+queue_workflows.register_ingest_task("build_report", build_report)   # fn(reason) or fn(reason, args)
+
+with my_pool.connection() as conn:
+    my_create_report(conn, report_id)            # your own write
+    node_queue.enqueue_ingest_job(               # and the job
+        task_name="build_report", queue="reports",
+        args={"report_id": report_id}, conn=conn,
+    )                                            # both commit, or neither does
+```
+
+---
+
+## GPU fleets
+
+GPU inference shaped the parts you won't usually find in a job queue:
+
+- **Warm-model cache.** A model stays loaded across the jobs that use it; reloading a multi-gigabyte model per job is the biggest cost.
+- **Affinity routing.** Each worker reports `current_model`, and the claim `ORDER BY` prefers jobs for that model, so work goes to the box that already has it loaded.
+- **Capacity-aware assignment.** Models are matched to available VRAM, and a job that fits nowhere is flagged up front rather than running out of memory halfway through.
+- **LLM servers.** Each box runs one ollama or vLLM server at a time. The engine starts and stops it on demand, sizes vLLM from its own startup numbers, and sheds models when RAM runs low.
+- **Download lane.** A node marked `download: true` runs on its own queue with a fleet-wide limit (default 1), so network waits never take up a GPU slot. An optional `dedup_key` means the same file is never downloaded twice.
+- **Hardware flight recorder.** An opt-in table records GPU temperature, power, clocks and throttle reasons per host, so you can see that a job is slow because the hardware is throttling, not because the model is big. See [`docs/hw_watch.md`](docs/hw_watch.md).
+
+Full design: [`docs/gpu_and_llm.md`](docs/gpu_and_llm.md).
+
+---
+
+## Turning workers on and off
+
+Each `(host, queue)` worker is switched on or off by writing one row to `worker_controls`, from the CLI or with plain SQL from any app that shares the database. A trigger wakes the worker immediately.
+
+```bash
+queue-worker-control --queue gpu --off                # hard stop: re-queue the in-flight job, free VRAM
+queue-worker-control --queue gpu --on --host host-a   # resume, no restart needed
+```
+
+```sql
+INSERT INTO worker_controls (host_label, queue, project, desired_state, stop_policy, requested_by)
+VALUES ('host-a', 'gpu', '', 'off', 'hard', 'ops')            -- project '' = single tenant
+ON CONFLICT (host_label, queue, project) DO UPDATE
+  SET desired_state = EXCLUDED.desired_state, updated_at = now();
+```
+
+Turning a worker off sends its in-flight job back to the queue, where a healthy worker picks it up: the job is not failed and no retry is counted. The stopped worker stays idle until it is turned back on. A worker with no row in the table counts as **on**. See [`docs/worker_control.md`](docs/worker_control.md).
+
+---
+
+## One broker for many projects
+
+Several apps can share one broker database. Each app tags its rows with a `project` and claims only its own rows, matched exactly inside the same `SKIP LOCKED` statement:
+
+```python
+queue_workflows.configure(project="app-a", db_backend="pg", db_url_env="BROKER_DSN")
+queue_workflows.configure(project="app-b", db_backend="pg", db_url_env="BROKER_DSN")
+```
+
+See [`docs/broker.md`](docs/broker.md).
+
+---
+
+## Hand it to a coding agent
+
+The repo is set up for a coding agent such as Claude Code, Cursor or Codex. All host wiring goes through one `configure()` call, the SQLite default lets the agent test a change end to end without touching your infrastructure, and the test suite doubles as the behavioural contract (it only ever runs against a database named `*_test`).
+
+Paste this prompt, filling in the two bracketed lines:
 
 ```text
 Set up broker_parrot (python package queue_workflows,
@@ -116,399 +306,119 @@ Steps:
    queue-claim-worker per queue, queue-scheduler) from docs/deployment.md.
 ```
 
-Every claim in that prompt is backed by a doc the agent can read: the engine never imports your app (the seam is `configure()` + hooks), the suite refuses to run against a non-`_test` database, and one end-to-end round-trip — enqueue → claim → execute → completed — is exactly what the `run_once()` API is for.
-
----
-
-> **There's no bundled dashboard — the engine emits what a dashboard needs.** Live per-host CPU/GPU/RAM over `pg_notify('hw_metrics', …)`, `worker_heartbeats`, the `node_queue.*_snapshot()` read models, and the `worker_controls` ON/OFF toggles are all there. Bring your own front-end — it's a great task to hand a coding agent. A newer **broker web service + operator panel** ([`docs/broker.md`](docs/broker.md), [screenshot](#-one-broker-for-many-projects)) also ships as a pure-stdlib, server-rendered option.
-
-Here's a real example built directly on that telemetry — one GPU box's panel from a live **hardware + queue** operator front-end. It reads the engine's `hw_watch_samples` flight recorder (migration 0021) straight from the DB and draws a 1-hour trail per box: GPU **and** CPU temperature, power, **clock speed**, and throttle (the full panel adds `worker_heartbeats` and per-box `worker_controls` ON/OFF). This box is mid-render at 96% GPU with its board zone pinned near the thermal limit, so the recorder catches it hitting the **power brake** (⚡ ×4) and stacking up throttle seconds — you can watch the GPU clock step down when the power draw does. That's the operational story the engine's raw telemetry makes visible — and it's exactly the kind of front-end you can hand a coding agent to build:
-
-![One GPU box's 1-hour hardware flight recorder, drawn from the engine's hw_watch_samples — GPU/CPU temperature, board-zone max, GPU power, throttle index, GPU/CPU clock and CPU utilisation, with four power-brake events flagged](docs/images/hw-flight-recorder.png)
-
----
-
-## Table of Contents
-
-- [Quickstart — 60 seconds, zero servers](#-quickstart--60-seconds-zero-servers)
-- [Agent-friendly — just type it](#-agent-friendly--just-type-it)
-- [Why broker_parrot?](#-why-broker_parrot)
-- [How it compares (vs. Triton Inference Server)](#-how-it-compares-vs-triton-inference-server)
-- [Highlights](#-highlights)
-- [Installation](#installation)
-- [Core concepts](#-core-concepts)
-- [Architecture at a glance](#-architecture-at-a-glance)
-- [Setting up a real project](#-setting-up-a-real-project)
-- [Turning workers on/off](#️-turning-workers-onoff--the-operator-control-plane)
-- [Host-defined queues + ingest jobs](#️-host-defined-queues--parametrised-ingest-jobs)
-- [One broker for many projects](#-one-broker-for-many-projects)
-- [Pluggable storage backends](#️-pluggable-storage-backends)
-- [GPU models & LLM backends](#-gpu-models--llm-backends)
-- [Migrations](#️-migrations)
-- [Tests](#-tests)
-- [Documentation](#-documentation)
-- [Background](#-background)
-- [Contributing](#-contributing)
-- [License — free for open use, commercial licensing available](#️-license--free-for-open-use-commercial-licensing-available)
-
----
-
-## ✨ Why broker_parrot?
-
-The pitch in one line: **the database you already run is the most durable thing you own — so let it _be_ the queue.** No second broker to operate, no scheduler cluster. You `INSERT` a row inside your own transaction and the work is enqueued; a crashed worker's lease lapses and the row is re-queued. Purpose-built for a **small, self-hosted, heterogeneous CPU/GPU fleet you already own** — not a 1,000-node cloud.
-
-**Reach for it when** you have a handful of self-hosted boxes, want GPU-aware scheduling (warm models, per-box ON/OFF) and crash-safe recovery, and would rather not stand up a broker or a workflow platform just to move jobs between machines.
-
-**Look elsewhere when** you need a hosted UI, multi-region durability, or versioned-workflow replay at large scale — that's a different class of tool.
-
----
-
-## 🆚 How it compares (vs. Triton Inference Server)
-
-People often ask how this relates to [NVIDIA Triton Inference Server](https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/index.html). **They solve different problems and compose rather than compete.** Triton is a *model server* — it loads models into one process and answers inference requests synchronously, optimized for raw throughput. broker_parrot is a *durable job orchestrator* — it routes async work across a fleet of boxes with crash recovery, using the database as the bus. Triton makes one model fast on one node; broker_parrot reliably moves a unit of work to whichever node holds the right warm model and survives failure. You can even run **Triton (or vLLM/ollama) _as a node body inside_ a broker_parrot job** — the engine schedules and recovers the work, Triton serves the tensors.
-
-| Dimension | **broker_parrot** | **Triton Inference Server** |
-|---|---|---|
-| **Category** | Durable async workflow / job-queue engine | Real-time model inference server |
-| **Core interaction** | `INSERT` a row → job runs later, durably | HTTP/gRPC request → synchronous response |
-| **Latency profile** | Async, seconds–hours; survives restarts | Sub-second request/response |
-| **Unit of work** | Arbitrary node body / ingest task (`run(...)`); a model call is just one kind | A model inference (tensors in → tensors out) |
-| **Multi-step / pipelines** | First-class **DAG** dispatch with a durable outbox, deps, skip-if, fan-out | Model **ensembles** + Business Logic Scripting |
-| **Throughput tricks** | None by design — concurrency-1 per worker (opt-in cpu thread lane) | **Dynamic batching**, concurrent model execution |
-| **Model lifecycle** | Warm `ModelCache`, idle-unload, **warm-model affinity routing** across the fleet | Model repository: load/unload, versioning |
-| **Framework backends** | Host-agnostic — you bring `run(...)`; no framework coupling | TensorRT, PyTorch, ONNX, OpenVINO, vLLM, Python |
-| **Fleet & scheduling** | DB `FOR UPDATE SKIP LOCKED` claim + `LISTEN/NOTIFY`, lease + reclaim across N boxes | Per-node server; scaling delegated to **Kubernetes** |
-| **Crash recovery** | Lease lapse → re-queue onto a healthy peer; wall-clock / stall / GPU-health watchdogs re-queue-and-retry | K8s restarts the pod; no built-in job re-queue |
-| **Operator control** | Per-`(host, queue)` **ON/OFF** control plane (hard-stop frees VRAM) | No fleet ON/OFF; managed by K8s |
-| **State & durability** | Everything in the DB — jobs, leases, append-only event log, heartbeats | Stateless server; metrics only |
-| **Background / periodic work** | First-class **ingest jobs** + scheduler ticker | Out of scope — request-driven only |
-| **Dependencies** | Just a **database** (SQLite default, or Postgres via psycopg 3; optional redis/mongo) | NVIDIA runtime / CUDA; typically GPU + K8s for scale |
-
-**Where they overlap:** both keep models warm and care about GPU efficiency. **Where they don't:** Triton has no durable queue, no DAG, no cross-host crash-recovery, no operator ON/OFF, and no periodic work; broker_parrot has no dynamic batching, no native framework backends, and isn't a low-latency request server. Use Triton to make an inference *fast*; use broker_parrot to make the *work* reliable across the fleet.
-
----
-
-## 🌟 Highlights
-
-- 🔒 **Exactly-once claims** — `SELECT … FOR UPDATE SKIP LOCKED` over a database queue, woken instantly by `LISTEN node_job_ready` so workers never poll-spin or double-run a job.
-- ❤️‍🩹 **Self-healing leases** — a live worker renews its lease as it runs; a crashed or wedged worker's lease lapses and the orchestrator re-queues the row onto a healthy peer.
-- 🔗 **DAG dispatch with a durable outbox** — a node's terminal status and its dispatch event are written in one transaction, then drained to fan out the next ready nodes — no lost edges, no double fan-out.
-- 🔥 **GPU warm-model cache** — keeps a single model resident across consecutive same-model jobs and only drops/reloads on a real swap, so the expensive load happens once.
-- ⚡ **"Run next" priority flag** — flag a queued node so the next worker asking for its queue claims it first — jump an urgent job to the head with one call.
-- 🟢 **Operator ON/OFF control** — hard-stop or park any `(host, queue)` worker on demand; a hard stop requeues the in-flight job to a free peer and frees its RAM/VRAM, with no restart.
-- 📊 **Per-host telemetry** — live CPU/GPU/RAM and capacity stream over `pg_notify('hw_metrics', …)` plus `worker_heartbeats`, ready to drive a dashboard.
-- ⏰ **DB-native scheduler** — a built-in ticker enqueues recurring background jobs at scheduled minutes (with optional hour windows) — no cron, no external beat process.
-- 🗄️ **Pluggable store** — SQLite (default), Postgres, Redis, or MongoDB, behind one durable-queue contract.
-- 🧵 **Widen the cpu lane, per job** — one worker process can run N node-jobs (`--threads N`), and a job that needs more of the box declares `cpu_slots` so the claim reserves that much *before* its body starts. Defaults keep the classic one-job-per-process worker.
-- 🔀 **One LLM server at a time** — a box switching between ollama and vLLM drains the outgoing server before starting the incoming one, and concurrency follows the serving kind (ollama 1, vLLM its batch size) instead of one global number.
-- 📥 **A download lane** — mark a node `download: true` and it runs on its own queue with a fleet-wide cap (one downloader at a time by default), so network waits never hold a cpu/gpu slot; an optional `dedup_key` means one file is never downloaded twice.
-- 🗂️ **An observed model catalog** — each GPU box publishes which models its servers can actually serve, a job may list an ordered set of acceptable models, and every claim records which model — and which exact weights — it ran.
-- 📡 **LAN telemetry broadcast** (opt-in) — the same hardware sample, also sent as a UDP broadcast, so a display panel on the local network needs no database credentials.
-
 ---
 
 ## Installation
 
-Requires **Python 3.10+**. As of **v1.0.0 the default backend is SQLite** — a daemon-less local file, zero server to run — so the only hard runtime dependency is `psycopg` (used by the SQLite *and* Postgres paths). For a Postgres deployment (**14+**), opt in with `configure(db_backend="pg")` or `export QUEUE_WORKFLOWS_DB_BACKEND=pg`.
+**Python 3.10+**; the only required runtime dependency is `psycopg`. SQLite is the default backend. For Postgres **14+**, use `configure(db_backend="pg")` or `export QUEUE_WORKFLOWS_DB_BACKEND=pg`, and put the DSN in `QUEUE_WORKFLOWS_DB_URL`.
 
-Not on PyPI yet — install straight from GitHub (the distribution/import name in code is `queue_workflows`):
+broker_parrot isn't on PyPI yet, so install it from GitHub. The import name is `queue_workflows`.
 
 ```bash
 pip install "queue_workflows @ git+https://github.com/robertziel/broker_parrot"
+
+# optional extras
+pip install "queue_workflows[metrics] @ git+https://github.com/robertziel/broker_parrot"   # psutil CPU/RAM probe
 ```
 
-Optional extras:
+## Running in production
+
+Run one process per role, all pointed at the same database:
 
 ```bash
-# hw_metrics CPU/RAM probe (GPU probe shells out, no extra dep)
-pip install "queue_workflows[metrics] @ git+https://github.com/robertziel/broker_parrot"
-
-# alternative storage backends
-pip install "queue_workflows[redis]   @ git+https://github.com/robertziel/broker_parrot"
-pip install "queue_workflows[mongodb] @ git+https://github.com/robertziel/broker_parrot"   # needs a replica set
+queue-orchestrator                 # dispatch + outbox drain + reclaim
+queue-claim-worker --queue gpu     # claim and execute (cpu | gpu | download | your ingest queues)
+queue-scheduler                    # periodic ingest ticker
 ```
 
----
+All app-specific wiring is passed to the engine as hooks, and every hook has a safe default. The engine never imports anything from your app (a test enforces it). Containers, lanes and the cutover runbook: [`docs/deployment.md`](docs/deployment.md).
 
-## 🧩 Core concepts
+## Migrations
 
-Three ideas carry the whole design. The full treatment is in [`docs/architecture.md`](docs/architecture.md).
-
-**The database is the bus.** `INSERT`ing a row *is* enqueuing the work. A trigger fires `pg_notify('node_job_ready', …)` **inside the writer's transaction**, so a listening worker wakes the instant the row is visible — no separate publish step, no lost-wakeup window.
-
-**Three process roles, one database.** All three run as ordinary processes against the same DB:
-
-- **Orchestrator** — the only process that bootstraps migrations. It runs the DAG dispatch loop, drains the dispatch-event outbox, sweeps for lapsed leases and dead workers, and resumes parked input nodes. No node bodies run here.
-- **Claim worker** — **one process is one worker, concurrency-1 by default** (the cpu lane opts into N-per-process via `cpu_worker_threads`). It `LISTEN`s, greedily drains its queue on each wake, renews its lease while a job runs, and writes the terminal status + outbox event in one transaction. `cpu`/`gpu` draw DAG node-jobs; ingest-family queues draw standalone ingest jobs.
-- **Scheduler** — a DB-native ticker that sleeps to the next scheduled minute and enqueues periodic `ingest_jobs` rows.
-
-**Leases make it self-healing.** A live worker renews `lease_expires_at` (~every 10 s), so lease length is independent of job duration. A dead or wedged worker stops renewing; its lease lapses; the orchestrator's reclaim sweep flips the row back to `queued` (re-firing the NOTIFY). Layered on top are wall-clock, no-progress, and GPU-health watchdogs — each re-queues-and-retries rather than failing — plus an out-of-process dead-worker detector for hardware hangs. See [`docs/watchdogs.md`](docs/watchdogs.md).
-
----
-
-## 🏗 Architecture at a glance
-
-**The system.** Your app inserts rows inside its own transactions; the trigger's `NOTIFY` wakes workers the instant the row commits. Three kinds of engine processes — orchestrator, claim workers, scheduler — coordinate through nothing but the database:
-
-```mermaid
-flowchart LR
-    subgraph app["Your application"]
-        A["INSERT run / job<br/>(inside your own txn)"]
-    end
-    subgraph db["The database — SQLite or Postgres"]
-        Q[("workflow_runs<br/>workflow_node_jobs<br/>ingest_jobs")]
-        HB[("worker_heartbeats<br/>worker_controls<br/>node-event log")]
-    end
-    subgraph fleet["Engine processes — spread across N boxes"]
-        O["Orchestrator<br/>DAG dispatch · outbox drain<br/>lease reclaim · dead-worker sweep"]
-        W1["Claim worker — cpu<br/>LISTEN → SKIP LOCKED claim"]
-        W2["Claim worker — gpu<br/>+ warm ModelCache"]
-        S["Scheduler<br/>periodic ingest ticker"]
-    end
-    A --> Q
-    Q -- "NOTIFY fires inside<br/>the writer's txn" --> W1
-    Q -- "instant wake,<br/>no polling" --> W2
-    S --> Q
-    O <--> Q
-    W1 <--> Q
-    W2 <--> Q
-    W1 --> HB
-    W2 --> HB
-    O --> HB
-```
-
-**A job's life.** Every transition is a guarded `UPDATE`; crash recovery is just a lapsed lease:
-
-```mermaid
-stateDiagram-v2
-    [*] --> queued: INSERT - the NOTIFY rides the txn
-    queued --> running: worker claims - FOR UPDATE SKIP LOCKED
-    running --> completed: run() returns
-    running --> failed: raises, or watchdog retries exhausted
-    running --> cancelled: run cancelled
-    running --> queued: lease lapses - worker died, reclaim sweep requeues
-    running --> queued: watchdog trip - requeue and retry on a healthy peer
-    completed --> [*]
-    failed --> [*]
-    cancelled --> [*]
-```
-
-**The durable outbox.** A worker never calls the dispatcher — it writes the terminal status *and* a dispatch event in one transaction, and the orchestrator fans out from there. Fan-out is retryable and survives any crash between the two steps:
-
-```mermaid
-sequenceDiagram
-    participant W as Claim worker
-    participant DB as Database
-    participant O as Orchestrator
-    W->>DB: UPDATE job to completed + INSERT dispatch_event (ONE txn)
-    O->>DB: drain the outbox
-    O->>DB: enqueue downstream nodes whose deps are all met
-    DB-->>W: NOTIFY node_job_ready → next claim
-```
-
-The full treatment — including the watchdog stack and the host-agnostic hook seam — is in [`docs/architecture.md`](docs/architecture.md) and [`docs/watchdogs.md`](docs/watchdogs.md).
-
----
-
-## 🛠 Setting up a real project
-
-The production-shaped walkthrough lives in **[`docs/setup.md`](docs/setup.md)** — a real node module, the pipeline + workflow JSON, the `configure()` wiring, the three processes, and kicking off a run. Every snippet there is the public API, end to end. (Prefer to delegate? The [agent prompt](#-agent-friendly--just-type-it) above walks a coding agent through exactly that page.)
-
-```text
-your-app/
-├── nodes/            # one run() module per job — no base class, no decorator
-├── pipelines/        # *.schema.json — the DAG: ids, depends_on, gpu flags
-├── definitions/      # *.json — workflows stringing pipeline steps together
-└── engine.py         # configure() + set_workflow_provider() + db.bootstrap()
-```
-
----
-
-## 🎚️ Turning workers on/off — the operator control plane
-
-Each machine runs **one worker per queue** under a `host_label` (a box can run both a `cpu` and a `gpu` worker). An operator can flip any one **ON or OFF independently**, and the state is just **a row in `worker_controls`** — so the engine's helper, the `queue-worker-control` CLI, *or any app sharing the database* can set it. A trigger fires `pg_notify('worker_control', '<host>:<queue>')` so the worker reacts **immediately**, no polling lag.
-
-Turning a worker **OFF is a hard stop**: it **requeues the in-flight job** (resume-style, redistributed to a healthy peer — *not* failed), frees RAM/VRAM, and the worker comes back **parked** (idle, not claiming) until turned back ON.
-
-```bash
-# CLI — defaults --host to the local hostname
-queue-worker-control --queue gpu --off                 # hard-stop this box's gpu worker
-queue-worker-control --queue gpu --on  --host host-a   # bring it back (resumes in place, no restart)
-```
-
-```sql
--- …or a plain SQL write from any consumer sharing the DB. The trigger wakes the worker.
-INSERT INTO worker_controls (host_label, queue, desired_state, stop_policy, requested_by)
-VALUES ('host-a', 'gpu', 'off', 'hard', 'ops')
-ON CONFLICT (host_label, queue) DO UPDATE
-  SET desired_state = EXCLUDED.desired_state, updated_at = now();
-```
-
-A worker **absent** from `worker_controls` is treated as **ON** (default-on), and the accessors no-op cleanly on a database that predates the feature — so adding the engine changes nothing until you opt in. Why a process exit (and a requeue, not a cancel), plus the extensible stop-policy seam: [`docs/worker_control.md`](docs/worker_control.md).
-
----
-
-## 🏷️ Host-defined queues + parametrised ingest jobs
-
-Two job families share the engine: DAG **node-jobs** (`workflow_node_jobs`, the reserved `cpu`/`gpu`/`download` queues, fanned out by the dispatcher) and standalone **ingest jobs** (`ingest_jobs`, **your own** queue names, no DAG). The ingest path isn't limited to one app's vocabulary — a second consumer can route its **own** queues and carry **per-job arguments**, enqueued **atomically with its own domain row** (the `NOTIFY` rides the caller's transaction):
+The engine owns its schema. Migrations ship with the package in `queue_workflows/migrations/` (Postgres) and `migrations_sqlite/`. `db.bootstrap()` applies them idempotently; only the orchestrator runs it, and claim workers wait until the schema is ready. An app with its own tables runs a second chain against its own version table:
 
 ```python
-queue_workflows.configure(
-    db_backend="pg",
-    db_url_env="MY_DB_URL",
-    ingest_queues=frozenset({"ingest", "etl", "sim", "reports"}),           # NOT cpu/gpu/download (reserved for the DAG path)
-    ingest_default_budget_s=3600,                                           # watchdog budget for these queues
-)
-queue_workflows.register_ingest_task("run_scenario", run_scenario)         # fn(reason) OR fn(reason, args) -> dict
-
-# Parametrised + atomic with your own write — one transaction, no dual-write:
-with my_pool.connection() as conn:
-    my_create_scenario(conn, scenario_id)
-    node_queue.enqueue_ingest_job(
-        task_name="run_scenario", queue="sim",
-        args={"scenario_id": scenario_id}, conn=conn,
-    )
+queue_workflows.db.bootstrap()                                   # engine chain
+queue_workflows.db.bootstrap(migrations_dir="myapp/migrations",  # your chain, own ledger
+                             version_table="myapp_schema_version")
 ```
 
-A registered callable may be `fn(reason)` or `fn(reason, args)`. Ingest workers emit `worker_heartbeats`, so the snapshot reflects live workers per queue. `cpu`/`gpu`/`download` stay **reserved** for the DAG path.
+Every table is documented in [`docs/schema.md`](docs/schema.md).
 
----
-
-## 🏢 One broker for many projects
-
-Instead of running **one database per app**, pool **several apps onto one shared "broker" database** and tell them apart with a `project` tag (migration `0017`). Each client claims **only** rows whose `project` matches its own — exact match, in the same `SKIP LOCKED` statement — so two projects never see each other's work, yet one operator dashboard sees the whole fleet.
-
-```python
-# app A and app B share one BROKER_DSN, distinct tags
-queue_workflows.configure(project="forecast", db_backend="pg", db_url_env="BROKER_DSN")
-queue_workflows.configure(project="render3d", db_backend="pg", db_url_env="BROKER_DSN")
-```
-
-Set it once per process with `configure(project=...)`, or export `QUEUE_WORKFLOWS_PROJECT=<name>` (the env knob also reaches console tooling that hand-rolls its own `configure`). Default `""` keeps single-tenant deploys byte-identical. This is the **inverse** of `db_namespace` (redis/mongo), which *isolates* tenants who can't see each other; `project` *pools* them into one queue you filter.
-
-The `queue-broker` console script bootstraps the shared schema and inspects the consolidated queue. A newer **broker service** inverts the model further — a pull→grant control plane with a web panel where the broker arbitrates a shared CPU/GPU across projects and can revoke a job at will. Full treatment: [`docs/broker.md`](docs/broker.md).
-
-The bundled `queue-broker-web` operator panel (pure stdlib, server-rendered, no JS) over that shared queue:
-
-![queue-broker-web — the shared CPU/GPU queue, per-project tabs, and the worker fleet](docs/images/broker-web-panel.png)
-
----
-
-## 🗄️ Pluggable storage backends
-
-The database is the engine — but the **queue store is selectable**: `configure(db_backend="sqlite" | "pg" | "redis" | "mongodb")`. **SQLite (default)** and **Postgres** are the two *relational* backends: they run the **full DAG engine** through a dialect seam. **Redis** and **MongoDB** are opt-in providers that reproduce the *same durable-queue contract* — **claim exactly-once, lease/reclaim, idempotent terminals, an atomic outbox, and per-namespace tenant isolation** — via a `StorageBackend` SPI (the redis/pymongo drivers import lazily, so a sqlite/pg deploy needs neither).
-
-```python
-import queue_workflows
-queue_workflows.configure(db_backend="redis")        # or "mongodb" / "pg" / "sqlite" (default)
-
-from queue_workflows.backends import get_backend
-be = get_backend()                                    # bound to your configured namespace
-job_id = be.enqueue("cpu", {"task": "render"})
-job    = be.claim("cpu", worker="box-1", lease_s=30)
-be.complete_with_event(job["id"], "completed", result={"ok": True})   # go terminal + append event, atomically
-```
-
-The port is deliberately **non-leaky** (no method takes or returns a driver handle) and each backend is **namespace-bound** so two tenants on one server stay isolated. The SPI is additive: selecting redis/mongo does not (yet) re-home the DAG orchestrator/worker off the relational store. Contract, capability matrix, and caveats: [`docs/storage_backends.md`](docs/storage_backends.md).
-
----
-
-## 🤖 GPU models & LLM backends
-
-A GPU claim worker owns a process-wide **warm `ModelCache`**: it keeps one model resident across consecutive same-model jobs, drops/reloads only on a real swap, and publishes `current_model` to its heartbeat so the claim `ORDER BY` can route a matching job to the box that's already warm (**affinity routing**). A capacity-aware assignment pass (migration `0015`) fits models to VRAM and flags what can't fit rather than thrashing.
-
-GPU nodes often need a co-tenant **ollama / vLLM** server next to the worker. Which *kind* of server a box runs is per-machine, operator-set state (on `worker_controls`, migration `0013`); each host advertises which server types it can actually run in its heartbeat (`0014`). A built-in **idle supervisor** can stop a vLLM sidecar to reclaim VRAM and restart it on demand — the host teaches it how via `set_vllm_lifecycle(stop_fn, start_fn)`. Nodes never branch on server type; the engine resolves the exact endpoint per dispatch and threads it in as `run(llm_server=...)`.
-
-Apps can also share a **GPU pool** — a namespaced `StorageBackend` queue addressed independently of the main store — so pooled workers across apps claim self-contained GPU tasks (code on the box, data on shared NFS). Full design: [`docs/gpu_and_llm.md`](docs/gpu_and_llm.md).
-
----
-
-## 🗄️ Migrations
-
-The engine **owns its schema**. Migrations ship as package data at `queue_workflows/migrations/NNNN_*.sql` (with a parallel `migrations_sqlite/` chain), and `queue_workflows.db.bootstrap()` applies them against a version ledger (`queue_schema_version`) — idempotent, safe on every boot. Only the orchestrator bootstraps (advisory-locked, so concurrent boots are safe); claim workers `db.wait_for_schema(min_version)` and block until the schema is ready.
-
-A host with its **own domain tables** runs a *second* chain alongside the engine's, with its own version table:
-
-```python
-import queue_workflows
-
-# 1. engine chain → queue_schema_version (queue tables)
-queue_workflows.db.bootstrap()
-
-# 2. your app's chain → its own ledger, fully independent of the engine's
-queue_workflows.db.bootstrap(
-    migrations_dir="myapp/migrations",
-    version_table="myapp_schema_version",
-)
-```
-
-The chain and every table are documented in [`docs/schema.md`](docs/schema.md).
-
----
-
-## 🧪 Tests
+## Tests
 
 ```bash
 pip install -e '.[test]'
-
-QUEUE_WORKFLOWS_TEST_DB_URL=postgresql://user:pw@host:port/queue_workflows_test \
-  python -m pytest
+QUEUE_WORKFLOWS_TEST_SQLITE=1 python -m pytest                    # no servers needed
+QUEUE_WORKFLOWS_TEST_DB_URL=postgresql://user:pw@host:port/queue_workflows_test python -m pytest
 ```
 
-The suite **forces a `*_test` DB** and applies the engine migration chain — it refuses to run against a non-`_test` database, so you can't point it at anything precious. The multi-backend contract suite additionally reads `QUEUE_WORKFLOWS_TEST_REDIS_URL` / `QUEUE_WORKFLOWS_TEST_MONGO_URL`; each backend **skips** if its server is unset or unreachable. See `tests/conftest.py` and [`docs/deployment.md`](docs/deployment.md).
+The Postgres suite forces a `*_test` database name (suffixing `_test` if the DSN lacks it) and creates it if missing.
 
 ---
 
-## 📚 Documentation
+## When not to use it
 
-The [`docs/`](docs/) set:
+A database-backed queue works well up to a healthy throughput ceiling, as long as your jobs already live next to your data. Choose a purpose-built broker if you need any of these:
 
-- [`setup.md`](docs/setup.md) — the full project walkthrough: a real node, the pipeline + workflow JSON, `configure()` wiring, the three processes, and kicking off a run.
-- [`architecture.md`](docs/architecture.md) — the mental model: the DB as the bus, the three process roles, the claim mechanism, DAG dispatch + the durable outbox, and the host-agnostic seam.
-- [`configuration.md`](docs/configuration.md) — the complete host-wiring reference: `configure()`, every `set_*` / `register_*` hook, the env knobs, and the default philosophy.
-- [`schema.md`](docs/schema.md) — the database schema and the full migration chain (Postgres and SQLite), plus the idempotency contracts.
-- [`storage_backends.md`](docs/storage_backends.md) — the `db_backend` seam and the `StorageBackend` SPI (`sqlite` / `pg` / `redis` / `mongodb`).
-- [`watchdogs.md`](docs/watchdogs.md) — the liveness model: leases, reclaim, the three watchdogs, the state watchers, and the out-of-process dead-worker detector.
-- [`worker_control.md`](docs/worker_control.md) — the operator ON/OFF control plane and the extensible stop-policy seam.
-- [`broker.md`](docs/broker.md) — the shared multi-project broker (the `project` tag) and the v2 pull→grant broker service + operator panel.
-- [`gpu_and_llm.md`](docs/gpu_and_llm.md) — the warm-model cache, capacity-aware assignment, the shared GPU pool, and the ollama / vLLM backends.
-- [`deployment.md`](docs/deployment.md) — running the engine in production: console scripts, the one-container-N-processes lane, migrations at deploy, and the fleet cutover runbook.
-- [`use_cases/`](docs/use_cases/README.md) — ten worked operational scenarios: a box powering off mid-job (front-of-queue requeue + the zombie kill signal), boot/rejoin, operator stop, wedged-GPU recovery, DAGs, periodic ingest, the multi-project broker, warm-model affinity, run-next priority, and human-in-the-loop input.
+- millions of tiny messages per second
+- fan-out to many independent consumers
+- jobs that have nothing to do with your relational data
+- a hosted UI, multi-region durability, or replay of versioned workflows
 
----
+What you get here instead is one system, one backup, one set of credentials and one transaction boundary.
 
-## 📦 Background
+## How it compares
 
-The engine was extracted from a larger self-hosted stack into this standalone, open-source package so it can be reused and shared on its own. It runs a real multi-box CPU/GPU fleet in production every day — the reliability layers (leases, watchdogs, the over-claim reaper, the box-agent supervisor) each exist because something actually failed that way first.
+These tools mostly sit at different layers. Triton is a model server; SkyPilot and dstack provision and run GPU jobs across clouds, Kubernetes and SSH machines; Volcano and Kueue are batch schedulers inside Kubernetes. broker_parrot is a durable job queue in the database you already run, for a handful of boxes you own.
 
----
+| | broker_parrot | Triton Inference Server | SkyPilot | Volcano | Kueue | dstack |
+|---|---|---|---|---|---|---|
+| What it is | Job queue + DAG engine in your DB | Model server | AI workload launcher and control plane | Kubernetes batch scheduler (CNCF) | Kubernetes job queueing and quotas | GPU provisioning and orchestration |
+| Runs on / needs | SQLite or Postgres; no Kubernetes | Docker, NVIDIA GPU or CPU; often Kubernetes | Clouds, Kubernetes, Slurm, SSH node pools | Kubernetes | Kubernetes | Clouds, Kubernetes, SSH fleets (Docker hosts) |
+| Unit of work | A row: node-job or ingest job | Inference request (HTTP/gRPC) | Cluster, job, managed job | VolcanoJob / PodGroup | Workload (Job, JobSet, RayJob, Pods …) | Dev environment, task, service |
+| Scheduling model | Workers claim with `SKIP LOCKED`, woken by NOTIFY | Per-model scheduler, dynamic batching | Finds capacity across infra, failover | Queues with weights and caps, fair-share, binpack | Admits on quota: cohorts, borrowing, preemption | Matches runs to fleet capacity |
+| Multi-step DAGs | Yes, with a durable outbox | Ensembles / BLS inside one request | Sequential pipelines | JobFlow (alpha) | No; pair with Argo or Tekton | No |
+| Crash/preemption recovery | Lease lapse → re-queue; watchdogs re-run a node | Out of scope (pod restart) | Managed jobs re-provision and restart | `maxRetry` + lifecycle policies | Re-queues evicted workloads | `retry` on interruption, error, no capacity |
+| GPU awareness | Warm-model affinity, VRAM fit, LLM server switching | Loads models, batches requests | Picks GPU type and cloud | Gang, GPU sharing (MIG, vCUDA) | GPU quotas, all-or-nothing, topology-aware | Picks GPUs, splits hosts into blocks |
+| Fleet on/off / queues | On/off per `(host, queue)`; cpu/gpu/download + ingest queues | Load/unload models | Start/stop/autostop clusters | Queue open/closed | ClusterQueue `Hold` / `HoldAndDrain` | Create/delete fleets |
+| Best for | Async GPU and data jobs on a few owned boxes | Low-latency online inference | Training and batch jobs on rented GPUs | Big MPI/Spark/AI batch on Kubernetes | Shared Kubernetes clusters with team quotas | ML teams wanting dev envs, tasks, endpoints |
+| License | Apache-2.0 | BSD-3-Clause | Apache-2.0 | Apache-2.0 | Apache-2.0 | MPL-2.0 |
 
-## 🤝 Contributing
-
-Contributions are welcome — bug reports, storage-backend providers, docs fixes, and rough edges all count. The house rules are short:
-
-- **Tests are the spec.** The suite is written test-first; a behavior change comes with the test that pins it (`tests/test_invariant_*.py` for engine guarantees).
-- **Stay host-agnostic.** The engine imports nothing from any host app — new tunables go through `configure()` / `envcompat` with a safe default (two guard tests enforce this).
-- **SQLite + Postgres both green.** `QUEUE_WORKFLOWS_TEST_SQLITE=1 python -m pytest` needs no servers at all.
-
-If broker_parrot saved you from standing up a broker, a ⭐ helps others find it.
+They compose: a broker_parrot job can call Triton, vLLM or ollama, and a broker_parrot fleet can run on machines SkyPilot or dstack provisioned.
 
 ---
 
-## ⚖️ License — free for open use, commercial licensing available
+## Documentation
 
-**Free for personal, research, and open-source use** under the
-**GNU Affero General Public License v3.0 or later** ([`LICENSE`](LICENSE))
-© Robert Zieliński.
+| Doc | Covers |
+|---|---|
+| [`setup.md`](docs/setup.md) | a full project walkthrough: node, pipeline + workflow JSON, `configure()`, the three processes |
+| [`architecture.md`](docs/architecture.md) | the database as the bus, process roles, the claim, the outbox, app hooks |
+| [`configuration.md`](docs/configuration.md) | `configure()`, every `set_*` / `register_*` hook, env settings |
+| [`schema.md`](docs/schema.md) | every table and the full migration chain (Postgres + SQLite) |
+| [`watchdogs.md`](docs/watchdogs.md) | leases, reclaim, the watchdogs, the dead-worker detector |
+| [`worker_control.md`](docs/worker_control.md) | the operator on/off control plane |
+| [`broker.md`](docs/broker.md) | the shared multi-project broker |
+| [`gpu_and_llm.md`](docs/gpu_and_llm.md) | warm-model cache, capacity assignment, ollama / vLLM |
+| [`box_placement.md`](docs/box_placement.md) | pinning a job to, or keeping it off, specific boxes |
+| [`hw_watch.md`](docs/hw_watch.md) · [`hw_lan_broadcast.md`](docs/hw_lan_broadcast.md) | the hardware flight recorder and LAN telemetry broadcast |
+| [`storage_backends.md`](docs/storage_backends.md) | the `sqlite` / `pg` backends |
+| [`deployment.md`](docs/deployment.md) | console scripts, container lanes, migrations at deploy time |
+| [`use_cases/`](docs/use_cases/README.md) | ten worked scenarios: power loss mid-job, boot and rejoin, a wedged GPU, and more |
 
-- 🆓 **Personal projects, research, homelabs, open source** — use it, modify it,
-  ship it. The AGPL asks one thing back: derivative works stay source-available
-  under the same license (AGPL §13 extends that to modified versions run as a
-  network service). Simply *running* an unmodified copy behind your own app
-  triggers no obligation.
-- 💼 **Commercial product where the AGPL's copyleft doesn't fit?** A commercial
-  license without the AGPL obligations is available — **let's talk:
-  [hello@robertz.co](mailto:hello@robertz.co)**.
+## Contributing
 
-Previous releases stay under the terms they shipped with: versions ≤ 1.0.1 under
-MIT, version 1.0.2 under PolyForm Noncommercial 1.0.0.
+Bug reports, new storage backends and doc fixes are all welcome.
+
+- **Tests come first.** A change in behaviour comes with the test that pins it down (`tests/test_invariant_*.py` for engine guarantees).
+- **Stay app-agnostic.** The engine imports nothing from any app. New settings go through `configure()` / `envcompat` with a safe default.
+- **Keep SQLite and Postgres both green.**
+
+If broker_parrot saved you from running a separate broker, a ⭐ helps others find it.
+
+## License
+
+**Apache-2.0** ([`LICENSE`](LICENSE)) © Robert Zieliński. Use it, modify it and ship it, commercially or not; keep the license and copyright notice.
+
+Earlier releases keep the terms they shipped with: versions ≤ 1.0.1 are MIT, 1.0.2 is PolyForm Noncommercial 1.0.0, and 1.0.3–1.4.0 are AGPL-3.0-or-later.

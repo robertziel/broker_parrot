@@ -2,7 +2,7 @@
 
 The default per-box cpu-worker count is the box's cgroup-aware available CPU
 cores (so each box scales to its own capacity), overridable via
-``AI_LEADS_WORKFLOW_CPU_WORKERS``. ``_available_cpus`` is cgroup-aware because
+``QUEUE_WORKFLOWS_WORKFLOW_CPU_WORKERS``. ``_available_cpus`` is cgroup-aware because
 workers run in containers — a CFS-quota- or cpuset-limited container must count
 its real share, not the host's cores. Pure logic with injected seams (no DB).
 """
@@ -109,30 +109,30 @@ def test_garbage_cgroup_contents_do_not_crash():
 
 
 def test_cpu_worker_count_defaults_to_available_cpus(monkeypatch):
-    monkeypatch.delenv("AI_LEADS_WORKFLOW_CPU_WORKERS", raising=False)
+    monkeypatch.delenv("QUEUE_WORKFLOWS_WORKFLOW_CPU_WORKERS", raising=False)
     assert node_pool.cpu_worker_count() == node_pool._available_cpus()
     assert node_pool.cpu_worker_count() >= 1
 
 
 def test_cpu_worker_count_env_override_wins(monkeypatch):
-    monkeypatch.setenv("AI_LEADS_WORKFLOW_CPU_WORKERS", "7")
+    monkeypatch.setenv("QUEUE_WORKFLOWS_WORKFLOW_CPU_WORKERS", "7")
     assert node_pool.cpu_worker_count() == 7
 
 
 def test_cpu_worker_count_is_no_longer_hardcoded_five(monkeypatch):
     """Regression for the change: the default must track the box, not the old
     magic 5 (unless the box genuinely has 5 cores)."""
-    monkeypatch.delenv("AI_LEADS_WORKFLOW_CPU_WORKERS", raising=False)
+    monkeypatch.delenv("QUEUE_WORKFLOWS_WORKFLOW_CPU_WORKERS", raising=False)
     assert node_pool.cpu_worker_count() == node_pool._available_cpus()
 
 
 def test_cpu_worker_count_garbage_env_falls_back_to_available(monkeypatch):
     """A non-integer override must fall back to available cores, not the old
     hardcoded 5 (regression guard on _int_env's bad-value path)."""
-    monkeypatch.setenv("AI_LEADS_WORKFLOW_CPU_WORKERS", "not-a-number")
+    monkeypatch.setenv("QUEUE_WORKFLOWS_WORKFLOW_CPU_WORKERS", "not-a-number")
     assert node_pool.cpu_worker_count() == node_pool._available_cpus()
 
 
 def test_gpu_worker_count_default_unchanged(monkeypatch):
-    monkeypatch.delenv("AI_LEADS_WORKFLOW_GPU_WORKERS", raising=False)
+    monkeypatch.delenv("QUEUE_WORKFLOWS_WORKFLOW_GPU_WORKERS", raising=False)
     assert node_pool.gpu_worker_count() == 1

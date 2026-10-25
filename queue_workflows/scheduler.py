@@ -5,7 +5,7 @@ per fire — which a fetch/load ``claim_worker`` then picks up via ``LISTEN
 ingest_job_ready``. No new Postgres extension (not pg_cron): it's a
 long-running Python loop that sleeps to the next scheduled instant.
 
-The SCHEDULE is HOST-INJECTED (plan §1f): the engine ships the generic
+The SCHEDULE is HOST-INJECTED: the engine ships the generic
 ``Ticker``/``ScheduleEntry``/``enqueue_due``/``enqueue_boot_kick`` machinery but
 takes the actual schedule from ``config.ingest_schedule`` (empty by default).
 The host sets it via ``queue_workflows.set_ingest_schedule([...])``. The

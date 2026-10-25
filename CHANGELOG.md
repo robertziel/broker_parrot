@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] — 2026-10-26
+
+### Breaking
+- **Relicensed to Apache-2.0** (was AGPL-3.0-or-later for 1.0.3–1.4.0). Earlier releases keep their terms.
+- **The retired `AI_LEADS_*` env names are an error.** Every knob is `QUEUE_WORKFLOWS_*`; a legacy twin still set
+  raises `RuntimeError` at startup naming its replacement (no silent fallback). `container_prefix` has no default
+  (cgroup attribution is off until a host sets it).
+- **SQLite and Postgres are the only backends.** The redis/mongodb `StorageBackend` providers, `db_namespace`, the
+  shared GPU pool (`gpu_pool`, `register_pool_handler`) and the `[redis]`/`[mongodb]` extras are removed.
+  `db_backend` accepts `sqlite` | `pg` (`postgres`/`postgresql` alias `pg`); anything else is a `ValueError`.
+- **Removed:** the v2 `broker_service` (`queue-broker-web`, `queue-broker-worker`, `bw_*` tables, `deploy/k8s`),
+  its HTML panel, `queue-worker-supervisor` + `set_worker_bounce`, and the `queue-broker` console script. The
+  dead-worker flag (`worker_heartbeats.last_flagged_dead_at`) and the `project` tag stay.
+
+### Added
+- **Migration 0028 — the LLM context window is a routing fact.** A sized job goes only to a box that serves a big
+  enough window; a box grows into demand through a resize switch.
+- **Migration 0029 — vLLM sized from its own startup numbers.** The next start is planned for what N requests of
+  the window need; the box's parallelism is capped at what the KV cache holds.
+- **Migration 0030 — `gpu_slots`** (`N` | `half` | `all`): how much of a GPU box one node-job takes.
+- **A per-box ceiling on concurrent GPU jobs** (`gpu_box_max_concurrent`, env `QUEUE_WORKFLOWS_GPU_BOX_MAX_CONCURRENT`).
+- **A memory sentinel** on the gpu lane: once a second it sheds the box's LLM servers under a danger/kill floor and
+  lets vLLM back after RAM has recovered; a load killed mid-way raises the bar for the next one.
+- **One LLM daemon per box**, enforced against servers the broker did not start (`rogue_llm`).
+- **An opt-in no-progress guard for pool-lane LLM nodes** (`POOL_STALL_TIMEOUT_S`).
+- **Per-core CPU load** in the `deploy/hw_broadcast_main.py` LAN broadcast.
+
+### Fixed
+- `queue-orchestrator` parses its real command line (`--help` used to block waiting for a database).
+- A vLLM box no longer also advertises ollama; `current_model` carries a model or nothing.
+- The startup resume no longer re-queues runs that were never orphaned.
+- A container recreate keeps the container's network identity; a lost context-lever port is reported, not retried
+  forever.
+
+### Docs
+- New logo: a flat, retro parrot perched on a database (`docs/images/logo.svg`).
+- README rewritten: the database-as-queue design, theme-aware architecture / job-lifecycle / outbox charts, a
+  comparison with Triton, SkyPilot, Volcano, Kueue and dstack, and a quickstart verified end to end.
+
 ## [1.4.0] — 2026-09-11
 
 A feature release on from 1.1.0. Migrations 0025–0027 are additive (one dropped

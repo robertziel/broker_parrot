@@ -12,10 +12,10 @@ is actually gone:
      predecessor's rows immediately (seconds after the supervisor restart);
   2. **orchestrator dead-worker sweep** — ``_sweep_dead_workers`` FLAGS the worker
      for a host-supervisor bounce but NEVER touches its job rows. It briefly also
-     re-queued them (~30 s) — reverted after a live incident: a heartbeat is a
+     re-queued them (~30 s) — reverted after a false positive: a heartbeat is a
      PROCESS-level signal from one thread, and a wide-concurrency cpu worker under
      load starved its beat thread past staleness while every per-job lease kept
-     renewing — 23 LIVE jobs were mass-re-queued mid-flight. The per-JOB lease
+     renewing — every one of its LIVE jobs was mass-re-queued mid-flight. The per-JOB lease
      renewal is the only truthful liveness signal, so job recovery belongs to the
      frozen-lease sweep below (~35 s — same speed, no false positives);
   3. **frozen-lease sweep** — per-job recovery keyed on the lease renewal itself.
@@ -149,9 +149,9 @@ def test_run_forever_wires_the_boot_reclaim():
 
 
 def test_sweep_dead_workers_flags_but_never_touches_the_job():
-    """THE FALSE-POSITIVE INCIDENT. box-c's 30-wide cpu worker
-    starved its heartbeat thread >90 s under a 27-job batch while every job's
-    lease kept renewing — the then-requeueing sweep yanked 23 LIVE jobs
+    """THE FALSE POSITIVE. A wide cpu worker starved its heartbeat thread past
+    staleness under a large batch while every job's lease kept renewing — the
+    then-requeueing sweep yanked its LIVE jobs
     mid-flight. Contract since: heartbeat staleness flags the PROCESS for a
     supervisor bounce; the job rows stay untouched (per-job recovery is the
     frozen-lease sweep's, keyed on the lease renewal — the signal that was

@@ -24,11 +24,11 @@ from queue_workflows.model_cache import ModelCache
 @pytest.fixture(autouse=True)
 def _wipe_heartbeats(monkeypatch):
     # Allow current_model upserts in this test file (the suite-wide
-    # AI_LEADS_DISABLE_WORKER_HEARTBEAT skip is for the daemon thread, but
+    # QUEUE_WORKFLOWS_DISABLE_WORKER_HEARTBEAT skip is for the daemon thread, but
     # _publish_current_model honours the same flag — override here). The
-    # host-label env defaults to AI_LEADS_HOST_LABEL (config.host_label_env).
-    monkeypatch.delenv("AI_LEADS_DISABLE_WORKER_HEARTBEAT", raising=False)
-    monkeypatch.setenv("AI_LEADS_HOST_LABEL", "test-host")
+    # host-label env defaults to QUEUE_WORKFLOWS_HOST_LABEL (config.host_label_env).
+    monkeypatch.delenv("QUEUE_WORKFLOWS_DISABLE_WORKER_HEARTBEAT", raising=False)
+    monkeypatch.setenv("QUEUE_WORKFLOWS_HOST_LABEL", "test-host")
     model_registry.clear_for_tests()
     gpu_model_cache._reset_gpu_model_cache_for_tests()
     with connection() as conn, conn.cursor() as cur:

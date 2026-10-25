@@ -9,7 +9,7 @@ is no ``on_node_cancelled``. So once a node is ``cancelled`` while its run is
 non-terminal — and ``run_store.reenqueue_running_for_resume`` then blindly
 re-queues the run on the next orchestrator restart — the run sits ``queued``
 forever with NO live node-job: nothing for a worker to claim, never completing,
-never failing. Observed live (runs 3e0e0f61 / bf008700 / 905fe457).
+never failing.
 
 Covered:
 - the decision tree of ``reconcile_run`` (pure, monkeypatched): noop when

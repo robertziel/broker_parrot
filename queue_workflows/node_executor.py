@@ -22,7 +22,7 @@ It owns everything between "the row is claimed (status='running')" and
     atomicity contract);
   * the best-effort run-card thumbnail refresh on completion.
 
-The node-module resolver is configurable (plan §2b-2): ``_invoke`` no longer
+The node-module resolver is configurable: ``_invoke`` no longer
 hardcodes ``importlib.import_module(f"workflows.nodes.{name}")`` — it asks the
 engine config (``config.resolve_node_module``), which by default builds from
 the host-set ``node_module_package`` (e.g. ``"workflows.nodes"``) or imports
@@ -373,7 +373,13 @@ def execute_node(
             # and hand it to the node — parallel to model_handle. None unless a
             # host wired set_llm_server_resolver. Inside the try so a resolver
             # error fails the node honestly (same as any invoke-time failure).
-            llm_server = cfg.resolve_llm_server(job)
+            #
+            # A CLUSTER RESERVATION has no LLM server: it holds the box for one the engine
+            # does not run (node_queue.CLUSTER_SERVER_KIND). Resolving one would build the box
+            # default's backend (a vLLM backend arms its supervisor) and log a violated
+            # preference for a row that asked for no broker server at all.
+            llm_server = (None if node_queue.is_cluster_reservation(job)
+                          else cfg.resolve_llm_server(job))
             result = _invoke(
                 module_name=job["node_module"],
                 inputs=fresh_inputs,
@@ -443,7 +449,7 @@ def _watchdog_max_retries() -> int:
 
 def _requeue_for_transient_gpu(job: dict, error: str, t0: float) -> str:
     """Re-queue a node job whose model-load/invocation hit a TRANSIENT GPU error so a free, healthy
-    host retries it — instead of failing the whole run. Bounded by ``AI_LEADS_WATCHDOG_MAX_RETRIES``
+    host retries it — instead of failing the whole run. Bounded by ``QUEUE_WORKFLOWS_WATCHDOG_MAX_RETRIES``
     (the SAME cap + machinery the stall watchdog uses); at the cap, fall through to a real failure
     so a genuinely-broken job can't loop forever. Writes NO dispatch event — the run stays alive."""
     retries = int(job.get("watchdog_retries") or 0)

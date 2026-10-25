@@ -3,8 +3,8 @@
 This is the **detailed, production-shaped setup**: a real node module, the pipeline +
 workflow JSON that references it, the host wiring (`configure()` + seams), the three
 processes, and kicking off a run. If you just want to see the engine work in 60
-seconds with zero servers, start with the [README quickstart](../README.md#-quickstart--60-seconds-zero-servers)
-— or hand your coding agent the [agent prompt](../README.md#-agent-friendly--just-type-it)
+seconds with zero servers, start with the [README quickstart](../README.md#quickstart)
+— or hand your coding agent the [agent prompt](../README.md#hand-it-to-a-coding-agent)
 and let it do this whole page for you.
 
 Related references: [`configuration.md`](configuration.md) (every hook and env knob),
@@ -89,7 +89,7 @@ Two small JSON files. The **pipeline schema owns the DAG** (`nodes` with `id` / 
       "id": "greet",
       "kind": "pipeline",
       "pipeline": "greet",
-      "inputs": { "name": { "$from": "parcel.label" } }
+      "inputs": { "name": { "$from": "item.label" } }
     }
   ]
 }
@@ -177,7 +177,7 @@ run_id = str(uuid.uuid4())
 run_store.insert_run(
     run_id=run_id,
     workflow_name="greet",
-    context={"parcel": {"label": "Ada"}},   # feeds the $from ref → name="Ada"
+    context={"item": {"label": "Ada"}},   # feeds the $from ref → name="Ada"
 )
 dispatcher.start_run(run_id)                 # fan out the initial ready nodes
 ```

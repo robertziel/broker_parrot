@@ -5,19 +5,19 @@
 -- simply ages out of the freshness window (no DELETE on shutdown). But an OFF
 -- control state must PERSIST precisely while the worker is NOT beating — exactly
 -- when its heartbeat row would be aging out — so it cannot live there. This table
--- is *desired* state, written by an operator / Rails (which shares the DB) and
+-- is *desired* state, written by an operator / a host app (which shares the DB) and
 -- read by the worker; keeping the two apart also avoids the heartbeat upsert
 -- clobbering an operator's control write (and vice-versa).
 --
 -- Keyed ``(host_label, queue)`` — the SAME identity worker_heartbeats and the
 -- claim's ``claimed_by``/``queue`` use. A host runs several workers under one
--- ``host_label`` (host-c runs a cpu AND a gpu worker), so control MUST be
+-- ``host_label`` (host-a runs a cpu AND a gpu worker), so control MUST be
 -- per-queue: turning off "host-a gpu" must not touch "host-a cpu".
 --
 --   * desired_state — 'on' | 'off'. A stable two-value enum ⇒ a DB CHECK.
 --   * stop_policy   — how to transition on→off. 'hard' (kill in-flight + free
---                     RAM now) is the only one implemented today; 'drain' /
---                     'pause' will slot in later. Deliberately FREE-FORM TEXT
+--                     RAM now) and 'drain' (finish in-flight, then park) are
+--                     implemented; 'pause' may slot in later. Deliberately FREE-FORM TEXT
 --                     (no CHECK) so a future policy needs NO migration — the
 --                     worker validates it against its in-code STOP_POLICIES
 --                     registry (queue_workflows.worker_control).
@@ -26,11 +26,11 @@
 -- The trigger NOTIFYs ``worker_control`` (payload ``host_label:queue``) on every
 -- write so the worker's WorkerControlWatcher wakes immediately — mirroring
 -- migration 0006/0007's node_job_ready / ingest_job_ready triggers, so a plain
--- INSERT/UPDATE from Rails wakes the worker with no app-side NOTIFY code and the
+-- INSERT/UPDATE from a host app wakes the worker with no app-side NOTIFY code and the
 -- wake rides the writer's txn (no "row written but no wake" window).
 --
 -- Idempotent (``CREATE TABLE IF NOT EXISTS`` / ``CREATE OR REPLACE FUNCTION`` /
--- ``DROP TRIGGER IF EXISTS``) so re-running on the live ai_leads DB is a no-op.
+-- ``DROP TRIGGER IF EXISTS``) so re-running on a live DB is a no-op.
 
 CREATE TABLE IF NOT EXISTS worker_controls (
     host_label    TEXT NOT NULL,

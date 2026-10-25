@@ -20,7 +20,7 @@ machinery and the DB:
     empty-registry re-registration fallback. That fallback is the injected
     ``register_builtins`` hook — the engine default is the
     ``config.builtin_model_registrar`` (a no-op unless a host wires it),
-    NOT an import of any host's ``builtin_models`` (the plan §2b-3 inversion).
+    NOT an import of any host's ``builtin_models`` (the host-agnostic inversion).
 
 The cache is concurrency-1 by contract (the GPU worker runs one job at
 a time), but its handle + counters are guarded by an ``RLock`` because
@@ -204,7 +204,7 @@ class ModelCache:
         # No constructor-injected registrar — fall through to the engine's
         # configured builtin-model registrar (a no-op unless a host wired one
         # via queue_workflows.set_builtin_model_registrar). NB this is the
-        # plan §2b-3 inversion: the engine NEVER imports a host's
+        # host-agnostic inversion: the engine NEVER imports a host's
         # ``builtin_models`` here.
         from queue_workflows.config import get_config
         get_config().builtin_model_registrar()
@@ -256,7 +256,7 @@ class ModelCache:
 
     def ensure_idle_reaper(self) -> None:
         """Start the idle-unload daemon once. No-op when disabled
-        (TTL<=0) or under tests (``AI_LEADS_DISABLE_GPU_IDLE_REAPER``)."""
+        (TTL<=0) or under tests (``QUEUE_WORKFLOWS_DISABLE_GPU_IDLE_REAPER``)."""
         if (self._reaper_started
                 or self._idle_ttl_s <= 0
                 or env_get("QUEUE_WORKFLOWS_DISABLE_GPU_IDLE_REAPER")):

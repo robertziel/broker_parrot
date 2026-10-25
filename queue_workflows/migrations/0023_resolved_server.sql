@@ -3,7 +3,7 @@
 -- WHY. The box-slot arbiter enforced ONE number per box, but a box serving
 -- {ollama,vllm} earns PAR slots only for vLLM work: ollama SERIALISES per model,
 -- so ollama-resolved jobs admitted 3-wide just queue inside the daemon while
--- holding node-job slots (observed live — "ollama allows 1!!"). Per-kind caps need
+-- holding node-job slots (ollama allows 1 at a time). Per-kind caps need
 -- to know which server each RUNNING job resolved to, so the claim stamps it:
 --
 --   resolved_server — the kind this job will be served by, computed AT CLAIM TIME

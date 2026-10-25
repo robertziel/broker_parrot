@@ -1,7 +1,7 @@
-"""The OPEN audit deltas from the multi-server-type (ollama/vLLM) round.
+"""Fault-path deltas in the multi-server-type (ollama/vLLM) per-node-job LLM routing.
 
-Each of these was surfaced by an independent audit of the per-node-job LLM routing
-work, judged non-blocking at the time, and recorded as deferred. They share one
+Each case below is a decision that was correct in the common case but not under a
+fault. They share one
 shape: a decision that is CORRECT in the common case but takes the LOOSE / STALE /
 DIVERGENT branch under a fault. This module pins the tight branch for each.
 
@@ -245,7 +245,7 @@ def test_the_no_preference_default_path_restamps_a_stale_prediction(monkeypatch)
 @pytest.mark.parametrize("pending", [None, "", "not-a-number"])
 def test_an_unreadable_pending_count_KEEPS_the_warm_server(pending):
     """A pending_fn that RAISES already keeps the server (stopping costs a
-    ~15-minute NFS reload; keeping costs RAM for one tick). A pending_fn that
+    long reload from network storage; keeping costs RAM for one tick). A pending_fn that
     returns None/garbage is the SAME ignorance and must take the same branch — it
     used to coerce to 0 and stop."""
     stops = _run_idle_stopper(pending_fn=lambda: pending)

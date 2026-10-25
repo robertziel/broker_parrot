@@ -24,7 +24,7 @@
 -- same cascade workflow_dispatch_events / workflow_node_jobs already get). Old
 -- rows are pruned by prune_node_events(retention_days) on a NodePool sweep.
 --
--- Additive + idempotent (IF NOT EXISTS) so re-running on the live ai_leads DB
+-- Additive + idempotent (IF NOT EXISTS) so re-running on an already-migrated DB
 -- is a safe no-op.
 
 CREATE TABLE IF NOT EXISTS workflow_node_events (

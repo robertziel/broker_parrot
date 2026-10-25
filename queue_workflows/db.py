@@ -1,8 +1,7 @@
 """Postgres connection pool + generalised migration runner.
 
 One global ``ConnectionPool`` per process keyed by the DSN read from the
-env var named by ``config.db_url_env`` (default ``AI_LEADS_DB_URL`` for
-byte-compat with the existing ai_leads deploy; other projects pass their
+env var named by ``config.db_url_env`` (default ``QUEUE_WORKFLOWS_DB_URL``; a host may pass its
 own via ``queue_workflows.configure(db_url_env=...)``).
 
 Migrations are plain SQL files under a *migrations dir*:
@@ -10,7 +9,7 @@ Migrations are plain SQL files under a *migrations dir*:
 - ``NNNN_name.sql``        — forward migration, applied in ``bootstrap``
 - ``NNNN_name.down.sql``   — paired reverse, applied in ``downgrade``
 
-The runner is **generalised** vs the original ai_leads single-chain shape:
+The runner is **generalised** vs the original host app's single-chain shape:
 ``bootstrap`` / ``downgrade`` / ``wait_for_schema`` / ``current_schema_version``
 take ``migrations_dir`` + ``version_table`` so the engine owns its OWN chain
 (the queue tables, version-ledger ``queue_schema_version``) while a host can
@@ -72,13 +71,12 @@ _pool_lock = threading.Lock()
 
 # ── an unreachable database is something to WAIT for ─────────────────────────
 #
-# A control-host reboot once brought a project's Postgres back with no docker network
-# endpoint, and every worker of that project crash-looped — hundreds of restarts each,
-# heartbeats weeks stale, nothing in any DB or panel showing it. The loop was not the
-# outage — it was `get_pool` installing a pool whose `open(wait=True)` had TIMED OUT.
-# psycopg_pool closes such a pool, a closed pool cannot reopen, so every later call
-# raised `PoolClosed` however healthy the database became, and exit-and-restart was the
-# only recovery. Both lines are in the live logs, from the same containers.
+# A database that is down at boot must be waited for, not crash-looped on. The trap:
+# installing a pool whose `open(wait=True)` TIMED OUT. psycopg_pool closes such a pool,
+# a closed pool cannot reopen, so every later call raises `PoolClosed` however healthy
+# the database becomes, and exit-and-restart is the only recovery. So an unreachable
+# database is classified (transient vs misconfigured) and the pool is installed only
+# once it opens.
 
 PoolTimeout = PoolTimeout          # re-exported: callers classify it as transient
 
@@ -217,8 +215,8 @@ def scrub_secrets(text: str, *, dsn: str | None = None) -> str:
     see WHY, and that message reaches a log through ``DbMisconfigured`` and through the
     per-minute ``waiting_db`` line — which repeats for as long as an outage lasts.
 
-    Whole-DSN echoes are the easy half. The hard half, and the one that leaked past two
-    audits, is libpq quoting back only the FRAGMENT it choked on:
+    Whole-DSN echoes are the easy half. The hard half, and the one that is easy to
+    miss, is libpq quoting back only the FRAGMENT it choked on:
 
         postgresql://qw:p@ssSECRET@host/db
           -> failed to resolve host 'ssSECRET@127.0.0.1'
@@ -286,8 +284,8 @@ def db_url() -> str:
 
 def _pool_sizes() -> tuple[int, int]:
     """The process pool's (min, max): ``QUEUE_WORKFLOWS_DB_POOL_MIN`` (floor,
-    default 1) and ``QUEUE_WORKFLOWS_DB_POOL_MAX`` (cap, default 10), legacy
-    ``AI_LEADS_*`` spellings included. min is clamped into [0, max] so no env
+    default 1) and ``QUEUE_WORKFLOWS_DB_POOL_MAX`` (cap, default 10), both read
+    via envcompat. min is clamped into [0, max] so no env
     combination can make ``ConnectionPool`` raise at construction. The cap is
     the connection-budget lever for N-process claim lanes: each process holds
     up to ``max`` connections (threads: claim/terminal txns, lease renewer,
@@ -1198,8 +1196,9 @@ def wait_for_schema(
     For processes that DON'T own the migration run (the claim workers /
     scheduler — only the orchestrator calls :func:`bootstrap`): poll
     :func:`current_schema_version` until it reaches ``min_version``, then
-    return it. ``bootstrap()`` is NOT concurrency-safe (no advisory lock), so
-    a non-owning process must WAIT for the schema rather than apply it itself.
+    return it. Only the orchestrator owns the migration run (``bootstrap()``
+    serializes concurrent bootstraps with ``pg_advisory_xact_lock`` on Postgres),
+    so a non-owning process WAITS for the schema rather than apply it itself.
 
     Raises ``TimeoutError`` if the version isn't reached within ``timeout_s``.
     ``sleep_fn`` is injectable for tests (default ``time.sleep``)."""

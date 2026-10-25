@@ -10,7 +10,7 @@ relied on docker ``restart: unless-stopped`` bringing the container back on its 
     unless-stopped`` bringing the sidecar back up on its baked ``--model`` flag, which may
     not be the newly-requested one
 
-Measured consequence on a live fleet: a box whose ``worker_controls.
+The consequence in practice: a box whose ``worker_controls.
 llm_server_type`` said ``vllm`` served whatever model was baked into a hand-maintained
 compose file, and a freshly quantized model sitting on that box's own disk was unreachable
 — not because anything was broken, but because nothing could ask for it.
@@ -86,25 +86,19 @@ def desired_argv(argv: list[str], model_id: str) -> list[str]:
 def recreate_payload(inspected: dict, argv: list[str]) -> dict:
     """A ``POST /containers/create`` body: this container, with a new ``Cmd``.
 
-    Built from the container's OWN inspect output so image, env, ports, binds, devices and
-    restart policy all survive verbatim. A recreate that rebuilt those from assumptions
-    would turn a model switch into a silent redeploy — losing a GPU device request or a
-    bind mount is the kind of thing that shows up as "the model is slow" three hours later.
+    Built from the container's OWN inspect output so image, env, ports, binds, devices,
+    restart policy and network identity all survive verbatim. A recreate that rebuilt
+    those from assumptions would turn a model switch into a silent redeploy — losing a
+    GPU device request, a bind mount or a network alias is the kind of thing that shows
+    up as "the model is slow" three hours later.
+
+    The builder is shared with the context lever (:mod:`server_context`), which performs
+    the same operation for a different value; the networks beyond the first are that
+    module's :func:`~server_context.networking` to connect after the create.
     """
-    config = dict(inspected.get("Config") or {})
-    host = dict(inspected.get("HostConfig") or {})
-    payload = {
-        "Image": config.get("Image"),
-        "Cmd": list(argv),
-        "Env": list(config.get("Env") or []),
-        "Labels": dict(config.get("Labels") or {}),
-        "ExposedPorts": dict(config.get("ExposedPorts") or {}),
-        "Entrypoint": config.get("Entrypoint"),
-        "WorkingDir": config.get("WorkingDir") or "",
-        "HostConfig": host,
-    }
-    # Drop keys docker rejects as null on create rather than sending them empty.
-    return {k: v for k, v in payload.items() if v not in (None, {}, "")} | {"Cmd": list(argv)}
+    from queue_workflows.llm_backends.server_context import recreate_payload as _build
+
+    return _build(inspected, list(argv))
 
 
 def ensure_sidecar(

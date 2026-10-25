@@ -591,8 +591,7 @@ def test_notify_does_not_fire_on_terminal_transition():
 # ── Exactly-once under live contention (FOR UPDATE SKIP LOCKED) ──────────────
 #
 # Every other test in this module drives the legacy direct-to-PG claim path
-# (``node_queue.claim_next_*``) SEQUENTIALLY. That path — not the StorageBackend
-# SPI exercised by ``tests/test_backend_contract.py`` — is what the real
+# (``node_queue.claim_next_*``) SEQUENTIALLY. That path is what the real
 # orchestrator/workers run. The core liveness contract is concurrency-1-per-row:
 # a regression dropping ``FOR UPDATE SKIP LOCKED`` (or weakening the claim
 # subselect into a TOCTOU read-then-write) would let two workers claim the same

@@ -1,11 +1,10 @@
 """INVARIANT: an unreachable database is something to WAIT for, not to die of.
 
-A control-host reboot once brought a project's Postgres container back with no docker
-network endpoint (``NetworkSettings.Networks == {}`` — the third occurrence of that
-specific failure). Every worker of that project then crash-looped — hundreds of restarts
-each — and their heartbeat rows went weeks stale, so nothing in any database or panel
-showed the fleet had lost a whole project's workers. Another project's worker had been
-in the same loop for months.
+A control-host reboot can bring a project's Postgres container back with no docker
+network endpoint (``NetworkSettings.Networks == {}``). Every worker of that project then
+crash-loops — hundreds of restarts each — and their heartbeat rows go stale, so nothing
+in any database or panel shows that a shared pool has lost one tenant's workers. A worker
+can sit in that loop indefinitely.
 
 There are two defects, and the second is what made it a LOOP:
 
@@ -14,7 +13,7 @@ There are two defects, and the second is what made it a LOOP:
    out, and a closed pool cannot be reopened — so the first slow start left a dead
    object installed as the process-wide pool, and every later call raised
    ``PoolClosed: the pool 'pool-1' is already closed`` no matter how healthy the
-   database had become. Both symptoms are in the live logs, from the same containers:
+   database had become. Both symptoms appear in the logs, from the same containers:
 
        psycopg_pool.PoolTimeout: pool initialization incomplete after 15.0 sec
        psycopg_pool.PoolClosed: the pool 'pool-1' is already closed
@@ -102,11 +101,11 @@ def test_the_next_call_can_still_build_a_HEALTHY_pool(monkeypatch):
 
 @pytest.mark.parametrize("err,transient", [
     ('connection failed: failed to resolve host "postgres": Temporary failure in '
-     'name resolution', True),           # THE network-detach symptom, from the live log
+     'name resolution', True),           # THE network-detach symptom
     ('connection to server at "192.0.2.10", port 6543 failed: Connection refused',
      True),
     ('connection to server at "192.0.2.10", port 6543 failed: server closed the '
-     'connection unexpectedly', True),   # also from the live log
+     'connection unexpectedly', True),   # also a real libpq message
     ("the database system is starting up", True),          # post-power-cut WAL replay
     ("pool initialization incomplete after 15.0 sec", True),
 ])
@@ -115,7 +114,7 @@ def test_a_recoverable_failure_is_TRANSIENT(err, transient):
 
 
 @pytest.mark.parametrize("err", [
-    'password authentication failed for user "ai_leads"',
+    'password authentication failed for user "acme"',
     'database "nope" does not exist',
     "invalid connection option",
 ])
@@ -126,9 +125,9 @@ def test_a_misconfiguration_is_NOT_transient(err):
 def test_the_target_is_reported_WITHOUT_the_password():
     """The wait line names the DSN so an operator knows which database to fix — and it
     must never be the place a password leaks into a log."""
-    masked = db.mask_dsn("postgresql://ai_leads:hunter2@192.0.2.10:6543/ai_leads")
+    masked = db.mask_dsn("postgresql://acme:hunter2@192.0.2.10:6543/acme")
 
-    assert masked == "192.0.2.10:6543/ai_leads"
+    assert masked == "192.0.2.10:6543/acme"
     assert "hunter2" not in masked
 
 
@@ -166,7 +165,7 @@ def test_the_waiting_line_is_logged_at_most_once_a_minute(caplog):
     def _probe():
         n["i"] += 1
         return db.Reachability(ok=n["i"] > 40, transient=True,
-                               target="192.0.2.10:6543/ai_leads", error="refused")
+                               target="192.0.2.10:6543/acme", error="refused")
 
     with caplog.at_level(logging.WARNING, logger="queue_workflows.db"):
         db.wait_for_db(probe_fn=_probe, now_fn=clock, sleep_fn=sleeper)
@@ -174,7 +173,7 @@ def test_the_waiting_line_is_logged_at_most_once_a_minute(caplog):
     said = [r.getMessage() for r in caplog.records if "waiting_db" in r.getMessage()]
     elapsed_min = (clock() - 1000.0) / 60.0
     assert 1 <= len(said) <= elapsed_min + 2
-    assert "192.0.2.10:6543/ai_leads" in said[0]
+    assert "192.0.2.10:6543/acme" in said[0]
 
 
 def test_a_misconfiguration_raises_at_once_and_never_sleeps():
@@ -186,7 +185,7 @@ def test_a_misconfiguration_raises_at_once_and_never_sleeps():
         db.wait_for_db(
             probe_fn=lambda: db.Reachability(
                 ok=False, transient=False, target="h:5432/d",
-                error='password authentication failed for user "ai_leads"'),
+                error='password authentication failed for user "acme"'),
             now_fn=clock, sleep_fn=sleeper)
 
     assert sleeper.slept == []
@@ -234,13 +233,13 @@ def test_waiting_returns_immediately_when_the_database_is_already_up():
     assert sleeper.slept == []
 
 
-# ── credentials must never reach a log (audit delta D3) ─────────────────────
+# ── credentials must never reach a log ─────────────────────────────────────
 
 
 def test_a_MALFORMED_dsn_error_does_not_echo_the_password():
     """libpq quotes the connection string back inside its own parse error, so the
     error text is not safe just because we never formatted the DSN into it."""
-    bad = "postgres//ai_leads:sup3rs3cr3t@192.0.2.10/ai_leads"
+    bad = "postgres//acme:sup3rs3cr3t@192.0.2.10/acme"
     exc = RuntimeError(f'missing "=" after "{bad}" in connection info string')
 
     r = db.classify_db_error(exc, target="?", dsn=bad)
@@ -250,7 +249,7 @@ def test_a_MALFORMED_dsn_error_does_not_echo_the_password():
 
 
 def test_the_raised_misconfiguration_carries_no_password():
-    bad = "postgresql://ai_leads:sup3rs3cr3t@h:5432/d"
+    bad = "postgresql://acme:sup3rs3cr3t@h:5432/d"
     with pytest.raises(db.DbMisconfigured) as caught:
         db.wait_for_db(
             probe_fn=lambda: db.classify_db_error(
@@ -276,7 +275,7 @@ def test_scrubbing_catches_every_password_shape_without_a_dsn(text, secret):
 
 @pytest.mark.parametrize("dsn,error", [
     # libpq quoting back only the FRAGMENT it choked on — no user:pass@ shape for a
-    # pattern to anchor on, and not the whole DSN either. All four observed live.
+    # pattern to anchor on, and not the whole DSN either. All four are real libpq shapes.
     ("postgresql://qw:p@ssPWSECRET@127.0.0.1:55499/d",
      "failed to resolve host 'ssPWSECRET@127.0.0.1': [Errno -2] Name or service not known"),
     ("postgresql://qw:a bPWSECRET@127.0.0.1:55499/d",
@@ -296,7 +295,7 @@ def test_an_ordinary_error_is_left_readable():
     """Over-redaction is the acceptable failure, but it must not be the NORMAL one."""
     err = 'connection to server at "192.0.2.10", port 6543 failed: Connection refused'
 
-    out = db.scrub_secrets(err, dsn="postgresql://ai_leads:hunter2@192.0.2.10:6543/d")
+    out = db.scrub_secrets(err, dsn="postgresql://acme:hunter2@192.0.2.10:6543/d")
 
     assert out == err
 
@@ -335,12 +334,12 @@ def test_an_UNSET_dsn_env_is_a_misconfiguration_not_an_outage(monkeypatch):
         db.wait_for_db(now_fn=_Clock(), sleep_fn=lambda s: None)
 
 
-# ── the masked target is a promise, not a hope (audit round 2) ──────────────
+# ── the masked target is a promise, not a hope ─────────────────────────────
 
 
 @pytest.mark.parametrize("dsn,secret", [
-    ("postgresql://ai_leads:Xk9/2Lm@192.0.2.10:5432/ai_leads", "Xk9/2Lm"),
-    ("postgresql://ai_leads:hunter2@192.0.2.10:6543/ai_leads", "hunter2"),
+    ("postgresql://acme:Xk9/2Lm@192.0.2.10:5432/acme", "Xk9/2Lm"),
+    ("postgresql://acme:hunter2@192.0.2.10:6543/acme", "hunter2"),
     ("postgresql://u:a/b/c@h:5432/d", "a/b/c"),
     ("host=h port=5432 dbname=d password=sec/ret", "sec/ret"),
     ("postgres//u:pw@h/db", "pw"),
@@ -354,7 +353,7 @@ def test_mask_dsn_never_emits_the_password(dsn, secret):
 
 
 def test_a_mis_parsed_dsn_yields_no_detail_rather_than_a_guess():
-    assert db.mask_dsn("postgresql://ai_leads:Xk9/2Lm@192.0.2.10:5432/ai_leads") == "?"
+    assert db.mask_dsn("postgresql://acme:Xk9/2Lm@192.0.2.10:5432/acme") == "?"
 
 
 def test_the_waiting_line_itself_carries_no_password(caplog):
@@ -374,7 +373,7 @@ def test_the_waiting_line_itself_carries_no_password(caplog):
 
 
 def test_scrub_secrets_handles_a_slash_bearing_password():
-    out = db.scrub_secrets("invalid dsn: postgresql://ai_leads:Xk9/2Lm@h:5432/db")
+    out = db.scrub_secrets("invalid dsn: postgresql://acme:Xk9/2Lm@h:5432/db")
     assert "Xk9/2Lm" not in out
     assert "***:***@" in out
 
@@ -398,11 +397,11 @@ def test_a_bounded_wait_that_gives_up_is_a_clean_stop_not_a_traceback():
         _db.wait_for_db = orig
 
 
-# ── a wait must always be interruptible (audit round 3, B1) ────────────────
+# ── a wait must always be interruptible ────────────────────────────────────
 
 
 def test_every_entrypoint_passes_its_stop_event_into_the_wait():
-    """B1. The orchestrator called `wait_for_db()` with no stop_event while its signal
+    """The orchestrator called `wait_for_db()` with no stop_event while its signal
     handler dutifully set one, so SIGTERM (and Ctrl-C) during an unbounded wait were
     logged and ignored — `docker stop`, `systemctl stop` and a reboot all hung to the
     grace period and ended in SIGKILL. A wait that cannot be interrupted is the wedge
@@ -445,7 +444,7 @@ def test_every_entrypoint_passes_its_stop_event_into_the_wait():
         + ", ".join(offenders))
 
 
-# ── round-4 follow-ups ──────────────────────────────────────────────────────
+# ── signals and short secrets ───────────────────────────────────────────────
 
 
 def test_a_signal_during_the_backoff_is_not_slept_through():
@@ -484,7 +483,7 @@ _ORDINARY_ERRORS = [
 @pytest.mark.parametrize("text", _ORDINARY_ERRORS)
 def test_a_SHORT_password_does_not_shred_an_ordinary_message(text, pw):
     """`pw='e'` once turned "connection failed" into "conn***ction fail***d", and a
-    later fix still let `pw='5432'` hide the port — a claim an audit measured as
+    later fix still let `pw='5432'` hide the port — a claim a measurement showed
     false. A short secret is a word or a number the message may legitimately
     use, so it is redacted only in CREDENTIAL context."""
     assert db.scrub_secrets(text, dsn=f"postgresql://u:{pw}@127.0.0.1:5432/d") == text
@@ -532,8 +531,8 @@ def test_a_SHORT_password_IS_redacted_in_credential_context(pw, text):
 
 def test_a_password_in_the_URI_QUERY_STRING_is_found_too():
     """`_password_of` read only the userinfo, so `?password=…` — a shape libpq accepts
-    — was never redacted. Pre-existing (the parent leaks it with a traceback), found by
-    the round-5 audit."""
+    — was never redacted. Pre-existing (the parent leaks it with a traceback), found in
+    review."""
     dsn = "postgresql://u@127.0.0.1:5432/d?password=QSZQXSECRET&sslmode=require"
 
     out = db.scrub_secrets('invalid percent-encoded token: "QSZQXSECRET"', dsn=dsn)

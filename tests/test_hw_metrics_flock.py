@@ -48,7 +48,7 @@ def _reset_flock_state(monkeypatch, tmp_path):
     monkeypatch.setattr(
         hw_metrics, "_HW_METRICS_LOCK_PATH", str(tmp_path / "hw.lock"),
     )
-    monkeypatch.delenv("AI_LEADS_DISABLE_HW_METRICS", raising=False)
+    monkeypatch.delenv("QUEUE_WORKFLOWS_DISABLE_HW_METRICS", raising=False)
     yield
     if hw_metrics._hw_metrics_lock_fd is not None:
         try:
@@ -92,7 +92,7 @@ def test_loses_flock_when_another_process_holds_it(monkeypatch):
 
 
 def test_disabled_by_env_starts_nothing(monkeypatch):
-    monkeypatch.setenv("AI_LEADS_DISABLE_HW_METRICS", "1")
+    monkeypatch.setenv("QUEUE_WORKFLOWS_DISABLE_HW_METRICS", "1")
     sampler = hw_metrics.start_hw_metrics_sampler_flocked()
     assert sampler is None
     assert hw_metrics._hw_metrics_lock_fd is None

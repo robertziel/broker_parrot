@@ -6,7 +6,7 @@ smaller: no ``$from`` input resolution, no model cache, no dispatch-event
 outbox, no thumbnail. It maps ``task_name`` → the host-registered callable,
 runs it, and writes the terminal row.
 
-GENERIC dispatch (plan §1f): the engine does NOT know the task-name→callable
+GENERIC dispatch: the engine does NOT know the task-name→callable
 map. It looks up ``task_name`` in the host-registered
 ``config.ingest_task_map`` (populated via
 ``queue_workflows.register_ingest_task(name, callable)``). Each callable takes

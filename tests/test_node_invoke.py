@@ -2,8 +2,6 @@
 dispatches a ``workflow_node_jobs`` row's ``inputs`` dict to the matching node
 module's ``run()`` function.
 
-(Renamed from the ai_leads ``test_tasks_invoke`` — ``tasks.py`` is gone.)
-
 Covers the three contract modes:
 - **Explicit kwargs** — one kwarg per schema input name, with ``str → Path``
   coercion when the annotation says ``Path`` (or a union containing ``Path``).

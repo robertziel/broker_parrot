@@ -7,9 +7,9 @@
 -- machinery is reused at the SQL-shape level, plus its own NOTIFY trigger that
 -- wakes the claim worker exactly like node_job_ready does for cpu/gpu.
 --
--- ENGINE-OWNED but TASK-NAME-AGNOSTIC (plan §1f): the original ai_leads
+-- ENGINE-OWNED but TASK-NAME-AGNOSTIC: the original host-app
 -- migration 043 had `CONSTRAINT ingest_jobs_task_check CHECK (task_name IN
--- ('run_fetch_all','run_load_all','audit_freshness'))` — those are ai_leads
+-- ('run_fetch_all','run_load_all','audit_freshness'))` — those are the host's
 -- domain names. The engine RELAXES that CHECK (queue + status CHECK only); the
 -- host validates task_name against its registered dispatch map BEFORE enqueue
 -- (node_queue.enqueue_ingest_job checks config.ingest_task_map). This keeps
@@ -21,10 +21,10 @@
 --   * claimed_by / lease_expires_at — identical lease bookkeeping to
 --                   workflow_node_jobs so reclaim_expired_leases sweeps both.
 --
--- Idempotent (`CREATE TABLE IF NOT EXISTS`, etc.). NB: on the live ai_leads DB
--- the table already exists WITH the task-name CHECK from old 043 — re-running
+-- Idempotent (`CREATE TABLE IF NOT EXISTS`, etc.). NB: on a host DB that predates
+-- the engine, the table already exists WITH the task-name CHECK from old 043 — re-running
 -- this engine migration is a no-op (IF NOT EXISTS), so it leaves the existing
--- (stricter) CHECK in place there. That is harmless: ai_leads only ever
+-- (stricter) CHECK in place there. That is harmless: such a host only ever
 -- enqueues its three known task names, all of which satisfy the old CHECK; the
 -- host-side Python validation is the canonical gate going forward.
 
@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS ingest_jobs (
     PRIMARY KEY (id),
     CONSTRAINT ingest_jobs_queue_check
         CHECK (queue IN ('fetch','load')),
-    -- NB: NO task-name CHECK here (plan §1f) — the host validates task_name
+    -- NB: NO task-name CHECK here — the host validates task_name
     -- against its registered ingest dispatch map before enqueue.
     CONSTRAINT ingest_jobs_status_check
         CHECK (status IN ('queued','running','completed','failed','cancelled'))

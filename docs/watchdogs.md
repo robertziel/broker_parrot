@@ -32,7 +32,7 @@ The simplest guard: a fixed deadline set at `start()` (`time.monotonic() + budge
 | GPU job, any other model | `GPU_DEFAULT_BUDGET_S` = 8100 s (2.25 h) — computed for logging/display, but a GPU job is never bracketed by this class (see below) |
 | `fetch` ingest sweep | `FETCH_BUDGET_S` = 7200 s (2 h) |
 | `load` ingest sweep | `LOAD_BUDGET_S` = 3600 s (1 h) |
-| host-defined (G1) ingest queue | `config.ingest_default_budget_s` |
+| host-defined ingest queue | `config.ingest_default_budget_s` |
 | `__input__*` park node | `INPUT_BUDGET_S` = 120 s |
 | any other CPU node | `CPU_BUDGET_S` = 2100 s (35 min) |
 
@@ -42,7 +42,7 @@ A GPU job still computes a `budget_for` value, but the `Watchdog` class itself i
 
 **Opt-in**, defense-in-depth for a non-video GPU node whose `run(...)` declares a `status_callback` parameter (`ClaimWorker._node_reports_progress`) — a node that never reports progress can't be told apart from a hung one, so it's left to whatever else polices it (for GPU, that's `GpuHealthWatchdog`). A **video** model steps too slowly per beat-segment to fit a 120 s window, so video nodes are excluded too.
 
-It is **inert until the first `beat()`** — `_deadline` starts `None` and the poll loop only checks it once armed. The executor calls `beat()` once immediately after the model load completes, which is what arms the watchdog; a multi-minute cold load (observed ~6 min) therefore sits entirely outside the no-progress window. After that, each diffusion step beats again (`STALL_TIMEOUT_S` = **120.0 s**, chosen to be far larger than the observed ~12 s inter-step gap, polled every `STALL_POLL_S` = 5.0 s).
+It is **inert until the first `beat()`** — `_deadline` starts `None` and the poll loop only checks it once armed. The executor calls `beat()` once immediately after the model load completes, which is what arms the watchdog; a multi-minute cold load therefore sits entirely outside the no-progress window. After that, each diffusion step beats again (`STALL_TIMEOUT_S` = **120.0 s**, chosen to be far larger than a typical inter-step gap, polled every `STALL_POLL_S` = 5.0 s).
 
 **A no-beat timeout alone is only a suspicion, never a verdict.** When the deadline lapses, `StallWatchdog` does not trip outright — it runs a short confirmation window (`STALL_CONFIRM_SAMPLES` = 3 reads, `STALL_CONFIRM_POLL_S` = 1.0 s apart) using the *same* `gpu_health` samplers and the *same* "GPU idle AND RAM static" predicate `GpuHealthWatchdog` uses:
 
@@ -50,7 +50,27 @@ It is **inert until the first `beat()`** — `_deadline` starts `None` and the p
 - RAM moved beyond `GPU_HEALTH_RAM_DELTA_MB` (default 5120 MB / 5 GiB) → the node is loading weights / staging / preparing → **re-arm, don't kill**.
 - Only when GPU stayed idle **and** RAM stayed static across the whole confirmation window is it genuinely doing nothing → **trip**.
 
-A multi-GB model load moves RAM far past the 5 GiB delta, so a cold or lazy load can never be confirmed as wedged — this is the fix for the false positive that motivated the watchdog ("should not kill if the GPU model is being loaded or preparing to start; only if it does nothing"). An unconfirmed suspicion emits a best-effort `stall_suspected` node event and re-arms rather than latching, so a transient slow patch followed by resumed progress fully recovers with no trip at all.
+A multi-GB model load moves RAM far past the 5 GiB delta, so a cold or lazy load can never be confirmed as wedged — this is the fix for the false positive that motivated the watchdog: never kill while the model is loading or preparing to start, only when it does nothing. An unconfirmed suspicion emits a best-effort `stall_suspected` node event and re-arms rather than latching, so a transient slow patch followed by resumed progress fully recovers with no trip at all.
+
+#### On the pool lane: opt-in per node, trips on the beat gap alone
+
+The pool lane (LLM / VLM facade nodes that POST to the box's ollama or vLLM) arms no `GpuHealthWatchdog`, no wall-clock `Watchdog`, and its `LeaseRenewer` renews for as long as the process lives — so before this guard a request that never answered held the lane, and the box's LLM slot, **for ever**, with nothing able to reclaim it.
+
+A pool node opts in by declaring **both** a `status_callback` parameter and a module-level window:
+
+```python
+POOL_STALL_TIMEOUT_S = 420        # this node's own no-progress window, seconds
+
+def run(*, inputs, out, llm_server, status_callback=None):
+    ...                            # call status_callback() per streamed chunk
+```
+
+It then gets a `StallWatchdog(confirm_idle=False)`, and two things differ from the inline lane:
+
+- **The beat gap alone trips.** A pool job's GPU work happens in the *server's* container, so this container reads GPU-idle and RAM-static whether the generation is streaming happily or wedged — the physical confirmation would always say "wedged" and adds nothing. The node's beats (one per streamed chunk) are the progress signal.
+- **The node picks the window**, and declaring `status_callback` alone is not an opt-in here: ComfyUI renders run on this lane and beat once per sampler step, minutes apart on a video model, so a fixed window would kill them. A node without `POOL_STALL_TIMEOUT_S` runs exactly as before (`status_callback=None`, no watchdog).
+
+It is still **inert until the first beat** — on this lane that is the first streamed token — so a cold server-side model load and the prompt prefill are never timed. A window below `POOL_STALL_MIN_TIMEOUT_S` (30 s) is raised to it (a typo'd `5` would otherwise kill every job in the gap between two requests), and `QUEUE_WORKFLOWS_DISABLE_POOL_STALL_WATCHDOG=1` disarms it fleet-wide. A trip goes through the same `_watchdog_trip` (re-queue under the cap, fail past it) and hard-exits the **process**, so a sibling pool job dies with it and is re-queued resume-style by the orchestrator's frozen-lease sweep — the same blast radius the pool lane's `JobStatusWatcher` exit has always had.
 
 ### `GpuHealthWatchdog` — the GPU guard, health-driven not wall-clock (exit `78`)
 
@@ -69,7 +89,7 @@ Policing *health* instead of *time* fixes both: a truly wedged job (idle GPU, st
 
 Both `StallWatchdog`'s confirmation and `GpuHealthWatchdog`'s checkpoint read the same two samplers, deliberately scoped to *this* container rather than the box:
 
-- **`gpu_util_pct()`** — tries `nvidia-smi pmon -c 1 -s u` first, which the NVIDIA driver renders in the caller's own PID namespace: called from inside the GPU worker container it returns rows for *only this container's* processes, so a co-tenant ollama sidecar sharing the same physical GPU is invisible and can't mask this container's idle state (or vice versa — verified: neither container's pmon lists the other's PID). A row's `sm%` of `-` (N/A, common when a process isn't actively issuing SM work) counts as 0; the max across rows is the busy signal. Falls back to the box-level probe (`hw_metrics._gpu_probe`) when pmon is unavailable (ROCm, or no `nvidia-smi`) — coarser attribution, but acceptable on the ROCm overflow host, which has no GPU sidecar to be confused with anyway.
+- **`gpu_util_pct()`** — tries `nvidia-smi pmon -c 1 -s u` first, which the NVIDIA driver renders in the caller's own PID namespace: called from inside the GPU worker container it returns rows for *only this container's* processes, so a co-tenant ollama sidecar sharing the same physical GPU is invisible and can't mask this container's idle state (or vice versa — verified: neither container's pmon lists the other's PID). A row's `sm%` of `-` (N/A, common when a process isn't actively issuing SM work) counts as 0; the max across rows is the busy signal. Falls back to the box-level probe (`hw_metrics._gpu_probe`) when pmon is unavailable (ROCm, or no `nvidia-smi`) — coarser attribution, but acceptable on a ROCm host with no GPU sidecar to be confused with anyway.
 - **`container_ram_mb()`** — reads cgroup v2 `memory.current` from the container's own namespaced cgroup root (`/sys/fs/cgroup/memory.current`), which needs no host cgroup mount; falls back to `/proc/self/status` VmRSS if that file is absent. Returns `None` only when neither is readable, and a `None` reading is treated as "no RAM signal this checkpoint" — never grounds for a trip on its own.
 
 ## 3. The single policy point: `_watchdog_trip`
@@ -100,7 +120,7 @@ Polls `workflow_node_jobs` every `poll_s` (default 2.0 s) and hard-exits the ins
 
 ### `WorkerControlWatcher` (exit `79`)
 
-Enforces the operator ON/OFF control plane (migration `0012`) — `LISTEN worker_control` plus a periodic safety poll catches both a dropped NOTIFY and a control row written before this worker booted. When an operator sets `(host_label, queue)` to `desired_state='off'`, it dispatches the row's `stop_policy` (today only `"hard"` exists) — hard stop re-queues the in-flight job resume-style (**no** `watchdog_retries` bump — an operator-requested stop isn't a fault) and then `os._exit(79)`. Full design, the `STOP_POLICIES` registry, and the boot-time park gate live in [`worker_control.md`](worker_control.md).
+Enforces the operator ON/OFF control plane (migration `0012`) — `LISTEN worker_control` plus a periodic safety poll catches both a dropped NOTIFY and a control row written before this worker booted. When an operator sets `(host_label, queue)` to `desired_state='off'`, it dispatches the row's `stop_policy` (`"hard"` or `"drain"`) — hard stop re-queues the in-flight job resume-style (**no** `watchdog_retries` bump — an operator-requested stop isn't a fault) and then `os._exit(79)`. Full design, the `STOP_POLICIES` registry, and the boot-time park gate live in [`worker_control.md`](worker_control.md).
 
 ## 5. Last resort: the orchestrator-side dead-worker detector
 
@@ -115,16 +135,16 @@ The orchestrator (`NodePool`) is a **separate process** — GIL-independent of a
 - Stamps `worker_heartbeats.last_flagged_dead_at = now()` (migration `0009`) on the matching rows and returns them so the caller logs one `DEAD WORKER:` **ERROR** per flagged worker, naming the host/queue/project, how long the heartbeat has been stale, and how many running jobs it still owns.
 - Is **idempotent**: only rows whose `last_flagged_dead_at` is `NULL` or itself older than the threshold get (re)flagged, so the frequent tick doesn't relog the same dead worker every pass — it flags once and stays quiet until a fresh heartbeat clears the flag (`upsert_worker_heartbeat`), then flags again if it goes stale a second time.
 
-**The recovery split is deliberate.** The *job* is already recovered by the ordinary lease-reclaim sweep (§1) — that doesn't need this detector at all, since a lease-reclaim only cares that renewal stopped, not why. What this detector adds is flagging the dead **process** so a host-supervisor can bounce it: the orchestrator has no docker socket and is frequently on a different host than the worker, so it cannot safely cross-host-kill a container — it can only surface a durable, queryable signal (`last_flagged_dead_at` + the ERROR log line) for something with that authority to act on.
+**The recovery split is deliberate.** The *job* is already recovered by the ordinary lease-reclaim sweep (§1) — that doesn't need this detector at all, since a lease-reclaim only cares that renewal stopped, not why. What this detector adds is flagging the dead **process** so something on the host can bounce it: the orchestrator has no docker socket and is frequently on a different host than the worker, so it cannot safely cross-host-kill a container — it can only surface a durable, queryable signal (`last_flagged_dead_at` + the ERROR log line) for something with that authority to act on.
 
-**The host-side consumer: `queue-worker-supervisor`.** That "something with authority" ships as an optional per-host daemon (`queue_workflows/worker_supervisor.py`, console script `queue-worker-supervisor`) — the automated consumer of the flag. It runs **on a box**, reads `node_queue.flagged_dead_workers()` for the `host_label`s that box owns (a `label:container,…` map from `--map` / `QUEUE_WORKFLOWS_SUPERVISOR_MAP`), and `docker restart`s the local container; the restarted worker's fresh heartbeat then clears the flag, so the loop is self-terminating. Why it lives here and not in the orchestrator: **ownership = the map's keys**, so a box only ever restarts *its own* containers — never a cross-host kill. Safe by default (no map ⇒ **report-only**, logs what it would bounce, touches nothing); per-`(host,queue)` cooldown stops a restart storm; and the bounce action is injectable (`set_worker_bounce`) for a host on systemd/k8s/a custom API. This closes the loop that plain `docker restart:` policies can't — those fire on container *exit*, but a GIL/hardware-wedged worker's container stays `Up (unhealthy)` and never exits. See [`deployment.md`](deployment.md).
+**Acting on the flag is the host's job.** The engine only raises the flag; a host supervisor (or an operator panel reading `worker_heartbeats.last_flagged_dead_at`) restarts the container. Plain `docker restart:` policies don't cover this: they fire on container *exit*, and a GIL- or hardware-wedged worker's container stays `Up (unhealthy)`.
 
 ## 6. Exit-code summary
 
 | Code | Source | Trigger | Outcome |
 |---|---|---|---|
 | **75** | `Watchdog` | wall-clock `elapsed >= budget_for(job)` (CPU + ingest jobs only) | `_watchdog_trip` → re-queue+retry under the cap, else fail |
-| **76** | `StallWatchdog` | no `beat()` for `STALL_TIMEOUT_S` (120 s) *and* confirmed GPU-idle + RAM-static (opt-in, non-video GPU nodes with `status_callback`) | `_watchdog_trip` → re-queue+retry under the cap, else fail |
+| **76** | `StallWatchdog` | inline lane: no `beat()` for `STALL_TIMEOUT_S` (120 s) *and* confirmed GPU-idle + RAM-static (opt-in, non-video GPU nodes with `status_callback`). Pool lane: no `beat()` for the node's own `POOL_STALL_TIMEOUT_S` (opt-in; beat gap alone) | `_watchdog_trip` → re-queue+retry under the cap, else fail |
 | **77** | `JobStatusWatcher` | this worker's claimed row's `claimed_by` no longer matches it (reassigned/reclaimed out from under it) | self-kill only — no requeue/fail (another actor already changed the row) |
 | **78** | `GpuHealthWatchdog` | GPU idle (`<= GPU_IDLE_PCT`) *and* RAM static (`<= GPU_HEALTH_RAM_DELTA_MB`) across a full `GPU_HEALTH_INTERVAL_S` (300 s) window (every GPU job) | `_watchdog_trip` → re-queue+retry under the cap, else fail |
 | **79** | `WorkerControlWatcher` | operator sets `worker_controls.desired_state = 'off'` for this `(host, queue)` | hard stop: resume-style re-queue (no `watchdog_retries` bump), then exit — see [`worker_control.md`](worker_control.md) |
@@ -144,9 +164,9 @@ The sweep is scoped to **the claims this process actually holds** — by job id 
 
 ## Related docs
 
-- [`worker_control.md`](worker_control.md) — the operator ON/OFF control plane that owns exit `79` and the `"hard"` stop policy.
+- [`worker_control.md`](worker_control.md) — the operator ON/OFF control plane that owns exit `79` and the `"hard"`/`"drain"` stop policies.
 - [`architecture.md`](architecture.md) — the three process roles, the outbox pattern `_fail_job_and_exit` writes into, and how the dispatch loop consumes a node's terminal state.
-- [`schema.md`](schema.md) — `workflow_node_jobs.watchdog_retries` (migration 0010), `workflow_node_events` (migration 0011), `worker_heartbeats.last_flagged_dead_at` (migration 0009), and the full migration chain (currently through 0019).
+- [`schema.md`](schema.md) — `workflow_node_jobs.watchdog_retries` (migration 0010), `workflow_node_events` (migration 0011), `worker_heartbeats.last_flagged_dead_at` (migration 0009), and the full migration chain (currently through 0030).
 - [`gpu_and_llm.md`](gpu_and_llm.md) — the warm `ModelCache`, the GPU worker's inline + pool lanes, and how `current_model` feeds both claim affinity and the busy-ghost cleanup this doc's watchdogs perform on exit.
 - [`configuration.md`](configuration.md) — every `QUEUE_WORKFLOWS_*` env knob named above (`QUEUE_WORKFLOWS_WATCHDOG_MAX_RETRIES`, `QUEUE_WORKFLOWS_GPU_HEALTH_INTERVAL_S`, `QUEUE_WORKFLOWS_STALE_WORKER_AFTER_S`, …) and their defaults in one place.
-- [`deployment.md`](deployment.md) — the host-supervisor hook that consumes a `DEAD WORKER:` flag and bounces the container.
+- [`deployment.md`](deployment.md) — running the worker containers.

@@ -2,16 +2,16 @@
 
 WHY THIS EXISTS. Moving a GPU box from one LLM server kind to another is not
 "unload the old one, start the new one". Each server holds its OWN full copy of the
-weights, and the incoming one needs MINUTES to load them (~8 for a 35 GB FP8 model on
-a unified-memory GPU box). A box that keeps claiming work during those minutes immediately reloads the
+weights, and the incoming one needs MINUTES to load them (a large model on a
+unified-memory GPU box). A box that keeps claiming work during those minutes immediately reloads the
 server it just unloaded, so the switch ends with BOTH resident.
 
-That is not theoretical. On box-a:
+A naive switch fails exactly this way:
 
   * unload ollama, start vLLM, keep claiming
   * ollama reloads within seconds to serve the next job
-  * vLLM finishes loading ⇒ both resident, ~3 GB from OOM on a box
-    with an OOM death already in its history
+  * vLLM finishes loading ⇒ both resident, a few GB from OOM on a box
+    with little memory headroom
   * the residency watchdog resolves the violation by evicting the server with no
     traffic — which is always the INCOMING one, because it only just booted
   * so vLLM was killed on every single attempt, forever
@@ -47,11 +47,11 @@ TWO GUARANTEES, and they pull against each other:
     of re-arming a fresh window. A failed switch costs a slow queue; a wedged box costs
     everything.
 
-KNOWN LIMITS — stated because an independent audit found them and they are real:
+KNOWN LIMITS — stated because they are real:
 
   * **Per PROCESS, not per BOX.** The state lives in memory on one worker. Several
-    workers of DIFFERENT projects share a physical box (ai_leads and a second consumer both
-    run gpu workers on the unified-memory GPU boxes), and a peer keeps claiming through this box's
+    workers of DIFFERENT projects share a physical box (two consumer apps can both
+    run gpu workers on one unified-memory GPU box), and a peer keeps claiming through this box's
     switch — reloading the very server being replaced. A worker restart mid-switch
     likewise forgets it and resumes claiming. The engine already has the cross-process
     primitive for this — the flock box lease in ``gpu_model_lease`` — and the switch
@@ -119,16 +119,16 @@ ABORT = "abort"
 #: the warm window has to outlast a cold weight load — and MUST have real headroom
 #: over the slowest observed load, because completion is event-driven (the switch
 #: closes the moment the server answers) while the timeout only bounds the FAILURE
-#: case. 900 s left 18 s of margin against an observed 887 s load from network
-#: storage — one slow storage day from aborting every switch. 1800 s costs nothing when the server
+#: case. A cold load from network storage can take most of 900 s, so a 900 s window
+#: is one slow storage day from aborting every switch. 1800 s costs nothing when the server
 #: comes up (nothing waits on the deadline) and only stretches the give-up point
 #: for a genuinely broken start, which abort+backoff already handles.
 #: Operator overrides: QUEUE_WORKFLOWS_SWITCH_DRAIN_TIMEOUT_S /
 #: QUEUE_WORKFLOWS_SWITCH_WARM_TIMEOUT_S (read where the worker constructs its
 #: switch — see claim_worker._switch_timeouts).
 #: DRAINING must outlast the LONGEST legitimate in-flight job — a chat-model-a
-#: reasoning call runs 5-20 minutes, and a 300 s drain aborted four switches in a
-#: row against ONE healthy long job (observed live). A draining box is not wedged:
+#: reasoning call can run many minutes, and a short drain aborts switch after
+#: switch against ONE healthy long job. A draining box is not wedged:
 #: in-flight work is progressing and the job's own watchdog (budget 3600 s) bounds
 #: a truly stuck one, so the drain ceiling matches that bound.
 DEFAULT_DRAIN_TIMEOUT_S = 3600.0
@@ -152,8 +152,8 @@ DEFAULT_RETRY_EVERY_S = 30.0
 DEFAULT_START_ACK_TIMEOUT_S = 300.0
 #: How long a kind stays QUARANTINED after a definitive start failure, doubling per
 #: consecutive failure up to the cap. Without it the demand starter simply re-requests
-#: after its own cooldown and the box re-enters the doomed window — observed live, twice
-#: an hour, for three hours.
+#: after its own cooldown and the box re-enters the doomed window, over and
+#: over, for as long as the demand lasts.
 DEFAULT_QUARANTINE_S = 900.0
 DEFAULT_QUARANTINE_MAX_S = 14400.0
 
@@ -171,6 +171,16 @@ PERMANENT = "permanent"
 #: The lever told us nothing — every host hook returns ``None`` today. Treated as
 #: acknowledged so this whole mechanism is byte-compatible with an un-upgraded host.
 UNKNOWN = "unknown"
+
+#: Quarantine key for "changing this kind's WINDOW keeps failing" — deliberately not the
+#: kind's own key: a box whose lever is broken must still be able to switch to that
+#: server at whatever window it already has.
+_RESIZE_SUFFIX = ":context"
+
+
+def _resize_key(kind: str) -> str:
+    return f"{kind}{_RESIZE_SUFFIX}"
+
 
 _STATUSES = frozenset({STARTED, ALREADY_RUNNING, TRANSIENT, PERMANENT, UNKNOWN})
 #: Statuses under which a start is considered to be genuinely in flight.
@@ -293,6 +303,12 @@ class ServerSwitch:
         self._retry_every_s = float(retry_every_s)
         self._state = IDLE
         self._target: str | None = None
+        # ── the WINDOW half (migration 0028) ────────────────────────────────
+        # A switch may also carry the context window the incoming server must serve,
+        # and a RESIZE is a switch whose only change is that window: same kind, no
+        # outgoing server to free (the lever replaces the container in one operation).
+        self._target_context: int | None = None
+        self._resize = False
         self._since = 0.0
         self._last_try = 0.0
         # ── the start observation ────────────────────────────────────────────
@@ -308,7 +324,7 @@ class ServerSwitch:
         self._requested_wall: float | None = None
         # kind -> {until_wall, failures, reason, since_wall}
         self._quarantine: dict[str, dict] = {}
-        # ── persistence (analysis #1, restart half) ──────────────────────────
+        # ── persistence (restart half) ───────────────────────────────────────
         # The switch state lived only in this process, so a worker restart
         # mid-switch FORGOT it: the fresh process resumed claiming while the
         # incoming server warmed — the exact race the machine exists to close.
@@ -334,6 +350,26 @@ class ServerSwitch:
         """The kind being switched TO, or ``None`` when idle."""
         with self._lock:
             return self._target
+
+    @property
+    def requested_wall(self) -> float | None:
+        """Wall time of the current request — the identity of THIS switch, for a caller
+        that must decide something once per switch and reuse it on the retries."""
+        with self._lock:
+            return self._requested_wall
+
+    @property
+    def target_context(self) -> int | None:
+        """The context window the incoming server must serve, or ``None`` for "whatever
+        it is configured for" (which is every pre-0028 switch)."""
+        with self._lock:
+            return self._target_context
+
+    @property
+    def resize(self) -> bool:
+        """Is this switch only changing the WINDOW of the kind already serving?"""
+        with self._lock:
+            return self._resize
 
     @property
     def last_start(self) -> dict | None:
@@ -369,13 +405,37 @@ class ServerSwitch:
         with self._lock:
             return self._quarantined_locked(kind)
 
+    def resize_quarantined(self, kind: str) -> bool:
+        """Is RESIZING this kind held back? Tracked apart from the kind itself: a box
+        whose window cannot be changed (no lever, no container of that name) must still
+        be able to switch TO that server normally — conflating the two would take a
+        working server away over a failure that has nothing to do with it."""
+        with self._lock:
+            return self._quarantined_locked(_resize_key(kind))
+
     def quarantine_remaining_s(self, kind: str) -> float:
         with self._lock:
-            self._prune_quarantine_locked()
-            entry = self._quarantine.get(kind)
-            if not entry:
-                return 0.0
-            return max(0.0, float(entry.get("until_wall") or 0.0) - self._wall())
+            return self._quarantine_remaining_locked(kind)
+
+    def resize_quarantine_remaining_s(self, kind: str) -> float:
+        with self._lock:
+            return self._quarantine_remaining_locked(_resize_key(kind))
+
+    def _quarantine_remaining_locked(self, key: str) -> float:
+        self._prune_quarantine_locked()
+        entry = self._quarantine.get(key)
+        if not entry:
+            return 0.0
+        return max(0.0, float(entry.get("until_wall") or 0.0) - self._wall())
+
+    def quarantine_reason(self, kind: str) -> str | None:
+        """Why this kind is held back, or ``None`` when it is not. The memory sentinel
+        reads it: a hold caused by MEMORY is one the sentinel can see change, and lifts
+        after a minute of headroom; any other hold is not its to lift."""
+        with self._lock:
+            if not self._quarantined_locked(kind):
+                return None
+            return str((self._quarantine.get(kind) or {}).get("reason") or "")
 
     def clear_quarantine(self, kind: str) -> None:
         """Drop the hold on a kind. Called when that kind is OBSERVED serving — an
@@ -394,7 +454,7 @@ class ServerSwitch:
         ready. This is the guarantee: a claim taken mid-switch is what reloads the
         outgoing server and produces the two-resident state.
 
-        DEADLINE-AWARE (analysis #6 / audit D4): the timeout escapes used to live
+        DEADLINE-AWARE: the timeout escapes used to live
         only inside :meth:`tick`, so a caller that stopped ticking (its heartbeat
         disabled — config-reachable) left the box blocked forever. Now this read
         itself self-aborts once DOUBLE the current phase's budget has passed with no
@@ -441,30 +501,42 @@ class ServerSwitch:
 
     # ── transitions ──────────────────────────────────────────────────────────
 
-    def request(self, target: str) -> bool:
+    def request(self, target: str, context_length: int | None = None, *,
+                resize: bool = False) -> bool:
         """Ask to switch this box to ``target``. Returns True iff a switch started.
+
+        ``context_length`` — the window the incoming server must serve (0028). On a
+        kind switch it is what the server should be STARTED at, so a box coming up for
+        a queue that needs a big window does not have to be restarted again a minute
+        later. With ``resize=True`` the kind does not change at all and the window IS
+        the switch: nothing is unloaded, because the lever replaces the container in
+        one operation.
 
         Refused (False) when one is already in progress — including a request for the
         same target, so a caller polling "should I be on vLLM?" every tick starts one
         switch, not one per tick."""
         if not target:
             return False
+        key = _resize_key(target) if resize else target
         with self._lock:
             if self._state != IDLE:
                 return False
             self._prune_quarantine_locked()
-            if self._quarantined_locked(target):
-                entry = self._quarantine[target]
+            if self._quarantined_locked(key):
+                entry = self._quarantine[key]
                 log.info(
-                    "[server-switch] %s: NOT switching to %s — it is quarantined for "
+                    "[server-switch] %s: NOT %s %s — it is quarantined for "
                     "another %.0fs after %d failed start(s): %s",
-                    self._label, target,
+                    self._label, "resizing" if resize else "switching to", target,
                     max(0.0, float(entry.get("until_wall") or 0.0) - self._wall()),
                     int(entry.get("failures") or 0), entry.get("reason") or "?",
                 )
                 return False
             self._state = DRAINING
             self._target = target
+            self._target_context = (None if context_length is None
+                                    else int(context_length))
+            self._resize = bool(resize)
             self._since = self._now()
             self._requested_wall = self._wall()
             self._start_ack = True
@@ -472,8 +544,12 @@ class ServerSwitch:
             self._last_start = None
             self._persist()
         log.info(
-            "[server-switch] %s: switching to %s — DRAINING (claims blocked until it "
-            "is ready)", self._label, target,
+            "[server-switch] %s: %s%s — DRAINING (claims blocked until it is ready)",
+            self._label,
+            f"resizing {target} to a {context_length}-token window" if resize
+            else f"switching to {target}",
+            "" if resize or context_length is None
+            else f" at a {context_length}-token window",
         )
         return True
 
@@ -515,6 +591,24 @@ class ServerSwitch:
                         )
                         return self._abort()
                     return []
+                if self._resize:
+                    # NOTHING TO FREE. The window lever replaces the container in one
+                    # operation, so the server we are "replacing" is the one being
+                    # restarted. Emitting UNLOAD here would stop it and then wait to
+                    # observe it gone — of a server that is coming back — stranding the
+                    # box until the unload timeout.
+                    self._state = WARMING
+                    self._since = now
+                    self._last_try = now
+                    self._start_ack = True
+                    self._start_unack_since = None
+                    self._persist()
+                    log.info(
+                        "[server-switch] %s: drained — restarting %s for a %s-token "
+                        "window (WARMING)", self._label, self._target,
+                        self._target_context,
+                    )
+                    return [START_INCOMING]
                 self._state = SWITCHING
                 self._since = now
                 self._last_try = now      # the transition itself emits the first try
@@ -526,7 +620,7 @@ class ServerSwitch:
                 if outgoing_loaded:
                     # NOT started yet, on purpose. The incoming server is only
                     # started once the outgoing one is OBSERVED gone — a "start
-                    # anyway" is how the box ended up holding two 34 GB copies. A
+                    # anyway" is how the box ended up holding two full copies. A
                     # silently-failed unload therefore stalls here and aborts on the
                     # timeout, which costs a slow queue instead of an OOM.
                     if waited >= self._unload_timeout_s:
@@ -559,7 +653,8 @@ class ServerSwitch:
                 # slow-but-successful load would keep doubling the next hold until the
                 # box refused vLLM for hours.
                 if target:
-                    self._quarantine.pop(target, None)
+                    self._quarantine.pop(
+                        _resize_key(target) if self._resize else target, None)
                 self._reset()
                 log.info(
                     "[server-switch] %s: %s is ready after %.0fs — switch COMPLETE, "
@@ -587,11 +682,11 @@ class ServerSwitch:
                         self._label, self._target, unacked, reason,
                     )
                     return self._abort_and_quarantine(reason)
-            if outgoing_loaded:
+            if outgoing_loaded and not self._resize:
                 # The outgoing server CAME BACK mid-warm (the switch is per-process;
                 # a peer worker on the same box can reload it — see KNOWN LIMITS).
                 # Re-issuing START now would be the two-copies bug through the retry
-                # door: the round-2 audit fuzzed 1,486 violations, every one here.
+                # door: a fuzz run found every two-copies violation on this path.
                 # Hold the retry; the warm timeout still bounds the wait, and the
                 # start resumes the moment the outgoing is observed gone again.
                 return []
@@ -648,8 +743,8 @@ class ServerSwitch:
     def abandon(self, reason: str) -> None:
         """Cancel an in-flight switch and return to service, clearing persistence.
 
-        Exists for the CAPABILITY case (found live): a persisted switch to a kind
-        this box cannot serve — box-c (ROCm) resumed a vllm switch after a
+        Exists for the CAPABILITY case: a persisted switch to a kind
+        this box cannot serve — a ROCm box resumed a vllm switch after a
         restart and sat out of service warming a server that can never exist. The
         resume path cannot know capabilities; the worker can, and calls this."""
         with self._lock:
@@ -672,12 +767,15 @@ class ServerSwitch:
         failure, an unacknowledged start, a warm window that expired."""
         target = self._target
         if target:
-            self._quarantine_locked(target, reason)
+            self._quarantine_locked(
+                _resize_key(target) if self._resize else target, reason)
         return self._abort()
 
     def _reset(self) -> None:
         self._state = IDLE
         self._target = None
+        self._target_context = None
+        self._resize = False
         self._since = 0.0
         self._last_try = 0.0
         self._requested_wall = None
@@ -759,6 +857,11 @@ class ServerSwitch:
                 "phase": self._state,
                 "start_acknowledged": self._start_ack,
                 "last_start": self._last_start,
+                # 0028. A resumed switch that forgot its window would wait to observe a
+                # window it can no longer name, and a resumed RESIZE would try to free
+                # an outgoing server that was never there.
+                "context_length": self._target_context,
+                "resize": self._resize,
             }
         try:
             tmp = f"{self._persist_path}.tmp"
@@ -799,14 +902,21 @@ class ServerSwitch:
                 target = str(sw_rec.get("target") or "")
                 raw_wall = sw_rec.get("requested_wall")
                 requested_wall = None if raw_wall is None else float(raw_wall)
+                raw_ctx = sw_rec.get("context_length")
+                # A record written before windows existed simply has neither field,
+                # and resumes as the plain kind switch it was.
+                context_length = None if raw_ctx is None else int(raw_ctx)
+                resize = bool(sw_rec.get("resize"))
             else:
                 # v1: {"target": ..., "wall": ...} — the shape older engines persisted.
                 target = str(rec.get("target") or "")
                 raw_wall = rec.get("wall")
                 requested_wall = None if raw_wall is None else float(raw_wall)
+                context_length, resize = None, False
             age = (self._wall() - requested_wall
                    if requested_wall is not None else None)
-            if target and self._quarantined_locked(target):
+            if target and self._quarantined_locked(
+                    _resize_key(target) if resize else target):
                 log.warning(
                     "[server-switch] %s: dropping a persisted switch to %s — that "
                     "kind is quarantined", self._label, target,
@@ -814,6 +924,8 @@ class ServerSwitch:
             elif target and age is not None and 0 <= age < self._budget_total():
                 self._state = DRAINING
                 self._target = target
+                self._target_context = context_length
+                self._resize = resize
                 self._since = self._now()
                 self._requested_wall = requested_wall
                 log.warning(

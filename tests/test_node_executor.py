@@ -277,7 +277,7 @@ def test_execute_node_requeues_on_transient_gpu_error_under_cap():
 
 
 def test_execute_node_fails_transient_gpu_error_at_cap(monkeypatch):
-    monkeypatch.setenv("AI_LEADS_WATCHDOG_MAX_RETRIES", "3")
+    monkeypatch.setenv("QUEUE_WORKFLOWS_WATCHDOG_MAX_RETRIES", "3")
     run_id = _make_run()
     _install_fake_node("_ne_gpu_busy2", lambda **_k: {"context_delta": {}})
     job_id = node_queue.enqueue_node_job(

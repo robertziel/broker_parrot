@@ -13,8 +13,9 @@ OFF switch, and without double-running anything it held before the reboot.
    (each queue knows its minimum version). A brand-new box pointed at a
    brand-new DB simply waits for the orchestrator instead of racing it.
 2. **Park check.** It reads `worker_controls` for its `(host_label, queue)`
-   row. If the desired state is `off`, the worker **parks** — process up,
-   heartbeating, but not claiming — until an operator turns it back ON. A row
+   row. If the desired state is `off`, the worker **parks** — process up, not
+   claiming and not heartbeating (so it ages out of capacity) — until an
+   operator turns it back ON. A row
    that doesn't exist means ON (default-on), and a DB predating the control
    plane is treated as all-ON, so old deployments boot unchanged.
 3. **Heartbeat + LISTEN.** It starts the 10 s heartbeat

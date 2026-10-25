@@ -119,11 +119,11 @@ def test_on_node_awaiting_input_resolves_source_files_from_disk(tmp_path, provid
     provider.workflows[name] = {
         "name": name, "mode": "node",
         "steps": [
-            {"id": "svinfer", "kind": "pipeline", "pipeline": name, "inputs": {}},
+            {"id": "step_a", "kind": "pipeline", "pipeline": name, "inputs": {}},
             {"id": "pick_pano", "kind": "input", "widget": "choose_one",
              "prompt": "Pick a pano", "target": "selected_pano",
              "source": {
-                 "$from": "svinfer.files",
+                 "$from": "step_a.files",
                  "$filter": {
                      "kind:eq": "image",
                      "rel_path:matches": r"annotated_pano_\d+\.png$",
@@ -138,7 +138,7 @@ def test_on_node_awaiting_input_resolves_source_files_from_disk(tmp_path, provid
     }
 
     out_dir = tmp_path / "out"
-    step_dir = out_dir / "svinfer" / "detect" / "views"
+    step_dir = out_dir / "step_a" / "detect" / "views"
     step_dir.mkdir(parents=True)
     (step_dir / "annotated_pano_0.png").write_bytes(b"\x89PNG\r\n\x1a\n fake")
     (step_dir / "annotated_pano_1.png").write_bytes(b"\x89PNG\r\n\x1a\n fake")
@@ -152,8 +152,8 @@ def test_on_node_awaiting_input_resolves_source_files_from_disk(tmp_path, provid
     assert spec is not None
     rel_paths = sorted(o["rel_path"] for o in spec["options"])
     assert rel_paths == [
-        "svinfer/detect/views/annotated_pano_0.png",
-        "svinfer/detect/views/annotated_pano_1.png",
+        "step_a/detect/views/annotated_pano_0.png",
+        "step_a/detect/views/annotated_pano_1.png",
     ]
     for o in spec["options"]:
         assert o["kind"] == "image"
@@ -165,10 +165,10 @@ def test_input_spec_rel_paths_survive_the_file_endpoint_roundtrip(tmp_path, prov
     provider.workflows[name] = {
         "name": name, "mode": "node",
         "steps": [
-            {"id": "svinfer", "kind": "pipeline", "pipeline": name, "inputs": {}},
+            {"id": "step_a", "kind": "pipeline", "pipeline": name, "inputs": {}},
             {"id": "pick_pano", "kind": "input", "widget": "choose_one",
              "prompt": "Pick", "target": "selected_pano",
-             "source": {"$from": "svinfer.files", "$filter": {"kind:eq": "image"}},
+             "source": {"$from": "step_a.files", "$filter": {"kind:eq": "image"}},
              "depends_on": []},
         ],
     }
@@ -178,8 +178,8 @@ def test_input_spec_rel_paths_survive_the_file_endpoint_roundtrip(tmp_path, prov
     }
 
     out_dir = tmp_path / "out"
-    (out_dir / "svinfer" / "detect" / "views").mkdir(parents=True)
-    (out_dir / "svinfer" / "detect" / "views" / "annotated_pano_0.png").write_bytes(
+    (out_dir / "step_a" / "detect" / "views").mkdir(parents=True)
+    (out_dir / "step_a" / "detect" / "views" / "annotated_pano_0.png").write_bytes(
         b"\x89PNG\r\n\x1a\n fake",
     )
     run_id = _insert_run(name, out_dir)
@@ -200,7 +200,7 @@ def test_on_node_awaiting_input_passes_through_pick_or_upload_library(tmp_path, 
         "steps": [
             {"id": "upload_ref", "kind": "input", "widget": "pick_or_upload",
              "prompt": "Pick a reference or upload", "target": "ref_image_path",
-             "library": "fence_references",
+             "library": "references",
              "accept": "image/jpeg,image/png,image/webp", "depends_on": []},
         ],
     }
@@ -213,7 +213,7 @@ def test_on_node_awaiting_input_passes_through_pick_or_upload_library(tmp_path, 
     spec = _job_spec(run_id, "upload_ref")
     assert spec is not None
     assert spec["widget"] == "pick_or_upload"
-    assert spec["library"] == "fence_references"
+    assert spec["library"] == "references"
     assert spec["accept"] == "image/jpeg,image/png,image/webp"
     assert spec["target"] == "ref_image_path"
 
@@ -470,7 +470,7 @@ def test_paint_mask_source_wraps_scalar_abs_path_from_upstream_pick(tmp_path, pr
     spec's ``source_abs_path`` — wrapping the scalar into a
     single-element file-info list so the widget renders THAT image,
     not "whichever lane happened to come back first from the
-    remove_fence.files scan."
+    remove_obj.files scan."
 
     Without the wrap the previous behaviour fell through into the
     ``elif not isinstance(options, list): options = []`` branch — the
@@ -496,9 +496,9 @@ def test_paint_mask_source_wraps_scalar_abs_path_from_upstream_pick(tmp_path, pr
     out_dir = tmp_path / "out"
     out_dir.mkdir()
     # Simulate the lane outputs the operator just picked from.
-    lane_dir = out_dir / "remove_fence" / "lane_sd15_inpaint"
+    lane_dir = out_dir / "remove_obj" / "lane_sd15_inpaint"
     lane_dir.mkdir(parents=True)
-    picked = lane_dir / "no_fence.jpg"
+    picked = lane_dir / "clean.jpg"
     picked.write_bytes(b"\xff\xd8\xff fake")
 
     run_id = _insert_run(name, out_dir)
@@ -540,11 +540,11 @@ def test_paint_mask_source_wraps_scalar_abs_path_from_upstream_pick(tmp_path, pr
     assert spec.get("source_abs_path") == str(picked)
     # rel_path is the path relative to ``out_dir`` — the same convention
     # the file-endpoint uses when streaming the artefact.
-    assert spec.get("source_rel_path") == "remove_fence/lane_sd15_inpaint/no_fence.jpg"
+    assert spec.get("source_rel_path") == "remove_obj/lane_sd15_inpaint/clean.jpg"
 
 
 def test_paint_fence_regions_source_wraps_scalar_abs_path_like_paint_mask(tmp_path, provider):
-    """The one-canvas Fence/Gate/Concrete labeled painter
+    """The one-canvas multi-label region painter
     (``paint_fence_regions``) shares paint_mask's source resolution.
 
     A scalar ``$from: pick_clean.clean_plate_path`` pick must surface as
@@ -552,8 +552,8 @@ def test_paint_fence_regions_source_wraps_scalar_abs_path_like_paint_mask(tmp_pa
     plate. Pins the dispatcher branch that was MISSING entirely: with no
     ``elif`` arm for ``paint_fence_regions`` the spec carried no
     ``source_options`` key at all and the widget showed its missing-source
-    error instead of the painter (observed live: run parked at paint_fence
-    rendered a blank/alert pane). The fix folds the widget into the
+    error instead of the painter (a run parked at paint_fence rendered a
+    blank/alert pane). The fix folds the widget into the
     paint_mask arm; its absent ``initial_mask`` simply no-ops.
     """
     from queue_workflows import dispatcher, node_queue
@@ -574,9 +574,9 @@ def test_paint_fence_regions_source_wraps_scalar_abs_path_like_paint_mask(tmp_pa
 
     out_dir = tmp_path / "out"
     out_dir.mkdir()
-    lane_dir = out_dir / "remove_fence" / "lane_qwen_erase"
+    lane_dir = out_dir / "remove_obj" / "lane_qwen_erase"
     lane_dir.mkdir(parents=True)
-    picked = lane_dir / "no_fence.jpg"
+    picked = lane_dir / "clean.jpg"
     picked.write_bytes(b"\xff\xd8\xff fake")
 
     run_id = _insert_run(name, out_dir)
@@ -607,16 +607,16 @@ def test_paint_fence_regions_source_wraps_scalar_abs_path_like_paint_mask(tmp_pa
     )
     assert options[0]["abs_path"] == str(picked)
     assert spec.get("source_abs_path") == str(picked)
-    assert spec.get("source_rel_path") == "remove_fence/lane_qwen_erase/no_fence.jpg"
+    assert spec.get("source_rel_path") == "remove_obj/lane_qwen_erase/clean.jpg"
 
 
 def test_paint_fence_regions_initial_mask_wraps_scalar_from_pick(tmp_path, provider):
     """The paint_fence_regions SEED: ``initial_mask`` = the scalar
-    ``$from: pick_fence.selected_mask_path`` (the remove-fence mask) must
-    surface as ``initial_mask_abs_path`` so the widget pre-paints the MAIN
-    fence from it. Pins the scalar-wrap on the initial_mask block — it
+    ``$from: pick_fence.selected_mask_path`` (the upstream object mask) must
+    surface as ``initial_mask_abs_path`` so the widget pre-paints the main
+    region from it. Pins the scalar-wrap on the initial_mask block — it
     previously only handled dict/list and a scalar string fell into ``[]``,
-    so the seed silently vanished and the operator got a blank main fence.
+    so the seed silently vanished and the user got a blank main region.
     """
     from queue_workflows import dispatcher, node_queue
 
@@ -637,7 +637,7 @@ def test_paint_fence_regions_initial_mask_wraps_scalar_from_pick(tmp_path, provi
     out_dir.mkdir()
     mask_dir = out_dir / "pick_fence"
     mask_dir.mkdir(parents=True)
-    picked = mask_dir / "fence_mask.png"
+    picked = mask_dir / "mask.png"
     picked.write_bytes(b"\x89PNG fake")
 
     run_id = _insert_run(name, out_dir)
@@ -665,14 +665,13 @@ def test_paint_fence_regions_initial_mask_wraps_scalar_from_pick(tmp_path, provi
     assert len(im) == 1, f"initial_mask must wrap the scalar pick into ONE option, got {im!r}"
     assert im[0]["abs_path"] == str(picked)
     assert spec.get("initial_mask_abs_path") == str(picked)
-    assert spec.get("initial_mask_rel_path") == "pick_fence/fence_mask.png"
+    assert spec.get("initial_mask_rel_path") == "pick_fence/mask.png"
 
 
 def test_pick_fence_source_wraps_scalar_abs_path_from_upstream_pick(tmp_path, provider):
-    """Regression pin for the masked-compose "No source image was attached
-    to this step. Cancel and re-run." bug.
+    """Regression pin for the "no source image attached to this step" bug.
 
-    Workflow shape (edit_masked_compose_experiment):
+    Workflow shape (an example workflow):
       pick_clean_car (choose_one, target=car_clean_path)
         ↓
       pick_fence (pick_fence, source={"$from": "pick_clean_car.car_clean_path"})
@@ -685,9 +684,8 @@ def test_pick_fence_source_wraps_scalar_abs_path_from_upstream_pick(tmp_path, pr
     Before the fix the pick_fence block only handled dict/list (unlike its
     paint_mask / paint_fence_regions siblings); a scalar string fell into the
     ``elif not isinstance(src_options, list): src_options = []`` arm, the spec
-    had ``source_options=[]``, and PickFence.tsx rendered "No source image was
-    attached to this step." This is the one workflow that feeds pick_fence a
-    scalar source, so it was the only place the gap surfaced.
+    had ``source_options=[]``, and the host widget rendered an empty source.
+    Only a workflow that feeds pick_fence a scalar source surfaces the gap.
     """
     from queue_workflows import dispatcher, node_queue
 

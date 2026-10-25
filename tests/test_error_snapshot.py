@@ -18,14 +18,14 @@ def _ev(run_id, *, event_type, project=None, error=None, node="n", host="host-a"
 
 def test_error_snapshot_filters_by_project_and_kind():
     run = make_run(workflow_name="_err1")
-    _ev(run, event_type="failed", project="ai_leads", error="boom A")
-    _ev(run, event_type="error", project="ai_leads", error="boom B")
-    _ev(run, event_type="completed", project="ai_leads")            # not an error -> excluded
+    _ev(run, event_type="failed", project="acme", error="boom A")
+    _ev(run, event_type="error", project="acme", error="boom B")
+    _ev(run, event_type="completed", project="acme")            # not an error -> excluded
     _ev(run, event_type="failed", project="project-b", error="other-proj")
 
-    ai = node_queue.error_snapshot(project="ai_leads")
+    ai = node_queue.error_snapshot(project="acme")
     assert {e["error"] for e in ai} == {"boom A", "boom B"}
-    assert all(e["project"] == "ai_leads" for e in ai)
+    assert all(e["project"] == "acme" for e in ai)
     assert all(e["event_type"] in ("failed", "error") for e in ai)
 
     allp = {e["error"] for e in node_queue.error_snapshot()}        # all projects

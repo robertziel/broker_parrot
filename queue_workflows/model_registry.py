@@ -7,8 +7,7 @@ result across consecutive jobs so same-model back-to-back work skips
 reload.
 
 This is the registration *target*: the engine owns the registry; the host
-registers ITS ModelSpecs INTO it (via the injected builtin-model registrar,
-plan §2c). Keep this module cheap to import — no torch, no diffusers at module
+registers ITS ModelSpecs INTO it (via the injected builtin-model registrar). Keep this module cheap to import — no torch, no diffusers at module
 load. Loader functions defer heavy imports until called.
 """
 
@@ -37,8 +36,8 @@ class ModelSpec:
                           'vllm')``), or EMPTY for a model the worker loads
                           IN-PROCESS. See :func:`server_served_ids`.
     - ``server_models`` — the ARTIFACT options behind this id, per server kind:
-                          ``{"ollama": ("chat-expert-a-v6-q4km-ollama",),
-                          "vllm": ("chat-expert-a-v6-bf16-vllm",)}``. The id above is a
+                          ``{"ollama": ("chat-expert-a-v1-q4-ollama",),
+                          "vllm": ("chat-expert-a-v1-bf16-vllm",)}``. The id above is a
                           ROLE tag — stable across promotions, what traffic dials and
                           what the claim SQL keys on; each artifact tag is immutable
                           (one tag, one set of bytes) and names its precision and
@@ -91,7 +90,7 @@ def server_served_ids() -> set[str]:
     actually reported (``model_catalog.narrow_to_observed``). That observation comes from
     ollama ``/api/tags`` and vLLM ``/v1/models``, so a model the worker loads IN-PROCESS
     can never appear in it — narrowing against it would delete that model from every box
-    permanently, and its node-jobs would be claimable by nobody. Measured on a live fleet:
+    permanently, and its node-jobs would be claimable by nobody. Observed in operation:
     `tts-model-v1` (a TTS engine, loaded in-process via the warm ModelCache) vanished from
     every box's `known_models` the moment narrowing shipped.
 

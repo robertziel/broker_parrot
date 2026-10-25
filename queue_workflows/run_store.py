@@ -1,5 +1,5 @@
 """Minimal run-row read/write over ``workflow_runs`` — the engine's run-state
-seam (the ``repo`` inversion, plan §1d-A).
+seam (the ``repo`` inversion).
 
 ``workflow_runs`` is the DAG-run record and the queue's substrate: the engine
 created it (migration 0001) and several engine modules read/write it —
@@ -9,7 +9,7 @@ the out_dir + context), ``cancel_watcher`` (poll status), ``node_pool``
 it imports only ``db`` (the pool) — nothing up the engine stack — so
 ``dispatcher``/``node_pool`` can import it without a cycle.
 
-A host that joins ``workflow_runs`` to its own tables (parcels, Rails views)
+A host that joins ``workflow_runs`` to its own tables (its domain rows, its ORM views)
 keeps its own ORM views of the SAME table; this is the project's established
 "two ORMs, one Postgres" pattern. The engine deliberately treats ``parcel_id``
 as an opaque nullable column (the engine's migration 0001 drops the parcels
@@ -97,7 +97,7 @@ def list_stuck_node_run_ids(*, project: str | None = None) -> list[str]:
 
 
 # Whitelist of columns update_run() accepts. Typos surface at call time
-# instead of silently dropping. Mirrors ai_leads' queries._UPDATABLE for the
+# instead of silently dropping. Mirrors the original host app's queries._UPDATABLE for the
 # columns the engine touches (parcel_id stays writable so a host that keeps
 # the run_store path for inserts can still set it).
 _UPDATABLE = frozenset({
@@ -179,7 +179,7 @@ def insert_run(
     project: str | None = None,
 ) -> dict[str, Any]:
     """Insert a fresh ``workflow_runs`` row. ``mode`` defaults to ``node``
-    (the only live mode post-Phase-5). Returns the inserted row dict.
+    (the only live mode). Returns the inserted row dict.
 
     ``project`` (migration 0017) is the run's tenant tag; ``None`` ⇒ this
     client's ``config.project`` (default ``""`` — single-tenant). The dispatcher
@@ -239,7 +239,7 @@ def reenqueue_running_for_resume(*, project: str | None = None) -> int:
     trips an auto-fail. Genuine node failures still fail the run via the normal
     node-failure path (``node_executor`` mark_failed + outbox), not here.
 
-    Plain-SQL port of ai_leads' ``queries.reenqueue_running_for_resume``."""
+    Plain-SQL port of the original host app's ``queries.reenqueue_running_for_resume``."""
     if project is None:
         from queue_workflows.config import get_config
         project = get_config().project or ""
@@ -254,6 +254,19 @@ def reenqueue_running_for_resume(*, project: str | None = None) -> int:
                 updated_at = now()
             WHERE status = 'running'
               AND project = %s
+              -- ORPHANS ONLY. A live node-job is proof that nothing was orphaned: the
+              -- lease reclaim and the dispatch outbox are already driving that run, and
+              -- re-queueing it makes the dispatcher EXPAND IT AGAIN — a second copy of
+              -- the initial nodes beside the ones already waiting. It also dragged runs
+              -- this host cannot expand at all (an external client owns the queue's
+              -- public interface: the vLLM load balancer inserts its own `running` run
+              -- plus one gpu job, deliberately `running` so nobody tries to load a
+              -- workflow by that name) into a start_run failure loop — an ERROR and a
+              -- traceback twice a second, for ever.
+              AND NOT EXISTS (
+                    SELECT 1 FROM workflow_node_jobs j
+                     WHERE j.run_id = workflow_runs.id
+                       AND j.status IN ('queued', 'running', 'awaiting_input'))
             RETURNING id
             """,
             (project,),
@@ -265,7 +278,7 @@ def claim_next_queued() -> dict[str, Any] | None:
     """Atomically pick the oldest queued ``mode='step'`` run, flip to
     ``running``. ``FOR UPDATE SKIP LOCKED`` keeps concurrent workers from
     claiming the same row. Node-mode runs are expanded by the dispatcher, not
-    claimed here — so this excludes them (parity with ai_leads' query).
+    claimed here — so this excludes them (parity with the original host app's query).
 
     Kept for parity / standalone step-mode use; the live node engine doesn't
     call it."""

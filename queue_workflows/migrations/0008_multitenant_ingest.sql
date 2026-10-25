@@ -1,8 +1,8 @@
 -- queue_workflows 0008 — multi-tenant ingest: per-job args + host-defined queue
 -- names.
 --
--- All additive + backward-compatible: ai_leads' fetch/load queues and its
--- no-args enqueues keep working unchanged. The only behavioural change is that
+-- All additive + backward-compatible: the original host's fetch/load queues
+-- and its no-args enqueues keep working unchanged. The only behavioural change is that
 -- the queue-name allow-list moves from a DB CHECK to host-side validation —
 -- exactly the move migration 0007 already made for task_name (the host
 -- validates against its registered set before enqueue). This lets a non-ingest
@@ -10,12 +10,12 @@
 -- (e.g. ingest/etl/sim) and carry per-job arguments, without forking the
 -- shared engine.
 --
--- Idempotent (`IF NOT EXISTS` / `IF EXISTS`) so re-running on the live ai_leads
--- DB is a no-op.
+-- Idempotent (`IF NOT EXISTS` / `IF EXISTS`) so re-running on an already-migrated
+-- host DB is a no-op.
 
 -- (G2) Per-job arguments for parametrised ingest tasks — e.g. a host's
 -- run_scenario(scenario_id). DEFAULT '{}' so every existing INSERT stays valid
--- and ai_leads' periodic sweeps (which carry no args) are unaffected.
+-- and a host's periodic sweeps (which carry no args) are unaffected.
 ALTER TABLE ingest_jobs
     ADD COLUMN IF NOT EXISTS args JSONB NOT NULL DEFAULT '{}'::jsonb;
 

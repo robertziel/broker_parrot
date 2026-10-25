@@ -1,6 +1,6 @@
 """``queue_workflows`` — a standalone Postgres-as-queue workflow engine.
 
-A host-agnostic engine extracted from ai_leads (Phase 6): a ``SELECT … FOR
+A host-agnostic engine (extracted from an earlier, now-retired app): a ``SELECT … FOR
 UPDATE SKIP LOCKED`` claim loop woken by ``LISTEN``, lease reclaim, a DAG
 dispatcher with an outbox, a GPU warm-model cache, periodic ingest work, and
 per-host hw-metrics telemetry. Postgres is the only hard dependency.
@@ -13,10 +13,10 @@ scheduler / orchestrator::
     from queue_workflows.model_registry import ModelSpec
 
     queue_workflows.configure(
-        db_url_env="AI_LEADS_DB_URL",
+        db_url_env="QUEUE_WORKFLOWS_DB_URL",
         video_model_ids=frozenset({"video-model-b", "video-model-c"}),
         node_module_package="workflows.nodes",
-        container_prefix="ai_leads-",
+        container_prefix="myapp-",
     )
     queue_workflows.set_workflow_provider(load_workflow, pipeline_schema)
     queue_workflows.set_builtin_model_registrar(register_builtin_models)
@@ -28,7 +28,7 @@ scheduler / orchestrator::
 Every hook has a safe default, so ``import queue_workflows`` +
 ``configure(...)`` + a reachable Postgres is enough to run the engine
 standalone (no host wiring required). The package imports NOTHING from any
-host application (``workflows.*``) — enforced by ``tests/test_no_ai_leads_import.py``.
+host application (``workflows.*``) — enforced by ``tests/test_no_host_import.py``.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ from typing import Any, Callable
 
 from queue_workflows.config import EngineConfig, get_config
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 __all__ = [
     "configure",
@@ -47,15 +47,13 @@ __all__ = [
     "set_workflow_provider",
     "set_invoke_context",
     "set_vllm_lifecycle",
+    "set_llm_context_lever",
     "set_inference_server_lifecycle",
-    "set_worker_bounce",
     "set_gpu_lease_store",
     "set_llm_server_resolver",
     "set_llm_servers_available",
     "register_ingest_task",
     "set_ingest_schedule",
-    "register_pool_handler",
-    "register_broker_handler",
     "get_config",
     "EngineConfig",
     "__version__",
@@ -79,7 +77,6 @@ def configure(
     ingest_queues: frozenset[str] | None = None,
     ingest_default_budget_s: int | None = None,
     db_backend: str | None = None,
-    db_namespace: str | None = None,
     cancel_orphan_queued_jobs: bool | None = None,
     gpu_requires_local_device: bool | None = None,
     disable_gpu_worker_hw_sampler: bool | None = None,
@@ -87,15 +84,13 @@ def configure(
     hw_broadcast_port: int | None = None,
     vlm_pool_node_modules: frozenset[str] | None = None,
     gpu_self_load_node_modules: frozenset[str] | None = None,
-    gpu_pool_backend: str | None = None,
-    gpu_pool_url_env: str | None = None,
-    gpu_pool_namespace: str | None = None,
     llm_server_idle_ttl_s: float | None = None,
     cpu_worker_threads: int | None = None,
     download_max_concurrent: int | None = None,
+    gpu_box_max_concurrent: dict[str, int] | None = None,
 ) -> EngineConfig:
     """Set engine configuration values. Only the passed keyword args are
-    mutated; the rest keep their (ai_leads-byte-compatible) defaults. Returns
+    mutated; the rest keep their defaults. Returns
     the live :class:`EngineConfig` for chaining/inspection.
 
     Safe to call once at host startup before launching a worker / scheduler /
@@ -135,21 +130,11 @@ def configure(
         if ingest_default_budget_s is not None:
             cfg.ingest_default_budget_s = int(ingest_default_budget_s)
         if db_backend is not None:
-            if db_backend == "sqlite":
-                # SQLite is a RELATIONAL engine backend (it hosts the full DAG
-                # engine via the dialect seam), not a flat-queue StorageBackend
-                # SPI provider — so it bypasses the SPI registry validation. The
-                # engine's relational store is "pg" (default) or "sqlite";
-                # "redis"/"mongodb" select the SPI flat queue instead.
-                cfg.db_backend = "sqlite"
-            else:
-                # Validate against the backend registry (source of truth),
-                # imported lazily so the package root stays import-light.
-                from queue_workflows.backends import canonical_backend_name
+            # "sqlite" or "pg" (aliases folded); anything else raises here, at
+            # startup, rather than mis-routing the engine's store.
+            from queue_workflows.config import canonical_db_backend
 
-                cfg.db_backend = canonical_backend_name(db_backend)
-        if db_namespace is not None:
-            cfg.db_namespace = str(db_namespace)
+            cfg.db_backend = canonical_db_backend(db_backend)
         if cancel_orphan_queued_jobs is not None:
             cfg.cancel_orphan_queued_jobs = bool(cancel_orphan_queued_jobs)
         if gpu_requires_local_device is not None:
@@ -164,14 +149,6 @@ def configure(
             cfg.vlm_pool_node_modules = frozenset(vlm_pool_node_modules)
         if gpu_self_load_node_modules is not None:
             cfg.gpu_self_load_node_modules = frozenset(gpu_self_load_node_modules)
-        if gpu_pool_backend is not None:
-            from queue_workflows.backends import canonical_backend_name
-
-            cfg.gpu_pool_backend = canonical_backend_name(gpu_pool_backend)
-        if gpu_pool_url_env is not None:
-            cfg.gpu_pool_url_env = str(gpu_pool_url_env)
-        if gpu_pool_namespace is not None:
-            cfg.gpu_pool_namespace = str(gpu_pool_namespace)
         if llm_server_idle_ttl_s is not None:
             cfg.llm_server_idle_ttl_s = float(llm_server_idle_ttl_s)
         if cpu_worker_threads is not None:
@@ -182,6 +159,13 @@ def configure(
             # Same double floor as cpu_worker_threads: a 0 cap would be a
             # download lane that admits nothing, silently, forever.
             cfg.download_max_concurrent = max(1, int(download_max_concurrent))
+        if gpu_box_max_concurrent is not None:
+            # Stored verbatim, including entries that make no sense: the read site
+            # (claim_worker.resolve_box_max_concurrent) is where a non-positive or
+            # unreadable value is IGNORED, because the env spelling must obey the
+            # identical law and there is one implementation of it. Floor-here would
+            # silently turn a host's 0 into 1 — a ceiling the host never asked for.
+            cfg.gpu_box_max_concurrent = dict(gpu_box_max_concurrent)
     return cfg
 
 
@@ -283,7 +267,7 @@ def set_vllm_lifecycle(
     ``stop_fn() -> bool`` frees the sidecar's VRAM (True iff it stopped one);
     ``start_fn(model_id) -> None`` (re)starts it serving ``model_id``. A host
     that runs vllm as a SEPARATE container wires these so the in-worker supervisor
-    can control the SIBLING sidecar without a docker restart policy (ai_leads →
+    can control the SIBLING sidecar without a docker restart policy (e.g. →
     docker Engine API over the unix socket). Threaded into ``VLLMBackend`` by the
     backend factory. See
     :attr:`queue_workflows.config.EngineConfig.vllm_stop_fn`."""
@@ -291,6 +275,24 @@ def set_vllm_lifecycle(
     with cfg._lock:
         cfg.vllm_stop_fn = stop_fn
         cfg.vllm_start_fn = start_fn
+
+
+def set_llm_context_lever(fn: Callable[[str, int | None], Any] | None) -> None:
+    """Wire how THIS box changes the context window its LLM server serves.
+
+    ``fn(server_kind, context_length | None)`` — make the box's ``'ollama'`` /
+    ``'vllm'`` server serve that many tokens, or the operator's own value when ``None``.
+    May return a verdict (a ``StartOutcome``, a ``{"status": …, "reason": …}`` dict, a
+    bool, ``None``), which the switch acts on in the same tick.
+
+    Only needed for a deployment whose server is NOT a local container: by default the
+    engine recreates the box's own ``broker-ollama`` / ``vllm`` over the docker socket
+    (:mod:`queue_workflows.llm_context_lever`), and a box with no socket simply keeps the
+    window it serves. ``None`` restores that default. See
+    :attr:`queue_workflows.config.EngineConfig.llm_context_lever_fn`."""
+    cfg = get_config()
+    with cfg._lock:
+        cfg.llm_context_lever_fn = fn
 
 
 def set_inference_server_lifecycle(
@@ -302,7 +304,7 @@ def set_inference_server_lifecycle(
     Turning the box's GPU worker OFF (worker_controls, migration 0012) stops the
     server to free the GPU's VRAM; turning it ON starts it. ``start_fn() -> None``
     starts this machine's LLM server, ``stop_fn() -> None`` stops it — the host wires
-    them to whatever it runs (e.g. ``docker start/stop broker-ollama`` over the UDS),
+    them to whatever it runs (e.g. ``docker start/stop ollama`` over the UDS),
     so the engine stays server-type-agnostic. Either ``None`` ⇒ that direction is a
     no-op, so a deployment that never wires them keeps today's behaviour (the GPU
     toggle parks only the worker). The worker invokes them GPU-lane-only and
@@ -334,23 +336,10 @@ def set_comfyui_lifecycle(
         cfg.comfyui_stop_fn = stop_fn
 
 
-def set_worker_bounce(fn: Callable[[str, str, str], bool] | None) -> None:
-    """Wire the per-host dead-worker bounce action. ``fn(host_label, queue,
-    container) -> bool`` restarts a worker the orchestrator flagged dead, returning
-    True iff issued. Called by
-    :class:`queue_workflows.worker_supervisor.WorkerSupervisor` for a flagged
-    worker this box owns. ``None`` (default) ⇒ the supervisor's built-in
-    ``docker restart <container>``. A host on systemd/k8s/a custom API wires its
-    own. See :attr:`queue_workflows.config.EngineConfig.worker_bounce_fn`."""
-    cfg = get_config()
-    with cfg._lock:
-        cfg.worker_bounce_fn = fn
-
-
 def set_gpu_lease_store(store: Any | None) -> None:
     """Wire a cross-box GPU model-lease store (one-model-per-GPU-box arbitration,
     :mod:`queue_workflows.gpu_model_lease`). ``store`` implements ``read(box_id)``
-    + ``update(box_id, fn)`` (e.g. a redis/pg store shared across boxes). ``None``
+    + ``update(box_id, fn)`` (e.g. a DB-backed store shared across boxes). ``None``
     (default) ⇒ the file store when ``gpu_model_lease_dir`` is set, else a no-op
     that grants every load. See
     :attr:`queue_workflows.config.EngineConfig.gpu_lease_store`."""
@@ -398,31 +387,3 @@ def set_ingest_schedule(schedule: list) -> None:
     cfg = get_config()
     with cfg._lock:
         cfg.ingest_schedule = list(schedule)
-
-
-# ── shared GPU pool (pivot B) ──
-
-
-def register_pool_handler(name: str, callable_: Callable[..., dict]) -> None:
-    """Register a GPU-pool handler under ``name`` (deployed on a GPU box). A
-    pooled worker resolves a claimed task's ``handler`` to it and runs
-    ``fn(*, inputs, output_dir, params) -> dict``. The op CODE lives here on the
-    box; the DATA lives on shared NFS (``inputs``/``output_dir`` are paths the
-    handler interprets). A submit-only app needn't register any."""
-    cfg = get_config()
-    with cfg._lock:
-        cfg.gpu_pool_handlers[name] = callable_
-
-
-# ── broker_service worker runtime (v2 control plane) ──
-
-
-def register_broker_handler(key: str, callable_: Callable[..., Any]) -> None:
-    """Register a broker_service worker handler under ``key`` (matched against a
-    granted job's ``payload['handler']`` else its ``resource``). The worker runtime
-    (:mod:`queue_workflows.broker_service.worker`) runs ``fn(job, cancel) -> dict|None``
-    for a granted job; ``cancel`` is a ``threading.Event`` set when the broker revokes
-    permission mid-run. A submit-only app needn't register any."""
-    cfg = get_config()
-    with cfg._lock:
-        cfg.broker_handlers[key] = callable_

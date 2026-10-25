@@ -1,4 +1,4 @@
-"""The advertised server set must not flap on one missed probe (round-2 audit, HIGH).
+"""The advertised server set must not flap on one missed probe.
 
 Everything hangs off `_box_served`: `_gpu_slot_budget` (ollama→1, vllm→PAR), the
 DB-side box-slot arbiter, the published heartbeat `concurrency`, and — through it —
@@ -39,15 +39,18 @@ def _drive(w, monkeypatch, answers):
 def test_one_missed_probe_does_not_drop_the_kind(monkeypatch):
     w = _worker()
     _drive(w, monkeypatch, {"ollama": ["ollama"], "vllm": ["vllm"]})
-    assert sorted(w._box_served) == ["ollama", "vllm"]
+    # ONE SERVING KIND: while vLLM serves it is the only kind offered —
+    # ollama's always-up daemon stays in the DEBOUNCED set but is not advertised, or an
+    # ollama-only job lands here and loads a second copy beside vLLM's pool.
+    assert w._box_served == ["vllm"]
     assert w._gpu_slot_budget() == 3
 
     _drive(w, monkeypatch, {"ollama": ["ollama"], "vllm": []})      # miss 1
-    assert "vllm" in w._box_served, "one miss must not collapse the set"
+    assert w._box_served == ["vllm"], "one miss must not collapse the set"
     assert w._gpu_slot_budget() == 3, "…nor the budget the arbiter enforces"
 
     _drive(w, monkeypatch, {"ollama": ["ollama"], "vllm": []})      # miss 2
-    assert "vllm" in w._box_served
+    assert w._box_served == ["vllm"]
 
 
 def test_sustained_misses_do_drop_it():
@@ -72,15 +75,16 @@ def test_a_kind_rejoins_on_first_sighting(monkeypatch):
         _drive(w, monkeypatch, {"ollama": ["ollama"], "vllm": []})
     assert w._box_served == ["ollama"]
     _drive(w, monkeypatch, {"ollama": ["ollama"], "vllm": ["vllm"]})
-    assert sorted(w._box_served) == ["ollama", "vllm"], "a server that answers is up"
+    assert w._box_served == ["vllm"], (
+        "a server that answers is up — and vLLM, once up, is the only kind offered")
     assert w._gpu_slot_budget() == 3
 
 
 def test_heartbeat_row_pairs_concurrency_with_the_SAME_ticks_served_list(monkeypatch):
-    """Round-2 audit: kwargs evaluate left-to-right, and concurrency was computed
+    """kwargs evaluate left-to-right, and concurrency was computed
     BEFORE the servers probe that feeds it — every published row paired tick N-1's
     concurrency with tick N's served list. That two-tick skew is the exact
-    'adv=1 served={ollama,vllm}' row the operator screenshotted."""
+    'adv=1 served={ollama,vllm}' row an operator panel would show."""
     from queue_workflows import node_queue
 
     state = {"served": ["ollama"]}

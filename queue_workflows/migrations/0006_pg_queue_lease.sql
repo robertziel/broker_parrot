@@ -14,7 +14,7 @@
 --
 -- Idempotent (`ADD COLUMN IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`,
 -- `CREATE OR REPLACE FUNCTION`, `DROP TRIGGER IF EXISTS` + `CREATE TRIGGER`) so
--- re-running on the live ai_leads DB is a no-op.
+-- re-running on a live DB is a no-op.
 
 ALTER TABLE workflow_node_jobs
     ADD COLUMN IF NOT EXISTS claimed_by text,

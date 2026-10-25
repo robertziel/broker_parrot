@@ -5,10 +5,9 @@ supplements it with the slice owned by *our* containers — so the queue-pill
 chart can colour the lower portion (work caused by the host's containers) and
 grey the upper portion (everything else on the host).
 
-The container-name prefix is CONFIGURABLE (plan §1f / §2c): the default comes
-from ``config.container_prefix`` (``ai_leads-`` unless a host overrides it via
-``queue_workflows.configure(container_prefix=...)``) so other projects attribute
-their own containers. The ctor still takes an explicit ``name_prefix`` for
+The container-name prefix comes from ``config.container_prefix``, set by the
+host via ``queue_workflows.configure(container_prefix=...)``. It has no default:
+unset ⇒ attribution is off (``sample()`` returns ``None``), never a guess. The ctor still takes an explicit ``name_prefix`` for
 tests.
 
 Scope: CPU and RAM only. GPU attribution is intentionally skipped (ROCm/HIP
@@ -83,8 +82,8 @@ class CgroupAttribution:
         unavailable — caller should treat that as "no attribution data this
         tick" and emit only system-wide totals.
         """
-        if not self._root.exists():
-            return None
+        if not self._prefix or not self._root.exists():
+            return None  # no prefix configured ⇒ "ours" is unknown, not everything
 
         ids = self._our_container_ids()
         if ids is None:

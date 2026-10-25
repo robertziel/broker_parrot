@@ -1,7 +1,7 @@
 """Engine configuration + the dependency-inversion seams.
 
 ``queue_workflows`` is a host-agnostic Postgres-as-queue engine. Everything
-that used to couple it to a specific application (ai_leads) is now an
+that used to couple it to a specific application is now an
 *injected* hook held on a process-wide :class:`EngineConfig` singleton. A
 host wires those hooks once at startup (``queue_workflows.configure(...)`` +
 the ``set_*`` / ``register_*`` helpers) before launching a claim worker /
@@ -12,15 +12,14 @@ Every hook has a **safe default** so ``import queue_workflows`` +
 standalone (no host wiring required):
 
   * ``db_url_env``           — env var holding the DSN (default
-                               ``AI_LEADS_DB_URL`` for byte-compat with the
-                               existing ai_leads deploy; other projects pass
-                               their own).
+                               ``QUEUE_WORKFLOWS_DB_URL``; a host may pass
+                               its own).
   * ``video_model_ids``      — GPU models on the tight render budget (empty).
   * ``node_module_package``  — dotted package the node-module resolver imports
                                under (empty → the stored ``node_module`` value
                                is imported as a fully-qualified module).
   * ``container_prefix``     — cgroup-attribution container-name prefix
-                               (default ``ai_leads-``).
+                               (default ``""`` = attribution off).
   * the workflow provider    — ``load_workflow`` / ``pipeline_schema`` /
                                ``resolve_ref`` the dispatcher reads the DAG
                                from (defaults raise / use the built-in
@@ -41,50 +40,58 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-# ── env-var NAMES (configurable; defaults keep ai_leads byte-compat) ─────────
+# ── env-var NAMES (configurable; defaults are QUEUE_WORKFLOWS_*) ─────────────
 #
 # The engine reads these env *names* off the config so a host can rename them
-# without touching engine code. The DEFAULTS are the ai_leads names so the
-# rendered ``.env`` on the live fleet is unchanged at the cutover.
+# without touching engine code. The DEFAULTS are the canonical
+# ``QUEUE_WORKFLOWS_*`` names.
 
 
-#: Backend aliases for the QUEUE_WORKFLOWS_DB_BACKEND env knob. Mirrors
-#: ``backends._BACKEND_ALIASES`` (+ the relational ``sqlite``/``pg``), inlined so
-#: ``config`` stays a leaf — importing ``backends`` here would cycle (it imports
-#: ``config.get_config``). ``configure()`` re-validates against the registry.
 # Engine BUILT-IN pool-lane node modules (shipped in queue_workflows.builtin_nodes):
 # always exempt from the gpu required-model guard and always resolvable, in every
 # project, regardless of host configuration. See EngineConfig.effective_vlm_pool_node_modules
 # and resolve_node_module's builtin fallback.
 BUILTIN_POOL_NODE_MODULES: frozenset[str] = frozenset({"comfyui"})
 
+#: The ONLY engine backends — the two relational stores behind the dialect seam
+#: (``dialect.py``) — and the aliases each accepts. Every other name is
+#: rejected, never mapped to one of these.
 _DB_BACKEND_ALIASES = {
     "sqlite": "sqlite", "pg": "pg", "postgres": "pg", "postgresql": "pg",
-    "redis": "redis", "mongo": "mongodb", "mongodb": "mongodb",
 }
 
 
-def _default_db_backend() -> str:
-    """Default ``db_backend``, read from ``QUEUE_WORKFLOWS_DB_BACKEND`` (the env
-    knob that reaches the standalone console scripts) and **validated +
-    normalized** — so a typo or stale alias fails loudly here instead of silently
-    mis-routing (e.g. ``"Sqlite"`` → pg, or ``"mongo"`` → pg instead of the mongo
-    SPI). Unset ⇒ ``"sqlite"`` (the v1.0.0 default)."""
-    raw = os.environ.get("QUEUE_WORKFLOWS_DB_BACKEND")
-    if not raw:
-        return "sqlite"
-    norm = _DB_BACKEND_ALIASES.get(raw)
+def canonical_db_backend(name: str, *, source: str = "db_backend") -> str:
+    """Normalize a ``db_backend`` spelling (case/whitespace-insensitive, aliases
+    folded) to ``"sqlite"`` or ``"pg"``, or raise ``ValueError`` naming the
+    valid values. The ONE validator ``configure()``, the
+    ``QUEUE_WORKFLOWS_DB_BACKEND`` env default and the ``--db-backend`` CLI
+    flags share, so a typo or a removed backend fails loudly at startup instead
+    of mis-routing to a store the operator never chose. ``source`` names the
+    knob in the error."""
+    norm = _DB_BACKEND_ALIASES.get(str(name).strip().lower())
     if norm is None:
         raise ValueError(
-            f"QUEUE_WORKFLOWS_DB_BACKEND={raw!r} is not a known backend "
-            f"(valid: {sorted(set(_DB_BACKEND_ALIASES))})"
+            f"{source}={name!r} is not a supported backend "
+            f"(valid: {sorted(_DB_BACKEND_ALIASES)}; the engine runs only on "
+            "sqlite or Postgres)"
         )
     return norm
 
 
+def _default_db_backend() -> str:
+    """Default ``db_backend``, read from ``QUEUE_WORKFLOWS_DB_BACKEND`` (the env
+    knob that reaches the standalone console scripts) and validated through
+    :func:`canonical_db_backend`. Unset ⇒ ``"sqlite"`` (the v1.0.0 default)."""
+    raw = os.environ.get("QUEUE_WORKFLOWS_DB_BACKEND")
+    if not raw:
+        return "sqlite"
+    return canonical_db_backend(raw, source="QUEUE_WORKFLOWS_DB_BACKEND")
+
+
 def _env_flag(name: str) -> bool:
     """Truthiness for a ``QUEUE_WORKFLOWS_*`` boolean knob, read through
-    ``envcompat`` so the legacy ``AI_LEADS_*`` twin resolves for free. Anything
+    ``envcompat`` (which refuses a retired legacy twin). Anything
     in ``{1,true,yes,on}`` (case-insensitive) is on; unset or anything else is
     off, so a typo fails safe rather than silently enabling a feature."""
     from queue_workflows.envcompat import env_get
@@ -144,7 +151,7 @@ class EngineConfig:
     #: (``queue_workflows.llm_backends.factory``) reads. The DB (worker_controls,
     #: migration 0013) owns WHICH server type a machine runs + its tunables; the
     #: URL is deployment topology (set per host by ansible), so it stays in env.
-    #: Names default to the ai_leads vars for byte-compat; values fall back to the
+    #: Names default to the ``QUEUE_WORKFLOWS_*`` vars; values fall back to the
     #: localhost defaults below when the env is unset.
     ollama_url_env: str = "QUEUE_WORKFLOWS_OLLAMA_URL"
     vllm_url_env: str = "QUEUE_WORKFLOWS_VLLM_URL"
@@ -157,10 +164,6 @@ class EngineConfig:
     #: only, so every existing consumer is byte-compatible. See
     #: ``docs/llm_topology.example.yml``.
     llm_topology_path: str | None = None
-    #: env vars holding the redis / mongodb DSN for those backends (read only when
-    #: ``db_backend`` selects them). New names (no ai_leads equivalent).
-    redis_url_env: str = "QUEUE_WORKFLOWS_REDIS_URL"
-    mongo_url_env: str = "QUEUE_WORKFLOWS_MONGO_URL"
 
     # ── value config ──────────────────────────────────────────────────────────
     #: GPU model ids on the tight per-job video render budget (claim_worker).
@@ -187,78 +190,44 @@ class EngineConfig:
     #: a fully-qualified importable module name.
     node_module_package: str = ""
     #: cgroup-attribution container-name prefix (hw_metrics per-container slice).
-    container_prefix: str = "ai_leads-"
+    #: Empty (the default) ⇒ attribution is off.
+    container_prefix: str = ""
     #: Tenant identity of THIS client on a SHARED broker Postgres (migration
     #: 0017). One broker DB holds one cpu + one gpu (+ ingest) queue across all
     #: projects; every queue record carries ``project`` and a client enqueues +
     #: claims ONLY rows whose ``project`` matches this value. Default ``""`` is the
     #: single-tenant sentinel: every row is ``''`` and the claim filter
     #: ``project=''`` matches them all, so a single-Postgres-per-project deploy is
-    #: byte-compatible with no host wiring. Distinct from :attr:`db_namespace`,
-    #: which *isolates* tenants on a shared redis/mongo (they can't see each
-    #: other); ``project`` *pools* them into one pg queue with a filter — the
-    #: inverse. Set via ``configure(project="ai_leads")`` OR by exporting
+    #: byte-compatible with no host wiring. Set via ``configure(project="app-a")`` OR by exporting
     #: ``QUEUE_WORKFLOWS_PROJECT`` (the env knob, for entrypoints that hand-roll
     #: their own ``configure`` and never pass ``project`` — e.g. standalone scripts).
     project: str = field(default_factory=_default_project)
     #: OBSERVED LLM-server capability this worker advertises in its heartbeat
     #: (migration 0014) — which server types this HOST can actually run. The host
-    #: sets it once at startup (ai_leads → from the vllm-sidecar-rendered env), and
+    #: sets it once at startup (e.g. from a vllm-sidecar-rendered env), and
     #: the heartbeat emitter publishes it so the queue UI can gate its per-machine
     #: server-type control (an AMD box that can't run the CUDA vllm sidecar
     #: advertises just ``["ollama"]`` → the UI disables vllm there). Default
     #: ``["ollama"]`` (the universal baseline) keeps every other consumer unchanged.
     llm_servers_available: list[str] = field(default_factory=lambda: ["ollama"])
 
-    # ── storage backend selection (pluggable DB type) ──────────────────────────
-    #: Which relational engine / SPI provider the store resolves to:
+    # ── storage backend selection (sqlite or Postgres) ─────────────────────────
+    #: Which relational engine store the dialect seam resolves to:
     #: ``"sqlite"`` (**default** — a daemon-less local file, the friendliest
-    #: zero-config default for a reusable library) or ``"pg"`` (Postgres) for the
-    #: full DAG engine; ``"redis"`` / ``"mongodb"`` select the flat-queue
-    #: StorageBackend SPI instead. ``"sqlite"``/``"pg"`` go through the dialect
-    #: seam; the others are validated against the backend registry by
-    #: ``configure()``.
+    #: zero-config default for a reusable library) or ``"pg"`` (Postgres). Both
+    #: run the full DAG engine; any other value is rejected by
+    #: :func:`canonical_db_backend`.
     #:
     #: **BREAKING (v1.0.0):** the default was ``"pg"`` through v0.x. It is now
-    #: ``"sqlite"`` — this is the ONE intentionally non-``ai_leads``-byte-compat
-    #: default. A Postgres consumer (ai_leads + siblings) MUST opt in, either with
+    #: ``"sqlite"`` — the ONE intentionally non-byte-compat
+    #: default. A Postgres consumer MUST opt in, either with
     #: ``configure(db_backend="pg")`` OR by exporting ``QUEUE_WORKFLOWS_DB_BACKEND=pg``
     #: (the env knob, read here) — the latter is the "one line at startup" that
-    #: also reaches the standalone console scripts (``queue-broker``, the
+    #: also reaches the standalone console scripts (``queue-hw-watch``, the
     #: dashboards, …) which have no host ``configure()`` call. Without it, an
-    #: ``AI_LEADS_DB_URL`` pg DSN is read as a SQLite path. Every other default
+    #: ``QUEUE_WORKFLOWS_DB_URL`` pg DSN is read as a SQLite path. Every other default
     #: stays byte-compat.
     db_backend: str = field(default_factory=_default_db_backend)
-    #: Logical namespace isolating THIS tenant's jobs on a SHARED redis/mongodb
-    #: server — every key/collection is scoped by it, so two apps pointed at one
-    #: server can't claim or read each other's jobs (the multi-tenant data-leakage
-    #: guard). ``""`` ⇒ the literal namespace ``"default"``. For pg it scopes the
-    #: SPI rows via a ``namespace`` column.
-    db_namespace: str = ""
-
-    # ── shared GPU pool (pivot B) ──────────────────────────────────────────────
-    #: The shared GPU pool is a StorageBackend queue addressed INDEPENDENTLY of
-    #: ``db_backend`` — an app keeps ``db_backend="pg"`` for its own run/DAG state
-    #: while pooled GPU workers across apps claim self-contained GPU tasks from one
-    #: shared (redis) store. These select that pool store; the pool DSN is env
-    #: (deployment topology), like the redis/mongo DSNs.
-    gpu_pool_backend: str = "redis"
-    gpu_pool_url_env: str = "QUEUE_WORKFLOWS_GPU_POOL_URL"
-    #: Logical tenant namespace for the shared pool (every app + GPU box that
-    #: should share a fleet uses the SAME value); keys are scoped by it.
-    gpu_pool_namespace: str = "gpu_pool"
-    #: ``handler -> Callable`` the POOLED WORKER runs. Keyed by the task's
-    #: ``handler`` name; ``fn(*, inputs, output_dir, params) -> dict``. The op CODE
-    #: is deployed on the GPU box (this map); the DATA lives on shared NFS. Empty
-    #: on a submitter that only enqueues (it needn't know how to run them).
-    gpu_pool_handlers: dict[str, Callable] = field(default_factory=dict)
-
-    # ── broker_service worker runtime (v2 control plane) ───────────────────────
-    #: ``handler-key -> Callable[[job, cancel], dict|None]`` the broker_service
-    #: worker runtime runs for a granted job (resolved by ``payload['handler']``
-    #: else the job's ``resource``). Registered via
-    #: ``queue_workflows.register_broker_handler``. Empty on a submit-only app.
-    broker_handlers: dict[str, Callable] = field(default_factory=dict)
 
     # ── node-module resolver (overrides node_module_package when set) ──────────
     #: ``Callable[[str], module]`` — resolve a stored ``node_module`` string to
@@ -303,7 +272,7 @@ class EngineConfig:
     #: backend's ``ensure_ready`` calls it on a cold start / respawn. Default
     #: ``None`` ⇒ the vllm backend's built-in pkill / no-op seams (a same-container
     #: or unmanaged deployment). A host that runs vllm as a SEPARATE container
-    #: wires these (ai_leads → docker Engine API over the UDS) so the in-worker
+    #: wires these (e.g. → docker Engine API over the UDS) so the in-worker
     #: supervisor can stop/start the SIBLING sidecar WITHOUT a docker restart
     #: policy (which would re-trigger the NFS cold-start boot race). Threaded into
     #: ``VLLMBackend`` by the backend factory; ``None`` passes through to the
@@ -316,13 +285,25 @@ class EngineConfig:
     #: before; a ``permanent`` verdict ends the switch's out-of-service window on the
     #: spot instead of at the warm timeout. See ServerSwitch.report_start_outcome.
     vllm_start_fn: Callable[..., Any] | None = None
+    #: Serve a different CONTEXT WINDOW on this box (migration 0028).
+    #: ``fn(server_kind, context_length | None) -> verdict`` — restart/reconfigure the
+    #: box's ``'ollama'`` / ``'vllm'`` server so it serves ``context_length`` tokens, or
+    #: the operator's own value when ``None``. MAY return what it did, in the same
+    #: vocabulary as ``vllm_start_fn`` (a ``StartOutcome``, a ``{"status", "reason"}``
+    #: dict, a bool, ``None``). Default ``None`` ⇒ the engine's built-in lever recreates
+    #: the box's own container over the docker socket
+    #: (:mod:`queue_workflows.llm_context_lever`); a box with neither lever nor socket
+    #: simply advertises the window it already serves and is never asked to switch. Wire
+    #: this when the server is not a local container (another host, k8s). See
+    #: :func:`queue_workflows.set_llm_context_lever`.
+    llm_context_lever_fn: Callable[[str, int | None], Any] | None = None
 
     # ── inference-server ON/OFF, tied to the GPU worker toggle (host-provided) ─
     #: The operator GPU ON/OFF toggle (worker_controls, migration 0012) governs the
     #: machine's inference SERVER too, not just the worker process: turning the GPU
     #: worker OFF stops the box's LLM server (frees the GPU's VRAM), turning it ON
     #: starts it. These are the host-wired levers. ``stop_fn()`` stops this machine's
-    #: server (e.g. ``docker stop broker-ollama`` over the UDS); ``start_fn()`` starts
+    #: server (e.g. ``docker stop ollama`` over the UDS); ``start_fn()`` starts
     #: it. SERVER-TYPE-AGNOSTIC — the host controls whatever it runs (ollama / vllm).
     #: Distinct from ``vllm_{stop,start}_fn`` above (those drive the vllm backend's
     #: IDLE reap + model switch; these track the operator DESIRED state). Both default
@@ -346,22 +327,34 @@ class EngineConfig:
     comfyui_start_fn: Callable[[], None] | None = None
     comfyui_stop_fn: Callable[[], None] | None = None
 
-    # ── per-host dead-worker bounce (host-provided) ───────────────────────────
-    #: ``Callable[[host_label, queue, container], bool]`` — restart a wedged worker
-    #: the orchestrator flagged dead (``worker_heartbeats.last_flagged_dead_at``).
-    #: Called by :class:`~queue_workflows.worker_supervisor.WorkerSupervisor` for a
-    #: flagged worker this box OWNS (a key in its label→container map). Returns True
-    #: iff the bounce was issued. Default ``None`` ⇒ the supervisor's built-in
-    #: ``docker restart <container>``. A host that manages workers differently
-    #: (systemd, k8s, a custom API) wires its own restart here.
-    worker_bounce_fn: Callable[[str, str, str], bool] | None = None
-
     # ── one-model-per-GPU-box arbitration (opt-in) ────────────────────────────
     #: The PHYSICAL box identity every GPU worker on a machine agrees on, so the
     #: model lease (:mod:`queue_workflows.gpu_model_lease`) unifies per-project
     #: workers that carry DIFFERENT ``host_label``s (``box-a`` vs ``box-a-gpu``).
     #: Empty ⇒ the machine hostname. Env ``QUEUE_WORKFLOWS_GPU_BOX_ID``.
     gpu_box_id: str = ""
+    #: PER-BOX CEILING on concurrent GPU node-jobs — ``{box_id: max_concurrent}``,
+    #: e.g. ``{"box-b": 3, "box-c": 3}``. The box's computed concurrency (operator
+    #: PAR, capped by the vLLM KV cache and by the serving kind) describes the LLM
+    #: SERVER; this describes the MACHINE — its power envelope, its unified memory,
+    #: the thermal latch a flood of concurrent work trips. Keyed by the PHYSICAL box
+    #: identity (:data:`gpu_box_id` / ``gpu_model_lease.default_box_id()``, e.g.
+    #: ``box-b``), the same name ``avoid_box``/``force_box`` place against — NOT the
+    #: per-project lane label (``box-b-gpu``), because every project's lane on a
+    #: machine shares one card.
+    #:
+    #: Applied as the LAST word in ``claim_worker.ClaimWorker._pool_parallelism()``,
+    #: so it can only LOWER the computed number, never raise it. A box not named
+    #: here has NO ceiling (today's behaviour, byte-identical). A value that is not
+    #: a positive int is IGNORED, never obeyed — a 0 would be a GPU lane that claims
+    #: nothing, silently, forever.
+    #:
+    #: Env twin ``QUEUE_WORKFLOWS_GPU_BOX_MAX_CONCURRENT`` (wins) carries the same
+    #: mapping as a comma-separated list — ``"box-b=3,box-c=3"`` — so ONE rendered
+    #: ``.env`` fits the whole fleet; a bare integer (``"3"``) means "this box",
+    #: for a machine whose compose file is its own. Comma+``=`` is the shell-safe
+    #: shape for the engine's first mapping knob (every other knob is a scalar).
+    gpu_box_max_concurrent: dict[str, int] = field(default_factory=dict)
     #: Directory for the file-backed box model lease (each GPU container mounts the
     #: SAME host dir → a box-wide flock). Unset ⇒ the lease is a no-op that grants
     #: every load (byte-identical to no arbitration). Env
@@ -381,7 +374,7 @@ class EngineConfig:
     #: ``QUEUE_WORKFLOWS_LLM_SERVER_IDLE_TTL_S`` overrides (envcompat).
     llm_server_idle_ttl_s: float = 300.0
     #: A host-provided lease store (overrides ``gpu_model_lease_dir``) — anything
-    #: with ``read(box_id)`` + ``update(box_id, fn)``, e.g. a redis/pg-backed store
+    #: with ``read(box_id)`` + ``update(box_id, fn)``, e.g. a shared-DB-backed store
     #: shared across boxes. ``None`` ⇒ the file store (if a dir is set) else no-op.
     gpu_lease_store: Any | None = None
     #: ComfyUI base URL on THIS box, if it runs one (a diffusion server that can hold the
@@ -405,15 +398,15 @@ class EngineConfig:
     #: ``llm_server=None`` and keep self-resolving from local env (unchanged).
     llm_server_resolver: Callable[[dict], Any] | None = None
 
-    # ── orphan-cancel sweep (ON by default since the ghost audit) ──
+    # ── orphan-cancel sweep (ON by default) ──
     #: When True, the :class:`NodePool` periodically flips ``queued`` jobs whose
     #: parent run is already ``cancelled`` / ``failed`` to ``cancelled``. The
     #: host's cancel handler is usually a single ``UPDATE workflow_runs SET
     #: status='cancelled'`` and does not cascade into ``workflow_node_jobs``; the
     #: claim SQL refuses such jobs (run-cancel guard), but they linger in
     #: ``queued`` forever — polluting queue gauges AND (worse) feeding every
-    #: queue-depth-driven policy a lie (the audit found a "full" gpu
-    #: queue that was 82 % ghosts). Default ``True``: ghosts now cannot
+    #: queue-depth-driven policy a lie (a "full" gpu queue can be
+    #: mostly ghosts). Default ``True``: ghosts now cannot
     #: accumulate. The flip is semantically safe — a job of a terminal run can
     #: never be claimed anyway — and hosts that want the old bookkeeping keep it
     #: via ``configure(cancel_orphan_queued_jobs=False)``.
@@ -483,10 +476,10 @@ class EngineConfig:
     #: Env twin ``QUEUE_WORKFLOWS_DOWNLOAD_MAX_CONCURRENT`` overrides (envcompat).
     download_max_concurrent: int = 1
 
-    # ── ingest queue names + budget (host-configurable; G1) ────────────────────
+    # ── ingest queue names + budget (host-configurable) ────────────────────
     #: Ingest-family queue names. Migration 0008 dropped the fetch/load DB CHECK;
     #: the host validates ``queue`` against THIS set before enqueue (mirroring the
-    #: task_name gate). Default {'fetch','load'} keeps ai_leads byte-compat; a
+    #: task_name gate). Default {'fetch','load'}; a
     #: different project (e.g. a forecast service) sets {'ingest','etl','sim','reports'}.
     ingest_queues: frozenset[str] = frozenset({"fetch", "load"})
     #: Wall-clock budget (s) the claim worker applies to ingest queues OTHER than

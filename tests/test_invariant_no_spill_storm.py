@@ -1,24 +1,19 @@
 """INVARIANT: a box denied by its own lease must back off, not hot-loop.
 
-Observed live, on both GPU boxes, twice within seven seconds of a lane restart:
+The failure shape, seen on GPU boxes right after a lane restart:
 
-    71 `SPILLING job <id>` lines in 6.0 s   (box-a)
-    79 `SPILLING job <id>` lines in 6.5 s   (box-b)
+    dozens of `SPILLING job <id>` lines within a few seconds
 
 — all for ONE job id. The mechanism is a loop with no brake. The previous worker
 process died mid-switch, so the box-lease file still carried its `__server_switch__`
 holder (TTL 120 s, no release on exit). The fresh worker claimed a job, was denied the
 box by that dead holder, and `requeue_job_for_retry` put the row back at the FRONT of
 the queue (`LEAST(priority, 10)` — deliberately, it is a resume, not a fault). The very
-next claim returned the same row, which was denied again. Twelve DB round-trips a second
+next claim returned the same row, which was denied again. Many DB round-trips a second
 until the dead holder's TTL expired.
 
-The same shape was recorded before, in an earlier fill-before-spill incident: "68
-spills / 5 min — a hot claim->spill loop". It was diagnosed as a placement problem and
-the loop itself was left in.
-
 Spilling is correct: the job belongs on a box that can run it. Spilling the same job
-twelve times a second is not — it is a denial-of-service against the queue, it burns the
+many times a second is not — it is a denial-of-service against the queue, it burns the
 row's history, and it hides the reason in a wall of identical lines. So a denied acquire
 now pauses THIS worker's GPU claiming for a short, doubling, capped interval, and the
 reason is logged once per window. A worker that is never denied is unaffected.

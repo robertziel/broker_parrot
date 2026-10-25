@@ -103,8 +103,8 @@ def test_resolve_inputs_resolves_upstream_pipeline_step_files_ref(tmp_path):
     (``{"$from": "<step>.files", "$filter": {...}}``) must resolve against the
     on-disk ``<out_dir>/<step>/`` scan — exactly like an input step does.
 
-    Regression pin for failed run ffc5d63c
-    (``edit_install_methods_experiment``): ``resolve_inputs_for_job`` only
+    Regression pin for a failed run
+    (a pipeline with a step-files ref): ``resolve_inputs_for_job`` only
     built ``run.context`` + siblings' ``context_delta`` keyed by ``node_id``
     (e.g. ``split_labeled_mask/split``). It NEVER did the on-disk
     ``<step>.files`` scan ``_run_context_for_refs`` does, so a ref to the STEP

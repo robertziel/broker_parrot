@@ -1,6 +1,6 @@
 """workflow_node_events — durable per-node, per-attempt event history (0011).
 
-Engine half of the node-event-history feature (audit Phase 0):
+Engine half of the node-event-history feature:
   * record_node_event_in_txn rides the caller's txn (outbox-atomicity) and
     rolls back with it — the terminal / requeue contract;
   * record_node_event is BEST-EFFORT — a bad write is swallowed (returns None,
@@ -193,7 +193,7 @@ def test_execute_node_emits_failed_event(monkeypatch):
     assert "kaboom" in (failed[0]["error"] or "")
 
 
-# ── retention sweep (NodePool, Phase 2) ────────────────────────────────────
+# ── retention sweep (NodePool) ────────────────────────────────────
 
 
 def test_nodepool_retention_sweep_prunes_old_events():

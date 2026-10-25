@@ -3,7 +3,7 @@
 
 -- (G2) Per-job arguments for parametrised ingest tasks — e.g. a host's
 -- run_scenario(scenario_id). DEFAULT '{}' so every existing INSERT stays valid
--- and ai_leads' periodic sweeps (which carry no args) are unaffected.
+-- and a host's periodic sweeps (which carry no args) are unaffected.
 ALTER TABLE ingest_jobs
     ADD COLUMN args TEXT NOT NULL DEFAULT '{}';
 

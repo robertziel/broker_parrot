@@ -44,7 +44,7 @@ Daemon threads bracket each claimed job:
 GPU jobs are policed by HEALTH, never by elapsed time — a long-but-healthy
 render is never killed; a wedged one is caught by the health watchdog (and, for
 non-video, the stall watchdog). A trip RE-QUEUES the node for a retry on a fresh
-worker (the run stays ``running``) up to ``AI_LEADS_WATCHDOG_MAX_RETRIES`` times,
+worker (the run stays ``running``) up to ``QUEUE_WORKFLOWS_WATCHDOG_MAX_RETRIES`` times,
 then fails the run — so a single transient wedge no longer kills a whole workflow.
 On a hard-exit the trip path also clears this worker's ``current_model`` busy-ghost
 so a killed worker doesn't keep inflating the GPU-busy gauge.
@@ -78,12 +78,25 @@ log = logging.getLogger(__name__)
 #: peer asking for ANY model is denied (spills to another box) while the switch runs.
 SWITCH_SLOT = "__server_switch__"
 
+
+class _ClusterHold:
+    """One CLUSTER RESERVATION this lane is holding (``ClaimWorker._begin_cluster_hold``): the
+    job it is for, the quiesce that keeps the broker's servers down, and the watch that ticks it."""
+
+    __slots__ = ("job_id", "purpose", "quiesce", "stop", "thread")
+
+    def __init__(self, *, job_id: str, purpose: str, quiesce: Any) -> None:
+        self.job_id = job_id
+        self.purpose = purpose
+        self.quiesce = quiesce
+        self.stop = threading.Event()
+        self.thread: threading.Thread | None = None
+
 #: How long a gpu worker stops claiming after its own box denied it the card, and the
 #: ceiling that hold doubles up to. A denied acquire re-queues the job to the FRONT
 #: (it is a resume, not a fault), so without a brake the very next claim returns the
-#: same row and is denied again: 71 and 79 spills of ONE job within ~6 s were observed
-#: after a lane restart left a dead process's SWITCH_SLOT holder in the box lease, and
-#: an earlier incident recorded "68 spills / 5 min" of the same shape. The
+#: same row and is denied again: dozens of spills of ONE job within seconds were seen
+#: after a lane restart left a dead process's SWITCH_SLOT holder in the box lease. The
 #: ceiling stays at or under the lease TTL so a box whose stale holder simply expired
 #: resumes promptly rather than sitting out a brake that outlives the cause.
 SPILL_PAUSE_S = 1.0
@@ -95,7 +108,7 @@ SPILL_REPORT_EVERY_S = 60.0
 
 def _switch_timeouts() -> tuple[float, float]:
     """The switch phase budgets, env-overridable per deployment. One box loads
-    its vLLM weights over a network mount (887 s observed); a box with slower storage raises
+    its vLLM weights over a network mount (many minutes); a box with slower storage raises
     QUEUE_WORKFLOWS_SWITCH_WARM_TIMEOUT_S rather than editing a constant. Malformed
     values fall through to the defaults."""
     from queue_workflows import server_switch as _ss
@@ -117,6 +130,74 @@ def _switch_timeouts() -> tuple[float, float]:
 #: Consecutive missed probes before a server kind leaves the advertised set. At the
 #: 10 s heartbeat cadence, 3 misses ≈ 30 s.
 _SERVED_DEBOUNCE_MISSES = 3
+
+#: How long a sized job must have been queued before this box will restart its server
+#: for it. Below this, "no box serves that window" is as likely to be heartbeat lag as
+#: a real gap — and the restart costs the box its whole out-of-service window.
+CONTEXT_SWITCH_MIN_AGE_S = 30.0
+
+
+#: The smallest ``--gpu-memory-utilization`` worth starting vLLM at. Below this the pool
+#: cannot hold the weights and a useful cache, so the box does not start vLLM at all —
+#: the memory gate that keeps a box from filling its memory to the last byte.
+DEFAULT_VLLM_MIN_UTILIZATION = 0.30
+
+
+def _vllm_min_utilization() -> float:
+    raw = (env_get("QUEUE_WORKFLOWS_VLLM_MIN_UTILIZATION", "") or "").strip()
+    try:
+        value = float(raw) if raw else DEFAULT_VLLM_MIN_UTILIZATION
+    except ValueError:
+        return DEFAULT_VLLM_MIN_UTILIZATION
+    return value if 0.0 < value <= 1.0 else DEFAULT_VLLM_MIN_UTILIZATION
+
+
+#: Fewer concurrent requests than this and vLLM is not worth starting where ollama can
+#: serve instead: vLLM's advantage over ollama is BATCHING, and a pool that pays for one
+#: request buys nothing ollama does not already give — at a fraction of the memory, with
+#: no switch, no weight reload and no warm window.
+DEFAULT_VLLM_MIN_CONCURRENCY = 2
+
+
+#: How little free memory means the box is in trouble, whatever anyone planned
+#: (``QUEUE_WORKFLOWS_LLM_DANGER_FLOOR_MB``). 12 GB: a box can lose sshd at
+#: ~8 GB MemAvailable, and a box at 12 GB is one model load from that.
+DEFAULT_DANGER_FLOOR_MB = 12288
+
+
+def _danger_floor_bytes() -> int:
+    raw = (env_get("QUEUE_WORKFLOWS_LLM_DANGER_FLOOR_MB", "") or "").strip()
+    try:
+        mb = int(raw) if raw else DEFAULT_DANGER_FLOOR_MB
+    except ValueError:
+        mb = DEFAULT_DANGER_FLOOR_MB
+    return max(0, mb) * 1024 * 1024
+
+
+def _vllm_min_concurrency() -> int:
+    raw = (env_get("QUEUE_WORKFLOWS_VLLM_MIN_CONCURRENCY", "") or "").strip()
+    try:
+        value = int(raw) if raw else DEFAULT_VLLM_MIN_CONCURRENCY
+    except ValueError:
+        return DEFAULT_VLLM_MIN_CONCURRENCY
+    return max(1, value)
+
+
+def _vllm_model_max_context() -> int | None:
+    """The largest window this box's vLLM model supports
+    (``QUEUE_WORKFLOWS_VLLM_MAX_CONTEXT``), or ``None``.
+
+    vLLM does not publish it — ``/v1/models`` reports the window it was STARTED with,
+    which is exactly the number we would be trying to raise. And starting it beyond the
+    model's own maximum is not a soft failure: vLLM exits at startup, leaving the box
+    with no server until the switch aborts. So without an operator statement a vLLM box
+    advertises no room to grow, and only its model swap changes its window."""
+    raw = (env_get("QUEUE_WORKFLOWS_VLLM_MAX_CONTEXT", "") or "").strip()
+    try:
+        value = int(raw) if raw else 0
+    except ValueError:
+        return None
+    return value if value > 0 else None
 
 
 # ── wall-clock budgets ─────────────────────────────────────────────────────
@@ -156,6 +237,41 @@ NOTIFY_POLL_TIMEOUT_S = 1.0                   # safety poll for a dropped NOTIFY
 STALL_TIMEOUT_S = 120.0                        # ≫ inter-step gap (~12 s); load is excluded
 STALL_POLL_S = 5.0
 
+# A CLUSTER RESERVATION's lease, deliberately shorter than LEASE_S (see the LeaseRenewer in
+# _run_pool_node). What releases a hold whose owner dies? Answered where it actually lives: nothing enforces a hold whose lane is gone, yet the row
+# reads 'running' to llm-gateway until its lease lapses. The reservation's liveness IS its
+# renewal, every LEASE_RENEW_INTERVAL_S, so a long lease buys nothing but a long lie. 60 s is
+# 6x the renew interval — the same margin every other lease runs on — and the orchestrator's
+# 5 s reclaim sweep then re-queues a dead holder's row within ~a minute instead of ~ten.
+CLUSTER_RESERVATION_LEASE_S = 60
+
+# How long a cluster hold lets work ALREADY IN FLIGHT on this lane finish before it takes the
+# card anyway (ParkQuiesce's hold-off ceiling, in the 'cluster-hold' voice). llm-gateway waits
+# ~60 s for the RAM before it gives up, so the drain sits comfortably
+# inside that window: a job that ends sooner is never disturbed, and one that never ends is
+# not a reason to starve the cluster the box was reserved for.
+CLUSTER_HOLD_DRAIN_MAX_S = 30.0
+
+# How long a CLUSTER RESERVATION waits for the box lease before it gives the box back. It does
+# NOT spill behind the card it was sent to take: the occupant is usually the very LLM model its
+# own hold is unloading, and each re-queue-and-release re-opened the box to LLM claims —
+# a rapid HOLDING/RELEASED flap. So it waits, ticking
+# its hold (which is what clears the card), and only spills if something it cannot clear — a
+# render from another project — is still there at the ceiling.
+CLUSTER_RESERVATION_ACQUIRE_MAX_S = 120.0
+CLUSTER_RESERVATION_ACQUIRE_POLL_S = 2.0
+
+# The POOL lane's no-progress guard (an LLM / VLM facade node waiting on the box's
+# ollama / vLLM). OPT-IN PER NODE, and the node names its own window: a module-level
+# ``POOL_STALL_TIMEOUT_S`` on a node whose ``run`` declares ``status_callback``. It is
+# not armed merely because ``status_callback`` is declared — ComfyUI renders run on
+# this lane and beat once per sampler step, minutes apart on a video model, and a
+# fixed window would kill them. The floor stops a typo'd tiny window from killing
+# every healthy job in the gap between two requests (a prompt prefill + a model
+# swap); the kill switch disarms it fleet-wide without a redeploy.
+POOL_STALL_MIN_TIMEOUT_S = 30.0
+_POOL_STALL_DISABLE_ENV = "QUEUE_WORKFLOWS_DISABLE_POOL_STALL_WATCHDOG"
+
 
 # ── GPU health watchdog thresholds (HEALTH-driven, NOT wall-clock) ──────────
 # The GPU health watchdog replaces the fixed wall-clock budget for GPU jobs: it
@@ -188,16 +304,16 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
-GPU_HEALTH_INTERVAL_S = _env_float("AI_LEADS_GPU_HEALTH_INTERVAL_S", 300.0)
-GPU_IDLE_PCT = _env_int("AI_LEADS_GPU_IDLE_PCT", 5)
-GPU_HEALTH_RAM_DELTA_MB = _env_int("AI_LEADS_GPU_HEALTH_RAM_DELTA_MB", 5120)  # 5 GiB
+GPU_HEALTH_INTERVAL_S = _env_float("QUEUE_WORKFLOWS_GPU_HEALTH_INTERVAL_S", 300.0)
+GPU_IDLE_PCT = _env_int("QUEUE_WORKFLOWS_GPU_IDLE_PCT", 5)
+GPU_HEALTH_RAM_DELTA_MB = _env_int("QUEUE_WORKFLOWS_GPU_HEALTH_RAM_DELTA_MB", 5120)  # 5 GiB
 # First-window length when the watchdog arms AT job start (before any beat).
 # Generous (20 min) so a healthy-but-slow cold model load — which moves RAM as
 # weights load and so can't trip the "GPU idle AND RAM static" rule anyway — is
 # never policed tightly; it only bounds a load that is GENUINELY hung (idle GPU
 # AND static RAM) past this grace. The first beat (executor post-load / per
 # step) collapses the window to the normal GPU_HEALTH_INTERVAL_S cadence.
-GPU_HEALTH_LOAD_GRACE_S = _env_float("AI_LEADS_GPU_HEALTH_LOAD_GRACE_S", 1200.0)  # 20 min
+GPU_HEALTH_LOAD_GRACE_S = _env_float("QUEUE_WORKFLOWS_GPU_HEALTH_LOAD_GRACE_S", 1200.0)  # 20 min
 
 # ── watchdog re-queue-with-cap policy ───────────────────────────────────────
 # A watchdog trip RE-QUEUES the node for a retry on a fresh worker (flip
@@ -208,13 +324,13 @@ GPU_HEALTH_LOAD_GRACE_S = _env_float("AI_LEADS_GPU_HEALTH_LOAD_GRACE_S", 1200.0)
 # many, the trip falls back to the old mark-failed path (→ run fails). The cap is
 # read at trip-time (not captured at import) so an ops env-override takes effect
 # without a process restart, and so tests can flip it per-case.
-WATCHDOG_MAX_RETRIES = _env_int("AI_LEADS_WATCHDOG_MAX_RETRIES", 3)
+WATCHDOG_MAX_RETRIES = _env_int("QUEUE_WORKFLOWS_WATCHDOG_MAX_RETRIES", 3)
 
 
 def _watchdog_max_retries() -> int:
-    """The watchdog re-queue cap, read live from ``AI_LEADS_WATCHDOG_MAX_RETRIES``
+    """The watchdog re-queue cap, read live from ``QUEUE_WORKFLOWS_WATCHDOG_MAX_RETRIES``
     (default 3). Read at trip-time so an env-override needs no restart."""
-    return _env_int("AI_LEADS_WATCHDOG_MAX_RETRIES", WATCHDOG_MAX_RETRIES)
+    return _env_int("QUEUE_WORKFLOWS_WATCHDOG_MAX_RETRIES", WATCHDOG_MAX_RETRIES)
 
 
 # ── cpu lane width ──────────────────────────────────────────────────────────
@@ -227,7 +343,7 @@ def resolve_cpu_worker_threads() -> int:
     """The effective cpu lane width, resolved at CALL time so a host's
     ``configure()`` (which runs after import) is honoured: the
     ``QUEUE_WORKFLOWS_CPU_WORKER_THREADS`` env knob wins (operator override,
-    legacy spelling free via envcompat), then ``EngineConfig.cpu_worker_threads``,
+    read via envcompat), then ``EngineConfig.cpu_worker_threads``,
     then :data:`DEFAULT_CPU_WORKER_THREADS`.
 
     Always ``>= 1``: a malformed or sub-1 value falls through to the floor rather
@@ -250,7 +366,114 @@ def resolve_cpu_worker_threads() -> int:
     return DEFAULT_CPU_WORKER_THREADS
 
 
-# Worker capacity heartbeat refresh cadence. Rails' queue gauge treats a row
+#: The env twin of ``EngineConfig.gpu_box_max_concurrent``. Carries the whole
+#: mapping in one variable — ``"box-b=3,box-c=3"`` — so a single rendered
+#: ``.env`` fits the fleet; a bare integer (``"3"``) means "whichever box reads
+#: this", for a machine whose compose file is its own.
+BOX_MAX_CONCURRENT_ENV = "QUEUE_WORKFLOWS_GPU_BOX_MAX_CONCURRENT"
+
+#: Key for the bare-integer entry in a parsed ceiling map: "this box, whichever
+#: it is". Not a legal box id (``default_box_id()`` never returns empty), so it
+#: can never collide with a named one.
+_THIS_BOX = ""
+
+
+def _parse_box_ceilings(raw: str) -> dict[str, int]:
+    """Parse ``"box-b=3,box-c=3"`` (or a bare ``"3"``) into ``{box: ceiling}``.
+
+    ONE BAD ENTRY COSTS ONLY THAT ENTRY. A fleet-wide variable is edited by hand,
+    and a typo in one machine's entry must not silently lift the ceiling off every
+    other machine — so each entry is parsed independently and an unreadable or
+    non-positive one is dropped (see :func:`resolve_box_max_concurrent` for why a
+    0 is never obeyed)."""
+    out: dict[str, int] = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if "=" in entry:
+            # An entry that carries an '=' is NAMING a box, so it must name one:
+            # a bare '=3' names nothing and is a typo, not "every box". The bare
+            # fleet default has its own unambiguous spelling (no '=' at all).
+            box, _, value = entry.partition("=")
+            box = box.strip()
+            if not box:
+                log.warning(
+                    "[claim-worker:gpu] %s: ignoring %r — an entry with '=' must "
+                    "name a box (write a bare N for 'this box')",
+                    BOX_MAX_CONCURRENT_ENV, entry,
+                )
+                continue
+        else:
+            box, value = _THIS_BOX, entry
+        try:
+            n = int(value.strip())
+        except ValueError:
+            log.warning(
+                "[claim-worker:gpu] %s: ignoring unreadable ceiling %r "
+                "(expected 'box=N' or a bare N)", BOX_MAX_CONCURRENT_ENV, entry,
+            )
+            continue
+        if n <= 0:
+            log.warning(
+                "[claim-worker:gpu] %s: ignoring ceiling %r — a ceiling of %d is a "
+                "GPU lane that claims nothing; the box keeps its computed "
+                "concurrency", BOX_MAX_CONCURRENT_ENV, entry, n,
+            )
+            continue
+        out[box.strip()] = n
+    return out
+
+
+def resolve_box_max_concurrent(box: str) -> int | None:
+    """This BOX's operator ceiling on concurrent GPU node-jobs, or ``None`` for
+    "no ceiling" — resolved at CALL time so a host's ``configure()`` (which runs
+    after import) and an operator's live env are both honoured. Precedence matches
+    every other knob in this engine (``cpu_worker_threads``,
+    ``download_max_concurrent``): :data:`BOX_MAX_CONCURRENT_ENV` wins (read
+    via envcompat), then
+    ``EngineConfig.gpu_box_max_concurrent``.
+
+    Precedence is PER ENTRY, not per map: an env that names box-c overrides
+    box-c and leaves box-b's configured ceiling standing. Whole-map replacement
+    would mean an operator adding one machine to the variable silently REMOVES
+    every other machine's ceiling — and silently raising a ceiling is the one
+    direction this knob must never move by accident.
+
+    ``box`` is the PHYSICAL box identity (``gpu_model_lease.default_box_id()``,
+    e.g. ``box-b``) — the name ``avoid_box``/``force_box`` place against, NOT the
+    per-project lane label (``box-b-gpu``): every project's lane on a machine
+    shares one card, so the ceiling is one per machine, not one per lane.
+
+    A box nobody named returns ``None`` and keeps today's behaviour exactly.
+
+    NONSENSE IS IGNORED, NEVER OBEYED. 0, a negative, an unparseable value — all
+    return ``None`` rather than a ceiling. A ceiling of 0 would be a GPU lane that
+    claims nothing, silently, forever, on a machine the operator believes is
+    working; a typo in an env var must not be able to do that (the standing rule
+    is NEVER PARK — a box is shed or capped, never idled by accident)."""
+    raw = env_get(BOX_MAX_CONCURRENT_ENV)
+    if raw and raw.strip():
+        ceilings = _parse_box_ceilings(raw)
+        # A named entry is the more specific statement; the bare integer is the
+        # fleet default carried in the same variable.
+        hit = ceilings.get(box, ceilings.get(_THIS_BOX))
+        if hit is not None:
+            return hit
+    try:
+        configured = getattr(get_config(), "gpu_box_max_concurrent", None) or {}
+        val = configured.get(box)
+        if val is None:
+            return None
+        n = int(val)
+    except Exception:
+        # A host that wired a nonsense value (a string, a None, a broken mapping)
+        # gets today's behaviour, not a parked lane.
+        return None
+    return n if n > 0 else None
+
+
+# Worker capacity heartbeat refresh cadence. A host's queue gauge may treat a row
 # whose ``last_seen`` is older than 30 s as stale, so a 10 s refresh keeps us
 # comfortably inside that window.
 HEARTBEAT_INTERVAL_S = 10.0
@@ -261,10 +484,15 @@ HEARTBEAT_INTERVAL_S = 10.0
 # draw from ``ingest_jobs`` and need migration 0008 (the ``args`` column + the
 # relaxed queue CHECK that lets host-defined queue names exist — without it a
 # custom-queue row can't be inserted). A claim worker WAITS for its version
-# before polling — the orchestrator owns the migration run (``db.bootstrap`` takes
-# no advisory lock), the workers must not race it.
+# before polling — the orchestrator owns the migration run (``db.bootstrap``
+# serializes concurrent bootstraps with an advisory lock), the workers wait for it.
 _NODE_REQUIRED_VERSION = 6
 _INGEST_REQUIRED_VERSION = 8
+# The gpu lane needs 0028: its claim names ``context_length`` on EVERY claim (that is
+# how a box that cannot state its window is kept off sized rows), so a gpu worker on an
+# older schema would fail every claim instead of taking work. It waits for the
+# orchestrator's migration run, exactly as the download lane waits for 0025.
+_GPU_REQUIRED_VERSION = 29
 # The download lane needs the 0025 CHECK drop: before it, a download row cannot
 # even be INSERTed (the cpu/gpu CHECK rejects it), so a download worker on an
 # older schema would poll a queue that can never hold work.
@@ -292,12 +520,12 @@ def predict_default_kind(
 
     Mirrors ``llm_backends.factory.resolve_for_job``'s no-preference default so the
     kind the arbiter COUNTS is the kind dispatch will USE: a warm vLLM is the box's
-    active server and wins the default (6931668 — anything else feeds a second
+    active server and wins the default (anything else feeds a second
     model copy); otherwise the box's configured default via the factory's TTL
-    cache. D2's lesson holds: ``warm_servers`` is state the caller already probed
+    cache. The rule holds: ``warm_servers`` is state the caller already probed
     for the affinity sort, and the cache means no per-claim DB read. NEVER raises —
     a control-plane hiccup degrades to the engine default rather than parking the
-    claim loop. A wrong prediction is not a lost job: the D4 re-stamp corrects the
+    claim loop. A wrong prediction is not a lost job: the dispatch-time re-stamp corrects the
     row when dispatch lands elsewhere."""
     try:
         if worker_control.SERVER_TYPE_VLLM in set(warm_servers or ()):
@@ -316,7 +544,7 @@ def budget_for(job: dict) -> int:
       * any other GPU job → 8100 s;
       * a download node-job (migration 0025) → 3600 s;
       * built-in fetch / load ingest jobs → their generous sweep budgets;
-      * any other (host-defined, G1) ingest queue → ``config.ingest_default_budget_s``;
+      * any other (host-defined) ingest queue → ``config.ingest_default_budget_s``;
       * an input node (``node_module`` starts ``__input__``) → 120 s;
       * any other CPU job → 2100 s.
     """
@@ -332,7 +560,7 @@ def budget_for(job: dict) -> int:
     if queue == "load":
         return LOAD_BUDGET_S
     if queue not in _NODE_QUEUES:
-        # host-defined ingest queue (G1) — configurable default budget.
+        # host-defined ingest queue — configurable default budget.
         return get_config().ingest_default_budget_s
     if (job.get("node_module") or "").startswith("__input__"):
         return INPUT_BUDGET_S
@@ -378,9 +606,8 @@ class LeaseRenewer:
 
     def _renew_once(self) -> bool:
         try:
-            # Ingest leases go through the db_backend seam so a redis-backed
-            # ingest job renews on redis; the seam's pg path is the identical
-            # ``ingest_jobs`` UPDATE this used to run inline. DAG node-job leases
+            # Ingest leases go through the ingest_store seam; it runs the
+            # identical ``ingest_jobs`` UPDATE this used to run inline. DAG node-job leases
             # (``workflow_node_jobs``) stay on the direct-PG path, unchanged.
             if self._table == "ingest_jobs":
                 return ingest_store.renew_ingest_lease(
@@ -417,7 +644,7 @@ def _clear_busy_ghost(host_label: str | None, queue: str | None) -> None:
     exit (Part C). ``os._exit`` skips ``_run_node``'s ``finally`` — so
     ``ModelCache.mark_idle`` and the heartbeat refresh never run, and the worker's
     last ``worker_heartbeats`` row keeps advertising a ``current_model`` even
-    though the process is dead, inflating Rails' "N/M GPU busy" gauge (the user's
+    though the process is dead, inflating a host's "N/M GPU busy" gauge (e.g.
     "3/2 GPU busy" after a kill). Null it out + age ``last_seen`` past the gauge's
     30 s window so the dead worker drops out at once. Swallows everything — a hung
     DB write must NEVER block the hard-exit. No-op when the worker identity wasn't
@@ -494,7 +721,7 @@ def _fail_job_and_exit(
         if table == "ingest_jobs":
             # Ingest job: no parent run, no dispatch-event outbox — just mark
             # the row failed so a reclaim/operator sees it. Routed through the
-            # db_backend seam so a redis-backed ingest job is failed on redis.
+            # ingest_store seam, like every ingest call site.
             ingest_store.mark_ingest_failed(job_id, error=error)
         else:
             # DAG node-job: mark failed + write the dispatch-event row in ONE
@@ -581,7 +808,7 @@ def _watchdog_trip(
     Policy:
 
       * DAG node-job (``workflow_node_jobs``): read the row's current
-        ``watchdog_retries`` (migration 0010). If it's ``< AI_LEADS_WATCHDOG_MAX_
+        ``watchdog_retries`` (migration 0010). If it's ``< QUEUE_WORKFLOWS_WATCHDOG_MAX_
         RETRIES`` (default 3) the trip is treated as a TRANSIENT wedge —
         :func:`_requeue_job_and_exit` re-queues the node + retries it on a fresh
         worker, and the RUN stays alive. Once the counter has reached the cap the
@@ -661,7 +888,7 @@ def _watchdog_trip(
 class Watchdog:
     """Daemon thread enforcing a wall-clock budget on a single running job. On
     trip: route through :func:`_watchdog_trip` — for a DAG node-job, RE-QUEUE it
-    for a retry on a fresh worker under the cap (``AI_LEADS_WATCHDOG_MAX_RETRIES``,
+    for a retry on a fresh worker under the cap (``QUEUE_WORKFLOWS_WATCHDOG_MAX_RETRIES``,
     default 3), then mark failed once the cap is reached; for an ingest job, mark
     failed — then call ``on_exit`` (default: hard ``os._exit``). A hard exit kills
     exactly the over-budget job.
@@ -713,7 +940,7 @@ class Watchdog:
         )
         # Re-queue-with-cap (DAG node-jobs) for uniformity with the no-progress /
         # health watchdogs: a CPU over-budget MAY be a genuine runaway, but the
-        # cap bounds it either way — at most AI_LEADS_WATCHDOG_MAX_RETRIES retries
+        # cap bounds it either way — at most QUEUE_WORKFLOWS_WATCHDOG_MAX_RETRIES retries
         # then the run fails. Ingest over-budget still marks failed (no run to
         # keep alive) — _watchdog_trip branches on the table.
         _watchdog_trip(
@@ -736,8 +963,8 @@ class Watchdog:
 #: wedged before it trips on a no-beat timeout (Part A — gate the trip on the
 #: physical signal). A few samples spaced ``STALL_CONFIRM_POLL_S`` apart so a
 #: single noisy reading can't flip the verdict either way.
-STALL_CONFIRM_SAMPLES = _env_int("AI_LEADS_STALL_CONFIRM_SAMPLES", 3)
-STALL_CONFIRM_POLL_S = _env_float("AI_LEADS_STALL_CONFIRM_POLL_S", 1.0)
+STALL_CONFIRM_SAMPLES = _env_int("QUEUE_WORKFLOWS_STALL_CONFIRM_SAMPLES", 3)
+STALL_CONFIRM_POLL_S = _env_float("QUEUE_WORKFLOWS_STALL_CONFIRM_POLL_S", 1.0)
 
 
 class StallWatchdog:
@@ -772,7 +999,7 @@ class StallWatchdog:
         confirmation window — genuinely "doing nothing" — does it trip.
 
     On a confirmed trip :func:`_watchdog_trip` RE-QUEUES the node for a retry on a
-    fresh worker (run stays alive) under the cap (``AI_LEADS_WATCHDOG_MAX_RETRIES``,
+    fresh worker (run stays alive) under the cap (``QUEUE_WORKFLOWS_WATCHDOG_MAX_RETRIES``,
     default 3), then marks it failed once the cap is reached, hard-exiting in
     either case. ``beat`` is tolerant of extra args so it can be wired straight in
     as a node ``status_callback``.
@@ -782,7 +1009,14 @@ class StallWatchdog:
     :class:`GpuHealthWatchdog` uses, so the two watchdogs' "is this worker idle?"
     verdict is consistent. Tests feed fakes + a tight confirmation window.
     ``host_label`` / ``queue`` are threaded so the trip path can clear this
-    worker's ``current_model`` busy-ghost on hard-exit (Part C)."""
+    worker's ``current_model`` busy-ghost on hard-exit (Part C).
+
+    ``confirm_idle=False`` is the POOL lane's mode: the beat gap alone trips and the
+    samplers are never read. A pool job's GPU work happens in the ollama / vLLM
+    container, so this container reads idle + static whether the generation is
+    streaming or wedged — the confirmation would always say "wedged" and adds nothing
+    but a delay. There, the node's beat (one per streamed chunk) IS the progress
+    signal."""
 
     def __init__(
         self, *, job_id: str, stall_timeout_s: float = STALL_TIMEOUT_S,
@@ -797,6 +1031,7 @@ class StallWatchdog:
         ram_sampler: Callable[[], int | None] | None = None,
         host_label: str | None = None,
         queue: str | None = None,
+        confirm_idle: bool = True,
     ) -> None:
         if table not in _LEASE_TABLES:
             raise ValueError(f"stall-watchdog table must be in {sorted(_LEASE_TABLES)}, got {table!r}")
@@ -810,7 +1045,8 @@ class StallWatchdog:
         self._ram_delta_mb = int(ram_delta_mb)
         self._confirm_samples = max(1, int(confirm_samples))
         self._confirm_poll_s = float(confirm_poll_s)
-        if gpu_sampler is None or ram_sampler is None:
+        self._confirm_idle = bool(confirm_idle)
+        if self._confirm_idle and (gpu_sampler is None or ram_sampler is None):
             from queue_workflows import gpu_health
             gpu_sampler = gpu_sampler or gpu_health.gpu_util_pct
             ram_sampler = ram_sampler or gpu_health.container_ram_mb
@@ -854,8 +1090,9 @@ class StallWatchdog:
                 deadline = self._deadline
             if deadline is not None and time.monotonic() >= deadline:
                 # No beat for the window — but that ALONE doesn't mean wedged.
-                # Confirm against the physical GPU/RAM signal before tripping.
-                if self._confirm_wedged():
+                # Confirm against the physical GPU/RAM signal before tripping, unless
+                # this container has no physical signal to offer (the pool lane).
+                if not self._confirm_idle or self._confirm_wedged():
                     self._trip()
                     return
                 # Busy / loading / preparing — a false alarm. Re-arm the window
@@ -940,12 +1177,19 @@ class StallWatchdog:
         return False
 
     def _trip(self) -> None:
-        err = (
-            f"no progress for {int(self._stall_timeout_s)}s (no GPU step beat) "
-            f"AND confirmed GPU-idle + static-RAM — stall watchdog hard-stopped "
-            f"a wedged worker"
-        )
-        # Transient-wedge detector (the user's reconstruct/beat_keyframes case):
+        if self._confirm_idle:
+            err = (
+                f"no progress for {int(self._stall_timeout_s)}s (no GPU step beat) "
+                f"AND confirmed GPU-idle + static-RAM — stall watchdog hard-stopped "
+                f"a wedged worker"
+            )
+        else:
+            err = (
+                f"no progress beat for {int(self._stall_timeout_s)}s from a pool-lane "
+                f"node (its declared POOL_STALL_TIMEOUT_S) — stall watchdog "
+                f"hard-stopped the worker so the stuck request actually ends"
+            )
+        # Transient-wedge detector (a long multi-step node that wedges once):
         # re-queue + retry on a fresh worker under the cap, then fail.
         _watchdog_trip(
             job_id=self._job_id, table=self._table, error=err,
@@ -983,7 +1227,7 @@ class GpuHealthWatchdog:
     swap), the job is HEALTHY: the window resets and it keeps running, no matter
     how long. On trip it routes through :func:`_watchdog_trip` (the same policy as
     the other watchdogs): RE-QUEUE the node for a retry on a fresh worker under
-    the cap (``AI_LEADS_WATCHDOG_MAX_RETRIES``, default 3) so the run stays alive,
+    the cap (``QUEUE_WORKFLOWS_WATCHDOG_MAX_RETRIES``, default 3) so the run stays alive,
     then mark failed once the cap is reached — hard-exiting in either case.
 
     Arming: the watchdog arms AT job start (:meth:`start`) with a generous
@@ -1250,7 +1494,7 @@ class JobStatusWatcher:
 
 class HeartbeatEmitter:
     """Daemon thread that keeps this worker's ``worker_heartbeats`` row fresh so
-    Rails' queue gauge sees the fleet's real capacity.
+    a host's queue gauge sees the fleet's real capacity.
 
     Claim-worker shape:
 
@@ -1267,7 +1511,7 @@ class HeartbeatEmitter:
       * ingest workers (fetch/load + any host-defined queue) also heartbeat —
         migration 0008 dropped the cpu/gpu-only CHECK — reporting
         ``current_model=None`` so a host's queue gauge shows their liveness.
-      * honours ``AI_LEADS_DISABLE_WORKER_HEARTBEAT`` (tests).
+      * honours ``QUEUE_WORKFLOWS_DISABLE_WORKER_HEARTBEAT`` (tests).
 
     Upserts once on :meth:`start` (so the row exists immediately) then refreshes
     every ``interval_s`` until :meth:`stop`."""
@@ -1280,11 +1524,17 @@ class HeartbeatEmitter:
         on_tick: Callable[[], None] | None = None,
         occupant_fn: Callable[[], str | None] | None = None,
         known_models_fn: Callable[[list[str]], list[str]] | None = None,
+        llm_context_fn: Callable[[], tuple[int | None, int | None]] | None = None,
+        residents_fn: Callable[[], set[str] | None] | None = None,
     ) -> None:
         # Narrows the DECLARED registry to what this box was OBSERVED to hold. The
         # gpu worker supplies one; default is identity, so a standalone emitter (and
         # every cpu/ingest worker, which observes no models) behaves exactly as before.
         self._known_models_fn = known_models_fn or (lambda declared: list(declared))
+        # What this box's LLM SERVERS were observed to hold this tick, or None for "not
+        # observed". Only the gpu worker supplies one; unset means current_model behaves
+        # exactly as it always did.
+        self._residents_fn = residents_fn
         # Extra per-tick hook (gpu worker: renew/release the box-wide model lease
         # by observed residency). Best-effort; a failure never stops the heartbeat.
         self._on_tick = on_tick
@@ -1308,9 +1558,13 @@ class HeartbeatEmitter:
         # occupant (gpu worker wires this to its held slot). Without it a
         # self-managing render heartbeats current_model=NULL and the panel shows
         # an idle box doing minutes of GPU work; with the old fallback it showed
-        # the LLM's model instead, which is the lie the operator caught
-        # ("why still loaded ollama when render_blender is running?").
+        # the LLM's model instead — reporting ollama as loaded while a render runs.
         self._occupant_fn = occupant_fn
+        # The CONTEXT WINDOW pair (migration 0028): what this box's LLM server serves
+        # now, and the biggest it could switch to within its free memory. The GPU
+        # worker wires it; every other lane publishes (None, None) — a cpu box has no
+        # window, and a sized job must never be routed to one.
+        self._llm_context_fn = llm_context_fn
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         # Cached total-VRAM probe (stable hardware property; sampled once).
@@ -1325,30 +1579,68 @@ class HeartbeatEmitter:
         return not bool(env_get("QUEUE_WORKFLOWS_DISABLE_WORKER_HEARTBEAT"))
 
     def _current_model(self) -> str | None:
-        """The GPU busy signal: the warm-model slot, read live each tick — or,
-        when no in-process model is loaded, the box occupant rendered for humans
-        ("GPU job: render_blender_reel"). NULL for CPU and a genuinely idle GPU.
+        """The MODEL on this box's card: the warm-model slot, read live each tick, or
+        the box lease's occupant when that occupant IS a model. NULL for CPU, for a
+        genuinely idle GPU, and for every SENTINEL occupant.
 
-        A DISPLAY value, deliberately: claim affinity passes its own
-        ``current_model`` at claim time and never reads this row back, so a
-        human-readable occupant here cannot perturb placement.
+        A field called ``current_model`` carries a model id or nothing. The LLM slot was
+        excluded here from the start — "the server's OWN model reporting already covers
+        it, and 'LLM server' beside 'chat-model-a:latest' would double-report one
+        occupant" — and that reason holds for every sentinel: a ComfyUI render and a
+        self-managing node are OCCUPANCY, not models. Publishing one made an operator
+        panel show "MODEL GPU job: render_report" beside the real model and warn
+        of two residents contending for VRAM; what the box is DOING is already on the
+        card as its running jobs.
         """
         if self._queue != "gpu":
             return None
-        model = getattr(self._model_cache, "current_model", None)             if self._model_cache is not None else None
-        if model:
+        model = getattr(self._model_cache, "current_model", None) \
+            if self._model_cache is not None else None
+        if model and self._box_still_holds(model):
             return model
         occupant = self._occupant_fn() if self._occupant_fn is not None else None
-        if occupant:
-            from queue_workflows.gpu_model_lease import (
-                LLM_SERVER_SLOT, describe_slot,
-            )
-            # The LLM slot stays NULL here: the server's OWN model reporting
-            # already covers it, and "LLM server" beside "chat-model-a:latest" would
-            # double-report one occupant.
-            if occupant != LLM_SERVER_SLOT:
-                return describe_slot(occupant)
+        from queue_workflows.gpu_model_lease import is_sentinel_slot
+
+        if occupant and not is_sentinel_slot(occupant) \
+                and self._box_still_holds(str(occupant)):
+            return str(occupant)
         return None
+
+    def _box_still_holds(self, model: str) -> bool:
+        """Is the warm slot still RESIDENCY, or did it outlive the model?
+
+        For a model the worker loads itself (``ModelSpec.served_by`` empty) the cache IS
+        the observation — it holds the weights in this process, and no server can vouch
+        for it. For a model served by ollama or vLLM the cache is only a claim: the five
+        minute keep-alive, or another lane loading something else, evicts the model while
+        the slot stands until the cache's own idle TTL. A box that kept advertising it
+        made an operator panel warn of two models contending for one GPU.
+
+        Ignorance is never evidence of absence: no seam wired, a registry or probe that
+        raises, or an observation that has not happened yet all leave the old answer."""
+        if self._residents_fn is None:
+            return True
+        from queue_workflows import model_registry
+        from queue_workflows.model_catalog import canonical_tag
+
+        try:
+            want = canonical_tag(str(model))
+            served = {canonical_tag(str(i)) for i in model_registry.server_served_ids()}
+            if want not in served:
+                return True                      # in-process: the cache is the proof
+            residents = self._residents_fn()
+            if residents is None:
+                return True                      # not observed — not "absent"
+            # A role tag is SERVED BY an artifact (0027: `<role>-v<N>-<precision>-<server>`),
+            # and a box can hold both spellings. Either vouches for the role.
+            from queue_workflows.model_catalog import artifact_role
+
+            return any(canonical_tag(str(r)) == want or artifact_role(str(r)) == want
+                       for r in residents)
+        except Exception:
+            log.debug("[claim-worker:%s] residency check failed for %s — publishing it "
+                      "as before", self._queue, model, exc_info=True)
+            return True
 
     def _concurrency(self) -> int:
         """The advertised capacity for this tick — the historical constant 1
@@ -1410,7 +1702,7 @@ class HeartbeatEmitter:
             from queue_workflows import model_registry
             known = model_registry.known_ids()
             vram_total = self._vram_total_mb()
-            # PROBE BEFORE READING (round-2 audit, HIGH). The servers probe WRITES
+            # PROBE BEFORE READING. The servers probe WRITES
             # the state the concurrency read derives from (_box_served feeds
             # _gpu_slot_budget), and kwargs evaluate left-to-right — so putting the
             # probe after the read published tick N-1's concurrency with tick N's
@@ -1423,6 +1715,17 @@ class HeartbeatEmitter:
             # above records, one field over.
             known = self._known_models_fn(known)
             concurrency = self._concurrency()
+            # ...and the window AFTER the servers probe too, for the same reason: the
+            # probe is what establishes which kinds this box serves, and the window is
+            # read per serving kind. One row must describe one observation.
+            kwargs: dict[str, Any] = {}
+            if self._llm_context_fn is not None:
+                # NAMED ONLY BY A LANE THAT HAS A WINDOW. A cpu/ingest worker of this
+                # engine can start against a database the orchestrator has not migrated
+                # to 0028 yet, and a heartbeat naming columns that do not exist would
+                # flag the whole lane dead over a field it never uses.
+                kwargs["llm_context_length"], kwargs["llm_context_max"] = \
+                    self._llm_context()
             node_queue.upsert_worker_heartbeat(
                 host_label=self._host_label,
                 queue=self._queue,
@@ -1432,9 +1735,27 @@ class HeartbeatEmitter:
                 llm_servers_available=servers,
                 vram_total_mb=vram_total,
                 fits_models=self._fits_models(known, vram_total),
+                **kwargs,
             )
         except Exception:
             log.exception("[claim-worker:%s] heartbeat upsert failed", self._queue)
+
+    def _llm_context(self) -> tuple[int | None, int | None]:
+        """``(serves_now, could_switch_to)`` in tokens, or ``(None, None)``.
+
+        Unknown is a first-class answer and the SAFE one: the claim refuses a sized job
+        to a box that cannot state its window (silent truncation is the alternative),
+        and the fleet sweep tags a job no box can reach. So a probe that fails publishes
+        unknown rather than a guess — and never breaks the heartbeat."""
+        if self._llm_context_fn is None:
+            return None, None
+        try:
+            serving, ceiling = self._llm_context_fn()
+        except Exception:
+            log.exception("[claim-worker:%s] llm context probe failed — publishing "
+                          "unknown", self._queue)
+            return None, None
+        return serving, ceiling
 
     def _llm_servers(self) -> list[str]:
         """The OBSERVED llm capability to advertise this tick. Prefer the injected
@@ -1491,8 +1812,8 @@ class HeartbeatEmitter:
 #: ``download`` (migration 0025) is the width-capped network-WAIT lane — node
 #: family (lease/watchdog/outbox, ``node_job_ready`` wake), never ingest.
 _NODE_QUEUES = frozenset({"cpu", "gpu", "download"})
-#: Default ingest queues (ai_leads byte-compat). The LIVE ingest set is
-#: ``config.ingest_queues`` (host-configurable, G1); any queue NOT in
+#: Default ingest queues. The LIVE ingest set is
+#: ``config.ingest_queues`` (host-configurable); any queue NOT in
 #: ``_NODE_QUEUES`` is treated as ingest-family (draws from ``ingest_jobs``).
 _DEFAULT_INGEST_QUEUES = frozenset({"fetch", "load"})
 
@@ -1502,7 +1823,7 @@ def _probe_gpu_usable() -> bool | None:
 
     * ``True``  — a CUDA device is usable right now.
     * ``False`` — torch imports but reports NO usable device (incl. a probe that
-      raises, e.g. ``Can't initialize NVML``). THIS is the box-c post-recreate
+      raises, e.g. ``Can't initialize NVML``). THIS is the post-recreate
       blind condition: the worker image always ships torch, the HOST GPU is
       healthy, but the container's device cgroup was not injected.
     * ``None``  — torch is not importable at all. NOT the blind condition (a GPU
@@ -1715,7 +2036,7 @@ class ClaimWorker:
                                     persist_path=_persist,
                                     drain_timeout_s=_drain_s,
                                     warm_timeout_s=_warm_s)
-        # CAPABILITY GATE on resume (found live): a ROCm box with no vLLM (its
+        # CAPABILITY GATE on resume: a ROCm box with no vLLM (its
         # topology has no distinct vllm URL) resumed a persisted vllm switch and
         # sat OUT OF SERVICE warming a server that can never exist.
         if (self._switch.target == "vllm"
@@ -1803,9 +2124,15 @@ class ClaimWorker:
             # gpu: renew/release the box-wide model lease by observed residency.
             on_tick=(self._box_lease_tick if self.queue == "gpu" else None),
             # gpu: when no in-process model is loaded, the gauge shows the box
-            # occupant instead ("GPU job: render_blender_reel") — a self-managing
+            # occupant instead ("GPU job: render_scene") — a self-managing
             # render used to heartbeat NULL and read as an idle box.
             occupant_fn=((lambda: self._box_held_model) if self.queue == "gpu" else None),
+            # gpu: the context window this box serves and the one it could switch to
+            # (migration 0028) — the claim filter for sized jobs and the input to the
+            # fleet's unassignable sweep. Other lanes publish nothing: a cpu box has no
+            # window, and a sized job must never route to one.
+            llm_context_fn=(self._observe_llm_context if self.queue == "gpu" else None),
+            residents_fn=(self._observed_residents if self.queue == "gpu" else None),
         )
         # This host's hw-metrics sampler — started in ``run_forever`` ONLY when
         # ``queue == 'gpu'`` (one gpu container per host ⇒ one sampler per host).
@@ -1856,7 +2183,7 @@ class ClaimWorker:
     @property
     def _is_ingest(self) -> bool:
         # __init__ validated queue ∈ _NODE_QUEUES ∪ config.ingest_queues, so any
-        # non-node queue is a (host-configured) ingest queue (G1).
+        # non-node queue is a (host-configured) ingest queue.
         return self.queue not in _NODE_QUEUES
 
     # ── claim ────────────────────────────────────────────────────────────
@@ -1870,7 +2197,7 @@ class ClaimWorker:
         already awake. A separate poller would drift out of step with `advertised` and
         publish capability for a server the heartbeat had already written off.
 
-        Runs HERE, in the claim worker, and that is not incidental: measured on a live box,
+        Runs HERE, in the claim worker, and that is not incidental: in a common topology,
         the claim container resolves the LLM endpoint while the orchestrator container on
         the SAME box cannot (no host-gateway), so publishing from there would write an
         EMPTY catalog for a healthy box — and `best_match` treats unknown as cannot-serve,
@@ -1911,10 +2238,8 @@ class ClaimWorker:
         """Record WHICH BYTES this claim will run — the artifact tag behind the role.
 
         ``resolved_model`` answers "which role" and is deliberately a stable tag
-        (promotions re-point it), so it can never answer "which weights". Measured in a
-        consumer deployment: the `chat-expert-a` role served a GGUF built
-        from a void merge — the untuned base — for eight days, and every job row
-        truthfully recorded the role name throughout. This stamp is the per-job antidote:
+        (promotions re-point it), so it can never answer "which weights". A role tag can
+        point at the wrong build while every job row truthfully records only the role name. This stamp is the per-job antidote:
         the immutable artifact tag, derived from THIS box's own digest observation at the
         moment of the claim (migration 0027).
 
@@ -1963,12 +2288,14 @@ class ClaimWorker:
             # ONLY server-served ids are narrowed. The observation comes from ollama
             # /api/tags + vLLM /v1/models, so an in-process model can never appear in it
             # and filtering against it would delete that model from every box at once.
-            return narrow_to_observed(
+            narrowed = narrow_to_observed(
                 declared, getattr(self, "_observed_model_ids", ()) or (),
                 narrowable=model_registry.server_served_ids())
         except Exception:
             log.debug("[model-catalog] narrowing skipped", exc_info=True)
-            return list(declared or [])
+            narrowed = list(declared or [])
+        # ...and then by what this box could LOAD right now (see _narrow_by_memory).
+        return self._narrow_by_memory(narrowed)
 
     def _probe_llm_servers(self) -> list[str]:
         """OBSERVED, GPU-verified llm capability for THIS gpu box's heartbeat.
@@ -2014,15 +2341,19 @@ class ClaimWorker:
         self._llm_gpu_ok = gpu_ok
         # Advertise only a GPU-usable server; a CPU-bound one reads as "no server".
         observed = servers if gpu_ok else []
-        # DEBOUNCE (round-2 audit, HIGH). One timed-out probe used to collapse the
+        # DEBOUNCE. One timed-out probe used to collapse the
         # set for a tick — and everything hangs off it: _gpu_slot_budget dropped
         # 3→1, the DB-side arbiter refused every new claim against jobs admitted at
         # 3, and peers read the flap through the defer ranking. A kind JOINS on
         # first sighting (a server that answers is up); it LEAVES only after
         # _SERVED_DEBOUNCE_MISSES consecutive missed probes (a server that missed
-        # once is usually just busy). Same rule _refresh_box_llm_state already
-        # applies to the warm snapshot, now applied to the far more consequential
-        # served set. The ONLY-GPU claim gate (_llm_gpu_ok) stays UNdebounced —
+        # once is usually just busy). The same rule guards RESIDENCY
+        # (RESIDENT_ABSENT_MISSES), for the same reason: neither collector can tell a
+        # timed-out endpoint from an idle one. This comment used to cite
+        # _refresh_box_llm_state as already debouncing the warm snapshot — it did not,
+        # it only kept the last answer on a RAISE the collector never performs, and a
+        # later guard was built on that misreading.
+        # The ONLY-GPU claim gate (_llm_gpu_ok) stays UNdebounced —
         # a CPU-fallback must stop LLM claims immediately.
         misses = getattr(self, "_served_miss_counts", None)
         if misses is None:
@@ -2040,6 +2371,16 @@ class ClaimWorker:
                     misses.pop(kind, None)
         advertised = [k for k in (worker_control.SERVER_TYPE_OLLAMA,
                                   worker_control.SERVER_TYPE_VLLM) if k in stable]
+        # ONE SERVING KIND. The switch to vLLM unloads ollama's MODELS, not its daemon,
+        # so after a switch both servers answer their probes and this box used to
+        # advertise BOTH. An ollama-only job then passed the preference gate, landed
+        # here, and its first request loaded a second copy of the same model
+        # into the idle daemon beside vLLM's pool — the box hit full memory and froze.
+        # vLLM pins its weights for its whole lifetime, so while it
+        # serves it is the only kind offered; ollama is still in the debounced set and
+        # returns the moment vLLM is gone.
+        if worker_control.SERVER_TYPE_VLLM in advertised:
+            advertised = [worker_control.SERVER_TYPE_VLLM]
         # Feed the 0022 claim-side preference gate from the SAME observation the
         # heartbeat advertises, so "what this box says it serves" and "what it will
         # claim" can never disagree. Empty ⇒ gate off (claim-any), by design.
@@ -2103,13 +2444,22 @@ class ClaimWorker:
         observer, so it owns the observation and the claim just reads the result.
 
         Uses the SAME collector as the residency enforcer and the load gate
-        (``model_residency.probe_box_residents``) so all three see the box
-        identically. Best-effort: on any failure the previous snapshot is kept
-        rather than blanked, since a single flaky probe should not un-warm the box."""
+        (``model_residency.probe_box_residents``) so all three see the box identically.
+
+        That collector NEVER RAISES — "a dead endpoint contributes nothing", and each leg
+        swallows a timeout to an empty list — so the ``except`` below is not the guard it
+        looks like: a box whose ollama times out reports the same nothing as a box whose
+        ollama is merely idle. Presence is therefore trusted immediately and ABSENCE is
+        debounced: a model already seen must be missing from
+        :data:`RESIDENT_ABSENT_MISSES` consecutive snapshots before it is dropped. Per
+        MODEL, not per snapshot, because a box running two kinds where only one answers
+        returns a non-empty list, which no emptiness test can catch. Same rule, same
+        reason, as ``_probe_llm_servers``' served-set debounce."""
         servers: list[str] = []
         models: list[str] = []
+        held: set[str] = set()
         try:
-            from queue_workflows import model_residency
+            from queue_workflows import llm_probe, model_residency
 
             for r in model_residency.probe_box_residents(
                 inprocess_model=getattr(self.model_cache, "current_model", None),
@@ -2118,6 +2468,11 @@ class ClaimWorker:
                     servers.append(r.server)
                 if r.model and r.model not in models:
                     models.append(r.model)
+                # What a SERVER was seen holding — the heartbeat's evidence that its warm
+                # slot is still residency. The in-process leg is excluded deliberately:
+                # it IS that slot, echoed back, and a claim cannot be its own witness.
+                if r.model and r.server != llm_probe.INPROCESS:
+                    held.add(str(r.model))
         except Exception:
             log.debug(
                 "[claim-worker:gpu] warm-residency probe failed; keeping the last "
@@ -2125,6 +2480,652 @@ class ClaimWorker:
             )
             return
         self._box_warm = (servers, models)
+        self._ctx_residents = self._debounce_residents(held)
+
+    #: How many consecutive snapshots a model must be MISSING before the box stops
+    #: vouching for it. The collector cannot tell "idle" from "did not answer", and
+    #: ollama's own keep-alive is five minutes, so three ~10 s ticks expires a genuine
+    #: eviction inside 30 s while no single timed-out probe can blank a live model.
+    RESIDENT_ABSENT_MISSES = 3
+
+    def _debounce_residents(self, seen: set[str]) -> set[str]:
+        """This tick's residents, with absence held for ``RESIDENT_ABSENT_MISSES``."""
+        misses: dict[str, int] = self.__dict__.setdefault("_ctx_resident_misses", {})
+        previous: set[str] = getattr(self, "_ctx_residents", None) or set()
+        for model in seen:
+            misses.pop(model, None)
+        held = set(seen)
+        for model in previous - seen:
+            n = misses.get(model, 0) + 1
+            if n < self.RESIDENT_ABSENT_MISSES:
+                misses[model] = n
+                held.add(model)          # not yet evidence of absence
+            else:
+                misses.pop(model, None)
+        return held
+
+    # ── the context window (migration 0028) ──────────────────────────────────
+
+    #: The last observed ``(serves_now, could_switch_to)``. Class-level so the claim
+    #: path can read it before the first heartbeat tick has run.
+    _llm_context_state: tuple[int | None, int | None] = (None, None)
+    #: The last model seen loaded on this box's ollama — what the ceiling is computed
+    #: for once the runner has been unloaded (an idle box reports no runner at all).
+    _ctx_last_model: str | None = None
+
+    @property
+    def _ctx_model_info(self) -> dict:
+        cache = self.__dict__.get("_ctx_model_info_cache")
+        if cache is None:
+            cache = self.__dict__["_ctx_model_info_cache"] = {}
+        return cache
+
+    @property
+    def _ctx_last_window(self) -> dict:
+        """The last window each kind was OBSERVED serving. ollama only: a stopped vLLM
+        means the server is gone, and remembering its window would route sized jobs at
+        nothing (see :meth:`_llm_context_for_kind`)."""
+        cache = self.__dict__.get("_ctx_last_window_cache")
+        if cache is None:
+            cache = self.__dict__["_ctx_last_window_cache"] = {}
+        return cache
+
+    @property
+    def _ctx_per_token_seen(self) -> dict:
+        """The cache cost per token OBSERVED on a loaded runner, per model — what the
+        admission gate estimates a load by once that runner is gone."""
+        cache = self.__dict__.get("_ctx_per_token_cache")
+        if cache is None:
+            cache = self.__dict__["_ctx_per_token_cache"] = {}
+        return cache
+
+    @property
+    def _ctx_ceiling_by_kind(self) -> dict:
+        """Per-kind ceilings, kept across a server going DOWN: a stopped vLLM reports
+        nothing, and the window to start it back at has to come from somewhere."""
+        cache = self.__dict__.get("_ctx_ceiling_cache")
+        if cache is None:
+            cache = self.__dict__["_ctx_ceiling_cache"] = {}
+        return cache
+
+    def _observe_llm_context(self) -> tuple[int | None, int | None]:
+        """``(serves_now, could_switch_to)`` for this box, in tokens — the pair the
+        heartbeat publishes and the claim filters on.
+
+        Read per SERVING KIND and combined conservatively: the window is the SMALLEST
+        any serving kind offers (a sized job may resolve to either, and promising the
+        larger is how a prompt gets silently truncated), the ceiling the largest any
+        could reach. Runs on the heartbeat thread — never on the claim path, which reads
+        the cached pair.
+
+        Best-effort in the honest direction: anything it cannot establish is ``None``,
+        and a kind it cannot GROW (no lever, the kill switch, a resize quarantine after
+        a failed attempt) has its ceiling pinned to what it serves — the fleet must not
+        wait for a switch that will not happen."""
+        state: tuple[int | None, int | None] = (None, None)
+        try:
+            served = [k for k in self._served_llm_types() if k]
+            currents: list[int | None] = []
+            ceilings: list[int] = []
+            for kind in served:
+                current, ceiling = self._llm_context_for_kind(kind)
+                currents.append(current)
+                if ceiling is not None:
+                    ceilings.append(int(ceiling))
+                    self._ctx_ceiling_by_kind[kind] = int(ceiling)
+            if served:
+                serving = (None if not currents or any(c is None for c in currents)
+                           else min(int(c) for c in currents))
+                ceiling = max(ceilings) if ceilings else None
+                if serving is not None and ceiling is not None:
+                    ceiling = max(ceiling, serving)
+                state = (serving, ceiling)
+                self._observe_admission(served, serving)
+            if worker_control.SERVER_TYPE_VLLM in served:
+                # The cap it sets applies only while vLLM serves (_pool_parallelism), so
+                # nothing is reset when it leaves — and a stale cap on a vLLM that comes
+                # back before its first observation errs on the safe side.
+                self._observe_vllm_profile()
+        except Exception:
+            log.exception("[claim-worker:gpu] context-window observation failed")
+            state = (None, None)
+        self._llm_context_state = state
+        return state
+
+    #: How many heartbeat ticks a serving vLLM's log is re-read for its startup lines
+    #: before this start is given up on (a TTY container, a rotated log, an older vLLM).
+    _VLLM_PROFILE_ATTEMPTS = 30
+
+    def _observe_vllm_profile(self) -> None:
+        """ONCE per start of the vLLM serving here: read what it holds and what it cost.
+        The concurrency its cache really holds (``GPU KV cache size`` ÷ the window — the
+        metrics gauge first, the log if not) caps this box's PAR from now on; the start's
+        numbers (weights, cache, tokens, pool) are remembered in the catalog under the
+        command line's fingerprint, so the NEXT start is sized to what N requests need
+        rather than to what is free. Runs on the heartbeat thread; never raises."""
+        from queue_workflows import llm_context, llm_context_lever
+
+        kind = worker_control.SERVER_TYPE_VLLM
+        info = llm_context_lever.describe(kind)
+        if not info.exists or not info.running:
+            return
+        key = (info.container_id, info.started_at)
+        if key == self.__dict__.get("_vllm_observed_key"):
+            return
+        attempts = self.__dict__.get("_vllm_profile_attempts") or (None, 0)
+        attempts = (key, attempts[1] + 1) if attempts[0] == key else (key, 1)
+        self.__dict__["_vllm_profile_attempts"] = attempts
+
+        from queue_workflows import llm_probe
+        from queue_workflows.llm_backends import factory as _llm_factory
+
+        window = info.configured or self._ctx_last_window.get(kind) or self._vllm_model_max_context()
+        capacity = llm_probe.vllm_kv_capacity_tokens(_llm_factory.resolve_base_url(kind))
+        profile = llm_context_lever.observe_vllm(total_bytes=llm_context.mem_total_bytes())
+        if profile is not None and capacity is None:
+            capacity = profile.kv_tokens
+        concurrency = llm_context.vllm_concurrency(kv_tokens=capacity, window=window)
+        if concurrency is not None:
+            self.__dict__["_vllm_concurrency"] = concurrency
+        if profile is None:
+            if attempts[1] >= self._VLLM_PROFILE_ATTEMPTS:
+                log.warning("[vllm-plan] %s: vLLM's startup lines were not found in its log "
+                            "after %d reads — no profile of %s here; the next start is sized "
+                            "to what is free, as before", self.host, attempts[1],
+                            info.served_name or info.name)
+                self.__dict__["_vllm_observed_key"] = key
+            return
+        if info.served_name:
+            node_queue.record_llm_profile(self.host, kind, info.served_name,
+                                          profile.as_record(fingerprint=info.fingerprint))
+        self.__dict__["_vllm_observed_key"] = key
+        # Its pool is taken and its cache allocated: from here the memory it holds is a
+        # fact about the box, not a start to be judged (see _vllm_pool_committed).
+        self.__dict__["_vllm_committed_key"] = key
+        self._clear_startup_losses()
+        par = self._pool_parallelism_configured()
+        log.warning(
+            "[vllm-plan] %s: vLLM %s at pool %.2f — weights %.1f GB, cache %.1f GB = %s tokens "
+            "(%.1f KB/token): %d concurrent %s-token request(s) fit (--max-num-seqs %s, "
+            "PAR %d → this box runs %d); profile remembered — the next start is sized to "
+            "what it needs",
+            self.host, info.served_name or info.name, profile.utilization,
+            profile.weights_bytes / 2**30, profile.kv_bytes / 2**30, f"{profile.kv_tokens:,}",
+            profile.per_token_bytes / 1024, int(concurrency or 0),
+            f"{int(window):,}" if window else "?", info.max_num_seqs_now, par,
+            self._pool_parallelism(),
+        )
+
+    def _observed_residents(self) -> set[str] | None:
+        """What this box's SERVERS were last seen holding, or ``None`` for "not observed".
+
+        ONE TICK BEHIND, deliberately. The emitter runs `emit_once()` and then its
+        `on_tick` hook, and the snapshot is taken in that hook because the ROGUE-CONTAINER
+        SWEEP must run before any residency probe — a box must be judged after the guard
+        has cleaned it, or an outsider's model counts as a resident. Moving the probe
+        earlier to publish a freshly-loaded model a tick sooner would invert that, so the
+        lag stands: a model loaded since the last snapshot is published as unknown for one
+        ~10 s tick, which is the safe direction and costs only the panel.
+
+        No probe of its own — this is `_refresh_box_llm_state`'s snapshot, taken on the
+        heartbeat thread each tick with `model_residency.probe_box_residents`, the same
+        collector the residency enforcer and the load gate read "so all three see the box
+        identically". That collector does NOT keep the last answer when a probe fails —
+        it never raises, and every leg swallows a timeout to an empty list, which is
+        indistinguishable from an idle box. Absence is therefore debounced HERE, by
+        :meth:`_debounce_residents`: a model already seen survives
+        :data:`RESIDENT_ABSENT_MISSES` consecutive misses before the box stops vouching
+        for it, so no single flaky tick can blank a live model."""
+        return getattr(self, "_ctx_residents", None)
+
+    def _llm_context_for_kind(self, kind: str) -> tuple[int | None, int | None]:
+        """One serving kind's ``(serves_now, could_switch_to)``."""
+        from queue_workflows import llm_context, llm_context_lever, llm_probe
+        from queue_workflows.llm_backends import factory as _f
+
+        url = _f.resolve_base_url(kind)
+        # A box can only advertise room it could actually use: the kill switch, a
+        # missing lever, or a resize that already failed here all mean "what I serve is
+        # what I reach" — the fleet must not tag nothing and wait for a switch that
+        # cannot happen.
+        can_grow = (not llm_context_lever.disabled()
+                    and llm_context_lever.available(kind)
+                    and not self._switch.resize_quarantined(kind))
+        if kind == worker_control.SERVER_TYPE_VLLM:
+            current = llm_probe.vllm_max_model_len(url)
+            if not can_grow:
+                return current, current
+            ceiling = llm_context.vllm_ceiling(
+                current=current, model_max=_vllm_model_max_context(),
+                kv_capacity_tokens=llm_probe.vllm_kv_capacity_tokens(url))
+            return current, ceiling
+
+        # ollama. The CONFIGURED value wins over any loaded runner: /v1 loads at the
+        # configured default, and a runner another client loaded natively at a bigger
+        # window is undone by our very next call.
+        runners = llm_probe.ollama_runners(url)
+        loaded = runners[0] if runners else None
+        if loaded and loaded.get("name"):
+            self._ctx_last_model = str(loaded["name"])
+        configured = llm_context_lever.describe(kind).configured
+        current = configured
+        if current is None and loaded:
+            current = loaded.get("context_length")
+        if current is None:
+            # IDLED OUT, NOT GONE. ollama's daemon is always up; only the model unloads
+            # (5 min here), and the next request reloads it at the same window. A box
+            # with no lever to ask then has no runner to read either — and publishing
+            # nothing means it can neither claim a sized job nor escape being told it is
+            # unassignable, until some unsized job happens to warm it again. The window
+            # belongs to the DAEMON, so the last one OBSERVED stands until something
+            # contradicts it. Never invented: unknown stays unknown until first sight —
+            # and "seen" survives a restart, because the memory this box wrote to its own
+            # heartbeat is the same observation, one process ago.
+            current = self._ctx_last_window.get(kind) or self._seeded_window(kind)
+        elif current:
+            self._ctx_last_window[kind] = int(current)
+        model = (str(loaded.get("name")) if loaded else None) or self._ctx_last_model
+        model_max = (llm_context.model_info_max_context(
+            self._ollama_model_info(url, model)) if model else None)
+        if current is not None and model_max is not None:
+            # ollama clamps a bigger request to the model's own maximum, so a box
+            # configured beyond it does NOT serve what the number says.
+            current = min(int(current), int(model_max))
+        if not can_grow or model is None:
+            return current, current
+        sizes = self.__dict__.get("_ctx_model_sizes") or llm_probe.ollama_model_sizes(url)
+        weights = sizes.get(model)
+        runner_bytes = int(loaded.get("size") or 0) if loaded else 0
+        per_token = llm_context.kv_bytes_per_token_observed(
+            runner_bytes=runner_bytes, weights_bytes=weights,
+            context_length=(loaded or {}).get("context_length"),
+        ) or llm_context.kv_bytes_per_token_formula(
+            self._ollama_model_info(url, model))
+        ceiling = llm_context.ollama_ceiling(
+            current=current, model_max=model_max, per_token=per_token,
+            weights_bytes=weights, runner_bytes=runner_bytes,
+            available_bytes=llm_context.mem_available_bytes(),
+            reserve_bytes=llm_context.reserve_bytes(),
+        )
+        return current, ceiling
+
+    def _seeded_window(self, kind: str) -> int | None:
+        """This box's own last published window, read back ONCE per process.
+
+        Only for ollama, and only as the memory of last resort: a fresh worker on a box
+        with no lever, whose model is not loaded right now, would otherwise have nothing
+        to say about a daemon whose window has not changed. Read once — the heartbeat
+        asks every 10 s and this answer cannot change while the process runs (a live
+        observation replaces it in the memory it seeds)."""
+        if kind != worker_control.SERVER_TYPE_OLLAMA:
+            return None                      # a stopped vLLM serves nothing to remember
+        if self.__dict__.get("_ctx_seed_done"):
+            return None
+        self.__dict__["_ctx_seed_done"] = True
+        try:
+            # OLLAMA'S OWN publications only. The row also carries what a vLLM on this
+            # box served, and that number says nothing about a daemon whose default is
+            # chosen from VRAM — adopting it is how a box advertises a window it has
+            # never observed, and a sized job sent there is silently truncated.
+            seen = node_queue.last_published_context(self.host, self.queue,
+                                                     served_by=kind)
+        except Exception:
+            log.debug("[llm-context] %s: window read-back failed", self.host,
+                      exc_info=True)
+            return None
+        if seen:
+            self._ctx_last_window[kind] = int(seen)
+            log.info("[llm-context] %s: no runner loaded — resuming the %d-token window "
+                     "this box last published (it belongs to the daemon, not the "
+                     "runner)", self.host, int(seen))
+        return seen
+
+    def _ollama_model_info(self, url: str, model: str | None) -> dict:
+        """``/api/show`` model_info, cached for the process: it describes the WEIGHTS,
+        which do not change under a tag without a re-pull, and the heartbeat asks every
+        tick."""
+        if not model:
+            return {}
+        cache = self._ctx_model_info
+        if model not in cache:
+            from queue_workflows import llm_probe
+            cache[model] = dict(llm_probe.ollama_model_info(url, model) or {})
+        return cache[model]
+
+    def _observe_admission(self, served: list[str], serving: int | None) -> None:
+        """What this box could LOAD right now — the inputs :meth:`_narrow_by_memory`
+        judges a claim by. Runs on the heartbeat, never on the claim path.
+
+        Residents (a loaded ollama runner, vLLM's pinned model) always fit; anything
+        else would have to be loaded, and ollama loads on the FIRST REQUEST, so the claim
+        is the engine's only hand on it. The sizes are the box's own inventory of weights
+        on disk (ollama ``/api/tags``, asked whichever kind serves — the daemon answers
+        either way); the cache is what one token of window costs here, times the window
+        the box serves."""
+        from queue_workflows import llm_context, llm_probe
+        from queue_workflows.llm_backends import factory as _f
+
+        resident: set[str] = set()
+        sizes: dict[str, int] = {}
+        kv_bytes = 0
+        try:
+            ollama_url = _f.resolve_base_url(worker_control.SERVER_TYPE_OLLAMA)
+            sizes = dict(llm_probe.ollama_model_sizes(ollama_url) or {})
+            runners = llm_probe.ollama_runners(ollama_url) if ollama_url else []
+            resident |= {str(r.get("name")) for r in runners if r.get("name")}
+            if worker_control.SERVER_TYPE_VLLM in served:
+                resident |= {str(m) for m in llm_probe.vllm_served_models(
+                    _f.resolve_base_url(worker_control.SERVER_TYPE_VLLM)) or []}
+            loaded = runners[0] if runners else None
+            model = (str(loaded.get("name")) if loaded else None) or self._ctx_last_model
+            per_token = None
+            if loaded:
+                per_token = llm_context.kv_bytes_per_token_observed(
+                    runner_bytes=int(loaded.get("size") or 0),
+                    weights_bytes=sizes.get(str(loaded.get("name"))),
+                    context_length=loaded.get("context_length"))
+                if per_token:
+                    # The measured cost of THIS model on THIS daemon — remembered, so
+                    # the estimate does not collapse to a formula the moment it unloads.
+                    self._ctx_per_token_seen[str(loaded.get("name"))] = int(per_token)
+            if per_token is None and model:
+                per_token = self._ctx_per_token_seen.get(model)
+            if per_token is None and model:
+                # ADMISSION, not the ceiling. The formula's x4 slots x1.25 safety is the
+                # conservative direction for "how big could the window grow" — and the
+                # wrong one here: it refused a ~16 GB model into ~4x that much free room.
+                # One slot must fit; the reserve covers the rest.
+                per_token = llm_context.kv_bytes_per_token_formula(
+                    self._ollama_model_info(ollama_url, model), parallel=1, safety=1.0)
+            kv_bytes = int(per_token or 0) * int(serving or 0)
+        except Exception:
+            log.debug("[llm-memory] %s: admission observation incomplete", self.host,
+                      exc_info=True)
+        self.__dict__["_ctx_model_sizes"] = sizes
+        self.__dict__["_ctx_admission"] = {
+            "resident": resident, "sizes": sizes, "kv": kv_bytes,
+            "available": llm_context.mem_available_bytes(),
+            "reserve": llm_context.reserve_bytes(),
+        }
+
+    def _narrow_by_memory(self, ids: list[str]) -> list[str]:
+        """Drop the models this box could not LOAD right now — the memory gate before
+        the load, applied where the engine has a hand on it: the claim.
+
+        Example: vLLM held most of a box's memory, little was free, and a claim for a
+        job needing a model not resident here pulled that model's weights into the rest.
+        A model already resident always passes; one whose size the box does not know
+        passes too (a box that cannot describe itself must not wedge the queue); a KNOWN
+        misfit is refused and the job waits for a box that can hold it — or is tagged
+        unassignable if none can, because the same set is what the heartbeat publishes as
+        ``fits_models``. Before the first observation nothing is narrowed."""
+        adm = self.__dict__.get("_ctx_admission")
+        if not adm:
+            return list(ids)
+        try:
+            from queue_workflows import llm_context
+            from queue_workflows.model_catalog import canonical_tag
+
+            resident = {canonical_tag(m) for m in adm["resident"]}
+            sizes = {canonical_tag(k): v for k, v in adm["sizes"].items()}
+            kept: list[str] = []
+            refused: list[tuple[str, int]] = []
+            for mid in ids:
+                tag = canonical_tag(mid)
+                if tag in resident:
+                    kept.append(mid)
+                    continue
+                fits = llm_context.load_fits(
+                    weights_bytes=sizes.get(tag), kv_bytes=adm["kv"],
+                    available_bytes=adm["available"], reserve_bytes=adm["reserve"])
+                if fits is False:
+                    refused.append((mid, int(sizes.get(tag) or 0)))
+                else:
+                    kept.append(mid)
+            names = {m for m, _ in refused}
+            if names and names != self.__dict__.get("_ctx_refused_last"):
+                log.warning(
+                    "[llm-memory] %s: NOT offering to load %s — %.1f GB available, %.0f GB "
+                    "reserved for everything else, cache %.1f GB at this box's window; "
+                    "the job waits for a box that can hold it",
+                    self.host,
+                    ", ".join(f"{m} ({b / 2**30:.1f} GB)" for m, b in refused),
+                    (adm["available"] or 0) / 2**30, (adm["reserve"] or 0) / 2**30,
+                    (adm["kv"] or 0) / 2**30,
+                )
+            self.__dict__["_ctx_refused_last"] = names
+            return kept
+        except Exception:
+            log.debug("[llm-memory] %s: admission narrowing skipped", self.host,
+                      exc_info=True)
+            return list(ids)
+
+    def _vllm_start_plan(self) -> "Any":
+        """How to start vLLM here — see :func:`llm_context.vllm_plan`. With a remembered
+        profile of the model this container serves (the catalog, migration 0029, keyed by
+        the command line's fingerprint), the pool is what N requests of the window NEED and
+        N is what the box can afford; without one, the memory gate's rule: the configured
+        pool lowered to what is free, refused below the minimum. Never raises."""
+        from queue_workflows import llm_context, llm_context_lever
+
+        kind = worker_control.SERVER_TYPE_VLLM
+        if llm_context_lever.disabled() or not llm_context_lever.available(kind):
+            return llm_context.VllmPlan(None, None, None, "")
+        info = llm_context_lever.describe(kind)
+        if not info.exists:
+            return llm_context.VllmPlan(None, None, None, "")
+        if (info.running and self._vllm_pool_committed(info)
+                and not self._box_memory_in_danger()):
+            # THE MEMORY GATE GOVERNS STARTS. This server is already running and its
+            # startup is COMPLETE — its pool taken, its cache allocated. Judging it
+            # against a fresh MemAvailable reading judges it against its OWN pool:
+            # A server can allocate most of the box's memory as cache after a long load; a
+            # worker that rolls a minute later reads little free, plans a start that could
+            # not fit and stops the server that had just finished. A verdict about a
+            # start that is not happening must not kill one that already happened —
+            # unless the box is in real danger, where the LLM server is the biggest
+            # thing the engine can give back.
+            return llm_context.VllmPlan(None, None, None, "")
+        window = (self._switch.target_context or info.configured
+                  or self._vllm_model_max_context())
+        plan = llm_context.vllm_plan(
+            total_bytes=llm_context.mem_total_bytes(),
+            available_bytes=llm_context.mem_available_bytes(),
+            reserve_bytes=llm_context.reserve_bytes(),
+            operator_utilization=info.utilization,
+            operator_max_seqs=info.max_num_seqs or self._pool_parallelism_configured(),
+            window=window, profile=self._vllm_remembered_profile(info),
+            min_utilization=_vllm_min_utilization())
+        plan = self._yield_to_ollama_if_thin(plan)
+        plan = self._refuse_a_start_that_would_be_wasted(plan)
+        if plan.reason:
+            log.info("[vllm-plan] %s: %s", self.host, plan.reason)
+        return plan
+
+    def _refuse_a_start_that_would_be_wasted(self, plan: "Any") -> "Any":
+        """A start is worth its 6-11 minutes only if the box is likely to still hold it
+        at the end. With a clean history the plan's own arithmetic settles that; after a
+        load was killed mid-way, the same conditions are known NOT to be enough, so the
+        start waits until there is :meth:`_vllm_startup_headroom` more than the bare
+        need — the same bar the memory-recovery lift uses."""
+        from queue_workflows import llm_context
+
+        if plan.refusal is not None or plan.utilization is None and plan.max_num_seqs is None:
+            if plan.refusal is not None:
+                return plan
+        losses = int(self.__dict__.get("_vllm_startup_losses") or 0)
+        if not losses:
+            return plan
+        available = llm_context.mem_available_bytes()
+        need = self._vllm_memory_need_bytes()
+        if available is None or need is None or int(available) >= need:
+            return plan
+        return llm_context.VllmPlan(None, None, (
+            f"{llm_context.MEMORY_REFUSAL}a vLLM load was killed mid-load {losses} time(s) "
+            f"on this box since one completed, so a start needs "
+            f"{need / 2**30:.1f} GB free ({self._vllm_startup_headroom():.2f}x the bare "
+            f"need) to be worth its minutes — {int(available) / 2**30:.1f} GB now"),
+            "not worth the load time yet")
+
+    def _yield_to_ollama_if_thin(self, plan: "Any") -> "Any":
+        """A plan that can afford fewer than :func:`_vllm_min_concurrency` requests is
+        no reason to start vLLM on a box that also has ollama: batching is the whole
+        advantage, and one slot of it costs a pool ollama does not need. On a box with
+        no ollama of its own there is no alternative, so the thin plan stands."""
+        from queue_workflows import llm_context
+
+        minimum = _vllm_min_concurrency()
+        if (plan.refusal is not None or plan.max_num_seqs is None
+                or plan.max_num_seqs >= minimum or not self._box_has_ollama_endpoint()):
+            return plan
+        return llm_context.VllmPlan(None, None, (
+            f"{llm_context.MEMORY_REFUSAL}vLLM would hold this box for {plan.max_num_seqs} concurrent request(s), "
+            f"below the {minimum} it takes to be worth its pool "
+            f"(QUEUE_WORKFLOWS_VLLM_MIN_CONCURRENCY) — ollama serves this box without "
+            f"one ({plan.reason})"), "one request is not worth a vLLM")
+
+    def _box_has_ollama_endpoint(self) -> bool:
+        """Can this box serve ollama itself? The same discriminator
+        :meth:`_box_has_vllm_endpoint` uses, the other way round: an ollama URL that is
+        real and DISTINCT from the vLLM one. A box whose topology resolves both kinds to
+        one URL has no ollama of its own to fall back to."""
+        try:
+            from queue_workflows.llm_backends import factory as _f
+            o, v = _f.resolve_base_url("ollama"), _f.resolve_base_url("vllm")
+            return bool(o) and o != v
+        except Exception:
+            return False
+
+    def _box_memory_in_danger(self) -> bool:
+        """Is this box close enough to running out that the LLM server should go? Only
+        a KNOWN shortage counts: an unreadable meminfo is not danger.
+
+        The line is an ABSOLUTE floor (:func:`_danger_floor_bytes`), deliberately not a
+        multiple of the reserve. The reserve is a PLANNING margin — how much the next
+        start must leave behind — and raising it on a large unified-memory box would
+        move a reserve-scaled danger line so high that a box holding a legitimate large
+        pool (with ample free memory) would be declared dying, every tick. Danger is a different
+        quantity: how little is left before ``fork()`` fails and the kernel refuses GPU
+        allocations. A box can die at a MemAvailable of several GB — MemAvailable
+        counts reclaimable page cache a CUDA allocation cannot take, which is why the
+        floor sits above zero and not at the reserve."""
+        from queue_workflows import llm_context
+
+        available = llm_context.mem_available_bytes()
+        if available is None:
+            return False
+        return available < _danger_floor_bytes()
+
+    def _abandon_warm_if_box_is_dying(self) -> bool:
+        """While a vLLM WARMS, keep watching the BOX. Returns True when the warm was
+        given up (the caller does nothing else this tick).
+
+        The pool is decided ONCE per switch on purpose — re-deciding it against the
+        memory the start itself is consuming is what made a box recreate its container
+        at ever-lower utilizations and kill its own load. But "do not re-plan" was read as
+        "do not look": a first start of a model had no profile, used the configured
+        utilization which fitted what was then free, loaded beside the box's other
+        tenants, and drained MemAvailable until sshd could not fork and the gpu heartbeat
+        went minutes stale — with nothing watching.
+
+        Deciding the pool and watching the box are different questions. This one keeps
+        being asked, and only a KNOWN crossing of the danger line answers it: a load
+        LOWERS MemAvailable by design, so "less than when we decided" means nothing,
+        and an unreadable meminfo is not danger. Nothing is recomputed and nothing is
+        recreated here — the server is given back and the switch abandoned."""
+        from queue_workflows import server_switch as _sw
+
+        if self._switch.state != _sw.WARMING:
+            return False
+        if self._switch.target != worker_control.SERVER_TYPE_VLLM:
+            return False
+        if not self._box_memory_in_danger():
+            return False
+        from queue_workflows import llm_context
+
+        available = llm_context.mem_available_bytes() or 0
+        why = (f"the box has {available / 2**30:.1f} GB left while vLLM warms — under the "
+               f"{_danger_floor_bytes() / 2**30:.0f} GB floor "
+               f"(QUEUE_WORKFLOWS_LLM_DANGER_FLOOR_MB). A start that is taking the box "
+               f"down is not a start worth finishing")
+        started = self.__dict__.pop("_warm_started_at", None)
+        cost = (f"{(time.monotonic() - started) / 60.0:.1f} min into the load"
+                if started else "mid-load")
+        log.error("[llm-memory] %s: ABANDONING the vLLM warm at %s — %s", self.host, cost, why)
+        self._stop_loading_vllm(why)
+        self._switch.abandon(why)
+        self._note_startup_loss(f"{why} — {cost}")
+        return True
+
+    def _vllm_pool_committed(self, info: "Any") -> bool:
+        """Has THIS start of this container finished taking its memory? True once its
+        startup was observed complete (:meth:`_observe_vllm_profile` — the cache
+        allocated, in the server's own words). Keyed on the (container, start) pair, so
+        a restart at a bigger pool is a new start with its memory still ahead of it."""
+        return (self.__dict__.get("_vllm_committed_key")
+                == (info.container_id, info.started_at))
+
+    def _vllm_remembered_profile(self, info: "Any") -> "Any":
+        """The catalog's profile of the model this box's vLLM serves — only when it was
+        taken on the SAME command line (minus the engine's own flags); a model re-quantised
+        or re-flagged is a different profile, and none is better than a wrong one."""
+        from queue_workflows import llm_context
+
+        if not getattr(info, "served_name", None):
+            return None
+        record = node_queue.llm_profile(self.host, worker_control.SERVER_TYPE_VLLM,
+                                        info.served_name)
+        if not record or str(record.get("fingerprint") or "") != str(info.fingerprint or ""):
+            return None
+        return llm_context.VllmProfile.from_record(record)
+
+    def _vllm_start_utilization(self) -> tuple[float | None, str | None]:
+        """``(pool, refusal)`` of :meth:`_vllm_start_plan` — kept for callers of the
+        pool-only shape."""
+        plan = self._vllm_start_plan()
+        return plan.utilization, plan.refusal
+
+    def _vllm_start_decision(self) -> "Any":
+        """:meth:`_vllm_start_plan`, decided ONCE per switch and reused on the retries.
+        The switch re-issues START every 30 s while the server warms, and a fresh reading
+        then sees MemAvailable already lowered by the very vLLM that is loading — a box
+        recreated its container at ever-lower utilizations, killing the load each
+        time. A retry is the same start; its verdict was taken when the switch entered
+        WARMING."""
+        key = self._switch.requested_wall
+        cached = self.__dict__.get("_vllm_decision")
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        decision = self._vllm_start_plan()
+        self.__dict__["_vllm_decision"] = (key, decision)
+        return decision
+
+    def _stop_loading_vllm(self, why: str, *, what: str = "still loading") -> bool:
+        """Stop this box's vLLM container while it is RUNNING — after the memory gate
+        refused its pool, or because the box is out of memory (:meth:`_shed_llm_if_box_is_dying`).
+        Best-effort: no lever, no container, or a stop that fails leaves a loud log
+        line, never an exception into the caller. Returns True when a stop was issued."""
+        from queue_workflows import llm_context_lever
+        try:
+            if not llm_context_lever.describe(worker_control.SERVER_TYPE_VLLM).running:
+                return False
+            stop = get_config().vllm_stop_fn
+            if stop is None:
+                log.error("[llm-memory] %s: a vLLM is %s in memory the box does not have "
+                          "and no stop lever is wired (set_vllm_lifecycle) — stop it by "
+                          "hand: %s", self.host, what, why)
+                return False
+            stop()
+            log.error("[llm-memory] %s: STOPPED a vLLM that was %s — %s", self.host, what, why)
+            return True
+        except Exception:
+            log.exception("[llm-memory] %s: could not stop the vLLM", self.host)
+            return False
+
+    def _serving_context(self) -> int | None:
+        """The window this box serves, as last observed — a plain read for the claim
+        path (the observation itself is the heartbeat's work)."""
+        return (getattr(self, "_llm_context_state", None) or (None, None))[0]
 
     def _served_llm_types(self) -> list[str]:
         """The LLM server kinds THIS box can serve — the claim-side gate for a job's
@@ -2158,8 +3159,8 @@ class ClaimWorker:
         """Can this box plausibly serve vLLM AT ALL? The discriminator is the same
         one probe_box_residents uses: a vllm URL DISTINCT from ollama's. A bare
         topology entry resolves both kinds to one URL — that box has no vLLM, and
-        no amount of queue pressure may make the demand-starter chase one (found
-        live: a box held a doomed switch cycle against 2000 pending rows)."""
+        no amount of queue pressure may make the demand-starter chase one (else a box
+        holds a doomed switch cycle against thousands of pending rows)."""
         try:
             from queue_workflows.llm_backends import factory as _f
             o, v = _f.resolve_base_url("ollama"), _f.resolve_base_url("vllm")
@@ -2167,14 +3168,14 @@ class ClaimWorker:
         except Exception:
             return False
 
-    # AUDIT DELTA D2, second act. ``_default_llm_kind`` was removed as dead code:
+    # ``_default_llm_kind`` was removed as dead code:
     # it fed ``claim_next_gpu_job(default_server=...)``, which the claim SQL bound
     # and never read, at the cost of an UNCACHED ``worker_controls`` SELECT on
     # every single claim. The law gave the parameter its reader — an
     # UNDECLARED row's stamp IS this prediction (the old "unconstrained rows are
     # not LLM-served" premise was false: a real LLM-calling node had exactly
     # that row shape) — so it is back, via ``predict_default_kind`` below,
-    # which keeps D2's actual lesson: no per-claim DB read (a warm hint the worker
+    # which keeps the actual lesson: no per-claim DB read (a warm hint the worker
     # already holds, else the factory's TTL cache) and no exception path into the
     # claim loop.
 
@@ -2183,7 +3184,7 @@ class ClaimWorker:
         ollama SERIALISES per model — its cap is 1 no matter how many slots the box
         advertises; vLLM batches, so it gets the operator PAR. This is what stops
         3 ollama-resolved jobs queuing inside the daemon while vLLM work runs
-        3-wide on the same box ("ollama allows 1!!" — observed live)."""
+        3-wide on the same box (ollama allows 1)."""
         par = max(1, self._pool_parallelism())
         return {"ollama": 1, "vllm": par}
 
@@ -2194,7 +3195,7 @@ class ClaimWorker:
 
         PAR is the operator's CEILING; the SERVING KIND sets the real one. Raising PAR
         to 3 on a box serving ollama gave it three node-job slots for a server that
-        answers one request at a time — observed live (NODE JOBS 3/1, three
+        answers one request at a time (NODE JOBS 3/1, three
         llm_chat jobs queued behind one another inside ollama). The budget is
         therefore the operator's PAR capped by what the kinds actually serving here
         can absorb: an ollama-only box is 1, as it was before vLLM existed; a box
@@ -2284,6 +3285,7 @@ class ClaimWorker:
                 kind_caps=self._kind_caps(),
                 default_server=predict_default_kind(
                     warm_servers, self.host, self.queue),
+                serving_context=self._serving_context(),
             )
             if job:
                 self._stamp_resolved_artifact(job)
@@ -2347,13 +3349,30 @@ class ClaimWorker:
         the heartbeat probe), SKIP claiming — running the job here would run it on
         CPU. The row stays queued for a GPU-backed box, and claiming resumes on its
         own once the server is back on GPU. The two other skips (insufficient VRAM,
-        operator OFF) are enforced elsewhere (capacity gate / worker-control park)."""
+        operator OFF) are enforced elsewhere (capacity gate / worker-control park).
+
+        THE CLUSTER RESERVATION (``node_queue.CLUSTER_SERVER_KIND``) is the one claim a lane
+        out of service for LLM work still makes. A switch blocks claims because a claim would
+        reload the outgoing server, and the ONLY-GPU gate because the job would be served on
+        CPU; a reservation loads nothing, is served by no broker server, and holding it ENDS
+        the switch (:meth:`_begin_cluster_hold`). So both narrow the claim to reservations —
+        and only when one is queued for this box, a read that fails to "none" (the old
+        refusal); otherwise they refuse exactly as before."""
         from queue_workflows import model_registry
-        if self._switch.blocks_claims():
-            return None
+        reservations_only = self._switch.blocks_claims()
         if self._spill_paused():
             return None
-        if not self._pool_gpu_serving_ok():
+        if not reservations_only and not self._pool_gpu_serving_ok():
+            reservations_only = True
+        # THE HOLD GATES THE CLAIM. While this lane holds its box for the cluster, every LLM
+        # pool row it could claim is served by this box's own card — the card the hold just
+        # gave away. Unloading after the fact is a race the hold loses: a held lane can claim
+        # llm_chat a second after HOLDING, and the model is resident again for long enough
+        # that llm-gateway gives up waiting for RAM at 60 s. Narrow to reservations, which need no server of ours; with one already
+        # held nothing is queued for this box, so the claim below is skipped entirely.
+        if not reservations_only and self._cluster_hold_reason() is not None:
+            reservations_only = True
+        if reservations_only and not self._reservation_queued_here():
             return None
         warm_servers, warm_models = self._warm_state()
         job = node_queue.claim_next_gpu_job(
@@ -2371,15 +3390,62 @@ class ClaimWorker:
             kind_caps=self._kind_caps(),
             default_server=predict_default_kind(
                 warm_servers, self.host, self.queue),
+            # 0028: a sized row is claimable only where its window is served. A box
+            # that cannot state one (None) claims only unsized rows — the alternative
+            # is ollama truncating the prompt and answering 200.
+            serving_context=self._serving_context(),
+            reservations_only=reservations_only,
         )
         return job
 
     def _pool_parallelism(self) -> int:
-        """PAR for the VLM pool lane: the per-``(host, gpu)`` LLM ``parallelism``
-        (vLLM ``--max-num-seqs`` / ollama ``OLLAMA_NUM_PARALLEL``), clamped to
-        ``>= 1``. Read live (cheap DB read, default-safe on a pre-0013 schema)
-        so an operator's UI change to parallelism takes effect without a
-        restart — the feeder re-reads it each cycle to gate submissions."""
+        """PAR for the VLM pool lane: the operator's per-``(host, gpu)`` LLM
+        ``parallelism`` (:meth:`_pool_parallelism_configured`), CAPPED by what the vLLM
+        serving here can actually hold — the concurrency its KV cache reported at its
+        start (:meth:`_observe_vllm_profile`; e.g. 8 slots fed to a cache that holds
+        under 3 full-window requests get the rest preempted inside the server). Only while
+        vLLM serves; an ollama box is capped to 1 by :meth:`_gpu_slot_budget` as
+        before.
+
+        ...and then capped once more by the operator's PER-BOX ceiling
+        (:meth:`_box_ceiling`) — see there for why this method is where it lands."""
+        par = self._pool_parallelism_configured()
+        seen = self.__dict__.get("_vllm_concurrency")
+        if seen and worker_control.SERVER_TYPE_VLLM in (self._served_llm_types() or []):
+            par = max(1, min(par, int(seen)))
+        return self._box_ceiling(par)
+
+    def _box_ceiling(self, par: int) -> int:
+        """THE LAST WORD on how many GPU node-jobs this BOX runs at once: ``par``
+        lowered to the operator's per-box ceiling (``gpu_box_max_concurrent`` /
+        ``QUEUE_WORKFLOWS_GPU_BOX_MAX_CONCURRENT``), or ``par`` unchanged where no
+        ceiling names this box.
+
+        WHY HERE, AND ONLY HERE. Every input to ``par`` describes the LLM SERVER —
+        the operator's PAR, what the vLLM KV cache holds, what the serving kind can
+        absorb. None of them describes the MACHINE: its power envelope, its unified
+        memory, the thermal latch a flood of concurrent work trips. :meth:`_pool_parallelism` is the ONE function every consumer of
+        "how many can this box run" already goes through — :meth:`_gpu_slot_budget`
+        (→ the heartbeat's advertised ``concurrency`` and the DB-side box-slot
+        arbiter's ``max_running``), :meth:`_kind_caps`, the inline ``run_once``
+        admission gate, and the pool feeder's budget + executor size — so the
+        ceiling binds once, here, and no call site can escape it by being written
+        later. Sprinkling ``min(...)`` at those call sites is how a ceiling becomes
+        advice.
+
+        LOWERS ONLY. ``min`` both ways round: a box whose vLLM cache holds 2 still
+        runs 2 under a ceiling of 3, because the ceiling is what the operator is
+        willing to ALLOW, not a floor the server must reach. And the result is
+        always ``>= 1`` (both operands are), so this can never park a lane."""
+        ceiling = resolve_box_max_concurrent(self._physical_box())
+        return par if ceiling is None else min(par, ceiling)
+
+    def _pool_parallelism_configured(self) -> int:
+        """The operator's PAR: the per-``(host, gpu)`` LLM ``parallelism`` (vLLM
+        ``--max-num-seqs`` / ollama ``OLLAMA_NUM_PARALLEL``), clamped to ``>= 1``. Read
+        live (cheap DB read, default-safe on a pre-0013 schema) so an operator's UI
+        change to parallelism takes effect without a restart — the feeder re-reads it
+        each cycle to gate submissions."""
         try:
             par = worker_control.llm_config_for(self.host, "gpu").parallelism
         except Exception:
@@ -2763,6 +3829,30 @@ class ClaimWorker:
         except Exception:
             return False
 
+    @staticmethod
+    def _pool_stall_timeout_s(module_name: str) -> float | None:
+        """The no-progress window a POOL-lane node opted into, or ``None``.
+
+        Armed only when the node module declares BOTH a positive numeric
+        ``POOL_STALL_TIMEOUT_S`` and a ``status_callback`` parameter — a window the
+        node cannot beat would kill every job it runs. Below
+        :data:`POOL_STALL_MIN_TIMEOUT_S` the window is raised to the floor;
+        ``QUEUE_WORKFLOWS_DISABLE_POOL_STALL_WATCHDOG`` disarms it everywhere."""
+        from queue_workflows.config import _env_flag
+
+        if _env_flag(_POOL_STALL_DISABLE_ENV):
+            return None
+        try:
+            mod = get_config().resolve_node_module(module_name)
+            raw = getattr(mod, "POOL_STALL_TIMEOUT_S", None)
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw <= 0:
+                return None
+            if "status_callback" not in inspect.signature(mod.run).parameters:
+                return None
+        except Exception:
+            return None
+        return max(float(raw), float(POOL_STALL_MIN_TIMEOUT_S))
+
     def _run_node(self, job: dict) -> bool:
         """Execute a claimed DAG node-job (cpu/gpu) under a cancel-watcher +
         lease-renewer + a guard set that depends on the queue:
@@ -2850,7 +3940,7 @@ class ClaimWorker:
         #    replacing the removed wall-clock cap. Arms AT job start with a
         #    generous load-grace first window (so a load-phase hang AND a GPU node
         #    that never beats — no required_model / no status_callback, e.g.
-        #    sv_detect, scene_build — are both bounded), then the post-load /
+        #    a detector, scene_build — are both bounded), then the post-load /
         #    per-step beats collapse it to the 5-min cadence. Kills only a wedged
         #    worker (no GPU work AND static RAM over the window); a busy GPU or a
         #    > 5 GB RAM move keeps it alive forever. Video is the whole point —
@@ -2931,12 +4021,22 @@ class ClaimWorker:
 
           * NO ``model_cache.mark_busy/idle`` — there is no warm-model slot to
             protect from the idle reaper; these jobs carry ``required_model=None``.
-          * NO :class:`GpuHealthWatchdog` / :class:`StallWatchdog` — those police
-            an in-worker diffusion hang (idle GPU + static RAM) and a 0%-GPU
-            denoise stall; neither maps to an HTTP-bound VLM request, and the
-            pool runs PAR jobs at once so a shared single-job GPU-health verdict
-            would be meaningless. The lease + abandon-watcher already bound a
-            wedged request via reclaim.
+          * NO :class:`GpuHealthWatchdog`, and NO physically-confirmed
+            :class:`StallWatchdog` — those police an in-worker diffusion hang (idle
+            GPU + static RAM in THIS container); an HTTP-bound request does its GPU
+            work in the server's container, and the pool runs PAR jobs at once, so
+            a single-job GPU-health verdict would be meaningless.
+          * EXCEPT an opted-in no-progress guard: a node that declares
+            ``POOL_STALL_TIMEOUT_S`` (and ``status_callback``) gets a
+            :class:`StallWatchdog` with ``confirm_idle=False`` — its beats (one per
+            streamed chunk) are the progress signal, and silence past its own
+            window trips through the ordinary :func:`_watchdog_trip` policy. Without
+            it a request that never answers held this lane for ever: the lease
+            renewer keeps renewing while the process lives, so reclaim never fires.
+            A node that did not opt in is untouched (``status_callback=None``).
+            The trip hard-exits the PROCESS, so any sibling pool job dies with it
+            and is recovered resume-style by the orchestrator's frozen-lease sweep —
+            the same blast radius the JobStatusWatcher's exit has always had here.
 
         KEPT (the per-job correctness machinery, identical to the inline lane):
         the ``__input__`` park-and-return outbox early-return, the run-cancel
@@ -2951,11 +4051,34 @@ class ClaimWorker:
         the whole process (the safe abandon path) — acceptable: the inline
         diffusion job, if any, is re-queued by lease reclaim exactly as a
         watchdog hard-exit would do."""
+        # THE CLUSTER RESERVATION (node_queue.CLUSTER_SERVER_KIND): this box is being held
+        # for a server the engine does not run. When a cluster starts, classic vLLM is shut
+        # down first to free RAM. The hold begins BEFORE the box
+        # lease is asked for — a switch of our own holds SWITCH_SLOT and would deny it, and the
+        # hold ends that switch first — and its watch stops the classic servers at once.
+        hold = (self._begin_cluster_hold(job) if node_queue.is_cluster_reservation(job)
+                else None)
         # ONE-MODEL-PER-BOX gate: spill this no-model LLM job if the card already
         # holds another project's model (e.g. a diffusion render). Same gate as the
         # inline lane — both funnel through _acquire_box_or_spill.
-        if not self._acquire_box_or_spill(job):
+        #
+        # A RESERVATION WAITS INSTEAD OF SPILLING: the occupant is usually the LLM model
+        # its own hold is unloading, and a spill hands the box straight back.
+        if hold is not None:
+            if not self._acquire_box_for_reservation(job, hold):
+                # Only now, after the ceiling: give the box back and re-queue, still pinned
+                # here (a reservation queued for this box still refuses every start meanwhile).
+                self._end_cluster_hold(hold)
+                try:
+                    node_queue.requeue_job_for_retry(job["id"])
+                except Exception:
+                    log.exception("[cluster-hold] %s: re-queue failed for %s",
+                                  self.host, job.get("id"))
+                return False
+        elif not self._acquire_box_or_spill(job):
             return False
+        if hold is not None:
+            self._start_cluster_hold_watch(hold)
         job_id = job["id"]
         log.info(
             "[claim-worker:gpu:pool] claimed %s (node=%s model=%s)",
@@ -2971,6 +4094,8 @@ class ClaimWorker:
         # see one, but the guard keeps the two lanes' contract identical.)
         if (job.get("node_module") or "").startswith("__input__"):
             self._box_job_done()          # balance the acquire above (park touches no GPU)
+            if hold is not None:
+                self._end_cluster_hold(hold)
             with connection() as conn, conn.cursor() as cur:
                 node_queue.mark_awaiting_input_in_txn(cur, job_id)
                 node_queue.enqueue_dispatch_event_in_txn(
@@ -2983,21 +4108,49 @@ class ClaimWorker:
         cancel_thread = _start_run_cancel_watcher(
             job["run_id"], cancel_event, interval_s=5.0,
         )
+        # Visible to the lane, not just to this thread: a cluster hold starting on another pool
+        # thread has to be able to tell this job to stop calling the card's server.
+        self._register_pool_job(job, cancel_event)
         renewer = LeaseRenewer(
-            job_id=job_id, claimed_by=self.host, lease_s=self.lease_s,
+            job_id=job_id, claimed_by=self.host,
+            # A RESERVATION HOLDS ITS BOX ON A SHORT LEASE — see CLUSTER_RESERVATION_LEASE_S.
+            # The lease is how long the fleet keeps believing a lane that stopped renewing,
+            # and for a reservation that belief is "this box is held", which llm-gateway acts on.
+            lease_s=(CLUSTER_RESERVATION_LEASE_S if hold is not None else self.lease_s),
         )
         status_watcher = JobStatusWatcher(job_id=job_id, claimed_by=self.host)
         renewer.start()
         status_watcher.start()
+        stall_s = self._pool_stall_timeout_s(job.get("node_module") or "")
+        stall: StallWatchdog | None = None
+        if stall_s is not None:
+            # Inert until the node's FIRST beat — the first streamed token — so a cold
+            # server-side model load and the prompt prefill are never timed.
+            stall = StallWatchdog(
+                job_id=job_id, stall_timeout_s=stall_s, confirm_idle=False,
+                host_label=self.host, queue=self.queue,
+            )
+            stall.start()
+            log.info(
+                "[claim-worker:gpu:pool] %s: no-progress guard armed (%.0fs, opted in "
+                "by %s.POOL_STALL_TIMEOUT_S)", job_id, stall_s, job.get("node_module"),
+            )
         try:
-            # No model_cache (no warm model) and no status_callback (no GPU
-            # watchdog to beat) — the executor invokes the node directly.
+            # No model_cache (no warm model); the status_callback is the opted-in
+            # guard's beat, or None — the executor invokes the node directly.
             node_executor.execute_node(
                 job, model_cache=None, cancel_event=cancel_event,
-                status_callback=None,
+                status_callback=stall.beat if stall is not None else None,
             )
         finally:
+            self._unregister_pool_job(job)
             self._box_job_done()          # drop this pool job's box hold
+            if hold is not None:
+                # The reservation's job ended (the LB cancelled its run, or it failed):
+                # normal service resumes.
+                self._end_cluster_hold(hold)
+            if stall is not None:
+                stall.stop()
             status_watcher.stop()
             renewer.stop()
             cancel_event.set()
@@ -3094,7 +4247,7 @@ class ClaimWorker:
                     # leaves the in-flight counter untouched.
                     # Rank SELF by the same capped, published number peers see —
                     # ranking by raw PAR while advertising the capped budget made an
-                    # ollama box compare itself at 3 against peers' 1 (round-2 audit).
+                    # ollama box compare itself at 3 against peers' 1.
                     if self._pool_should_defer(self._gpu_slot_budget()):
                         break
                     with self._pool_lock:
@@ -3271,10 +4424,13 @@ class ClaimWorker:
     @property
     def _min_schema_version(self) -> int:
         """The migration this queue's claim path depends on: ``download`` needs
-        the 0025 CHECK drop (its rows can't exist before it), ingest needs 0008
-        (host-defined queue names + ``args``), cpu/gpu the 0006 lease columns."""
+        the 0025 CHECK drop (its rows can't exist before it), ``gpu`` the 0028 window
+        columns its claim filters on, ingest 0008 (host-defined queue names +
+        ``args``), cpu the 0006 lease columns."""
         if self.queue == "download":
             return _DOWNLOAD_REQUIRED_VERSION
+        if self.queue == "gpu":
+            return _GPU_REQUIRED_VERSION
         return (
             _NODE_REQUIRED_VERSION if self.queue in _NODE_QUEUES
             else _INGEST_REQUIRED_VERSION
@@ -3283,7 +4439,7 @@ class ClaimWorker:
     def await_schema(self) -> None:
         """Block until the migrations this queue's claim loop depends on are
         applied. The orchestrator owns the migration run (``db.bootstrap``,
-        which takes no advisory lock); a claim worker WAITS for the schema
+        serialized by an advisory lock on Postgres); a claim worker WAITS for the schema
         before it starts polling."""
         from queue_workflows import db
         # WAIT FOR THE DATABASE FIRST. `wait_for_schema` needs a connection, so an
@@ -3316,9 +4472,8 @@ class ClaimWorker:
         free here (a freshly (re)started process holds no model) but the BOX's is
         not: sidecar LLM servers outlive the worker, and a
         ``restart: unless-stopped`` sidecar even resurrects itself mid-park
-        (observed live: a parked box's vllm crash-looped and re-loaded 65 GB
-        ~2 h later with nothing able to stop it). So PARK RELEASES THE CARD
-        (operator rule #2): a parked gpu worker ticks a
+        (a parked box's vllm can crash-loop and re-load its weights hours
+        later with nothing able to stop it). So PARK RELEASES THE CARD: a parked gpu worker ticks a
         :class:`~queue_workflows.llm_idle_unload.ParkQuiesce` every wait
         iteration — an idle vLLM is stopped (a real ``docker stop``, which the
         restart policy respects), idle ollama models are unloaded, and a
@@ -3353,7 +4508,7 @@ class ClaimWorker:
         poll_s = worker_control._worker_control_poll_s()
         try:
             # Guarded like the arm sites: releasing the card is best-effort and
-            # must never take down the park gate itself (audit LOW #2 — an
+            # must never take down the park gate itself (an
             # ImportError here would crash a PARKING worker).
             quiesce_tick = self._build_park_quiesce()
         except Exception:
@@ -3389,55 +4544,380 @@ class ClaimWorker:
         must not touch the box's LLM servers (non-gpu lane, or the shared reaper
         kill-switch). Wiring only — every probe/lever resolves lazily at TICK
         time, so building the gate costs nothing and follows topology edits."""
-        from queue_workflows import llm_idle_unload, llm_probe
-        from queue_workflows.llm_backends import factory as _llm_factory
+        from queue_workflows import llm_idle_unload
 
         if self.queue != "gpu" or env_get(llm_idle_unload._DISABLE_ENV):
             return None
+
+        quiesce = llm_idle_unload.ParkQuiesce(
+            **self._llm_quiesce_levers(state="parked"),
+            voice="park",
+            label=self.host,
+            # A drain-park KEEPS the job it already had (that is what drain means), so
+            # the watchdog must not evict the model that job is streaming from — see
+            # ParkQuiesce's "THE ONE EXEMPTION". Only OUR work exempts the box; a peer's
+            # remote traffic still gets nothing.
+            #
+            # The POOL lane only, deliberately, NOT `_gpu_active_count`: that also
+            # counts the inline diffusion lane, and a render does not touch the LLM at
+            # all. Exempting on one would let a peer's traffic keep a parked box's vLLM
+            # busy — the precise failure the no-remote-exemption rule was written to end.
+            in_flight_fn=lambda: self._pool_inflight,
+        )
+        last_sweep = [0.0]
+
+        def tick() -> None:
+            # A parked box is the one most likely to be borrowed for something else,
+            # and still the box that serves the broker's models the moment it is
+            # enabled: the rogue guard runs here too, at the lease tick's 10 s.
+            now = time.monotonic()
+            if now - last_sweep[0] >= 10.0:
+                last_sweep[0] = now
+                from queue_workflows import rogue_llm
+
+                rogue_llm.sweep(host=self.host)
+            # A PARK ENDS A SWITCH. Lanes WARMING a vLLM when they are parked: the watchdog stopped the server once it answered
+            # /metrics, and 20 s later the switch — still WARMING, re-issuing its start every
+            # 30 s from the heartbeat thread a drain-park keeps — started the same container
+            # again. The switch ends here, with the
+            # server it was loading. A lane that restarted parked resumed its persisted
+            # switch from disk; that one ends here too, before any heartbeat could drive it.
+            self._abandon_switch("the box is PARKED — a parked box serves nobody")
+            quiesce.tick()
+
+        return tick
+
+    def _llm_quiesce_levers(self, *, state: str) -> dict:
+        """The probes and levers a :class:`~queue_workflows.llm_idle_unload.ParkQuiesce` works
+        this box's broker LLM servers with — for the park gate (``state='parked'``) and for a
+        cluster reservation's hold (``state='held'``). vLLM is judged by its CONTAINER'S state
+        as well as by ``/metrics``: a vLLM still loading answers no probe. Every probe and
+        lever resolves at TICK time."""
+        from queue_workflows import llm_probe
+        from queue_workflows.llm_backends import factory as _llm_factory
 
         def _stop_vllm() -> None:
             stop = get_config().vllm_stop_fn
             if stop is None:
                 log.warning(
-                    "[llm-idle] %s: parked with an idle vLLM but no stop hook is "
-                    "wired — set_vllm_lifecycle(start_fn, stop_fn) so a parked "
-                    "box can release its VRAM", self.host,
+                    "[llm-idle] %s: %s with an idle vLLM but no stop hook is "
+                    "wired — set_vllm_lifecycle(start_fn, stop_fn) so a %s "
+                    "box can release its VRAM", self.host, state, state,
                 )
                 return
             stop()
 
-        quiesce = llm_idle_unload.ParkQuiesce(
+        return dict(
             vllm_activity_fn=lambda: llm_probe.vllm_activity(
                 _llm_factory.resolve_base_url("vllm")),
             vllm_stop_fn=_stop_vllm,
+            vllm_running_fn=self._vllm_container_running,
             ollama_models_fn=lambda: llm_probe.loaded_models_info(
                 _llm_factory.resolve_base_url()),
             ollama_unload_fn=lambda models: llm_probe.unload_ollama_models(
                 _llm_factory.resolve_base_url(), models),
-            # A drain-park KEEPS the job it already had (that is what drain means), so
-            # the watchdog must not evict the model that job is streaming from — see
-            # ParkQuiesce's "THE ONE EXEMPTION". Only OUR work exempts the box; a peer's
-            # remote traffic still gets nothing (rule #3).
-            #
-            # The POOL lane only, deliberately, NOT `_gpu_active_count`: that also
-            # counts the inline diffusion lane, and a render does not touch the LLM at
-            # all. Exempting on one would let a peer's traffic keep a parked box's vLLM
-            # at 96 % — the precise rule #2 failure rule #3 was written to end.
-            in_flight_fn=lambda: self._pool_inflight,
-            label=self.host,
         )
-        return quiesce.tick
+
+    def _vllm_container_running(self) -> bool:
+        """Is this box's broker ``vllm`` container running — serving OR still loading? Read
+        fresh from docker every time: the describe cache holds 20 s, and a watchdog that kills
+        on sight cannot wait that long. ``False`` when docker cannot say (no socket, no such
+        container), so a box without the lever is judged by ``/metrics`` alone."""
+        from queue_workflows import llm_context_lever
+
+        return bool(llm_context_lever.describe(worker_control.SERVER_TYPE_VLLM,
+                                               ttl_s=0.0).running)
+
+    def _abandon_switch(self, why: str, *, stop_loading: bool = True) -> bool:
+        """End the server switch in flight because this box must start nothing (``why``).
+        Returns True when there was one.
+
+        With it go the box lease the switch holds for its whole duration (every peer is
+        denied while it holds ``SWITCH_SLOT`` — and so would be our own reservation's
+        acquire) and, unless ``stop_loading`` is False, the vLLM it started and is still
+        loading: the one thing a switch leaves behind that takes memory, and the server this
+        box was just told not to run."""
+        from queue_workflows import server_switch as _sw
+
+        switch = getattr(self, "_switch", None)
+        if switch is None or switch.state == _sw.IDLE:
+            return False
+        target, state = switch.target, switch.state
+        switch.abandon(why)
+        self.__dict__.pop("_vllm_decision", None)
+        self.__dict__.pop("_warm_started_at", None)
+        try:
+            lease = self._get_box_lease()
+            if lease is not None:
+                lease.release()
+        except Exception:
+            log.debug("[server-switch] %s: box-lease release failed (TTL will expire it)",
+                      self.host, exc_info=True)
+        if (stop_loading and target == worker_control.SERVER_TYPE_VLLM
+                and state in (_sw.SWITCHING, _sw.WARMING)):
+            try:
+                if self._vllm_container_running():
+                    stop = get_config().vllm_stop_fn
+                    if stop is None:
+                        log.error("[server-switch] %s: the abandoned switch left a vLLM "
+                                  "loading and no stop lever is wired "
+                                  "(set_vllm_lifecycle) — %s", self.host, why)
+                    else:
+                        stop()
+                        log.warning("[server-switch] %s: STOPPED the vLLM the abandoned "
+                                    "switch was loading — %s", self.host, why)
+            except Exception:
+                log.exception("[server-switch] %s: could not stop the vLLM the abandoned "
+                              "switch was loading", self.host)
+        return True
+
+    def _cluster_hold_reason(self) -> str | None:
+        """Why this lane is HOLDING its box for a cluster reservation right now, or ``None``.
+
+        THE CARD IS THE SCOPE. A hold means the whole card belongs to a server the engine
+        does not run, so it governs both things this lane could do with that card: START a
+        server on it (:meth:`_llm_starts_forbidden`) and CLAIM work that would occupy it
+        (:meth:`_claim_pool`). The holds are this process's own, so this is an in-memory
+        read — no DB, safe to ask on the claim path."""
+        holds = self.__dict__.get("_cluster_holds") or {}
+        if not holds:
+            return None
+        return f"the box is HELD for cluster reservation {next(iter(holds))[:8]}"
+
+    def _pool_jobs_lock(self) -> threading.Lock:
+        lock = self.__dict__.get("_pool_jobs_lock_obj")
+        if lock is None:
+            lock = self.__dict__.setdefault("_pool_jobs_lock_obj", threading.Lock())
+        return lock
+
+    def _register_pool_job(self, job: dict, cancel_event: threading.Event) -> None:
+        """Record a pool job in flight on this lane together with its COOPERATIVE cancel seam —
+        the same ``threading.Event`` the run-cancel watcher feeds.
+
+        WHY THE LANE NEEDS A REGISTRY. ``_pool_inflight`` is a count, and a count cannot be
+        asked "which of you is talking to the card?". A cluster hold has to answer exactly
+        that: the reservation's own body uses no LLM, but its siblings on the pool lane do, and
+        they are what reload the weights the hold unloads."""
+        with self._pool_jobs_lock():
+            self.__dict__.setdefault("_pool_jobs", {})[str(job.get("id") or "")] = (
+                job, cancel_event)
+
+    def _unregister_pool_job(self, job: dict) -> None:
+        """Drop a pool job from the registry — called on EVERY exit path of its runner."""
+        with self._pool_jobs_lock():
+            (self.__dict__.get("_pool_jobs") or {}).pop(str(job.get("id") or ""), None)
+
+    def _cancel_inflight_llm_pool_jobs(self, why: str, *, keep: str = "") -> list[str]:
+        """Signal cancel to every LLM-serving pool job in flight on this lane, and say so.
+
+        THE REASON: a row already ``cancelled`` can still have its process issue a fresh
+        ``/v1/chat/completions`` tens of seconds later, running for minutes — reloading the
+        weights the hold unloads every 5 s. Two things
+        were slow: the run-cancel watcher only polls every 5 s, and nothing told it at all
+        (the run was not cancelled — the BOX was taken). Signalling here is immediate.
+
+        COOPERATIVE, and only that. The event is the contract the engine owns; whether a node
+        checks it between its own LLM calls is the node's half (see ``execute_node``'s
+        ``cancel_event`` kwarg). Work that does not serve the LLM is never signalled — a render
+        does not compete for the card's weights — and ``keep`` spares the reservation's own
+        body, which IS the hold."""
+        jobs = dict(self.__dict__.get("_pool_jobs") or {})
+        cancelled: list[str] = []
+        for job_id, (row, event) in jobs.items():
+            if job_id == keep or not self._job_serves_llm(row):
+                continue
+            try:
+                event.set()
+            except Exception:                       # pragma: no cover - a set() that raises
+                log.debug("[cluster-hold] %s: could not signal %s", self.host, job_id,
+                          exc_info=True)
+                continue
+            cancelled.append(job_id)
+        if cancelled:
+            log.warning(
+                "[cluster-hold] %s: CANCELLING %d LLM job(s) still in flight on this lane "
+                "(%s) — %s. A job that keeps calling this box's server reloads the weights "
+                "the hold just unloaded, at the request boundary, every time.",
+                self.host, len(cancelled), ", ".join(j[:8] for j in cancelled), why)
+        return cancelled
+
+    def _pool_jobs_beside_the_reservation(self) -> int:
+        """Pool jobs RUNNING on this lane other than a reservation's own body — read off the
+        registry of jobs actually in flight, never off ``_pool_inflight``.
+
+        The reservation runs ON the pool lane, so it must never count as work draining off its
+        own card. And the slot counter is not a count of jobs: the feeder reserves a slot BEFORE
+        it asks for a job, and a held box keeps asking (the hold refuses, the slot goes back) —
+        so every hold tick would count a job that did not exist and skip the eviction,
+        indefinitely."""
+        holds = set(self.__dict__.get("_cluster_holds") or {})
+        with self._pool_jobs_lock():
+            return sum(1 for job_id in (self.__dict__.get("_pool_jobs") or {}) if job_id not in holds)
+
+    def _llm_starts_forbidden(self) -> str | None:
+        """Why this box must START no broker LLM server right now, or ``None``.
+
+        One rule, asked by every start path — a switch request, the switch's own tick and
+        START, the idle stopper's demand start, the boot-time server start:
+
+          * a CLUSTER RESERVATION is held on this lane: the box, and its memory, belong to a
+            server the engine does not run;
+          * one is QUEUED for this box, or still RUNNING under this lane's name (a lane that
+            restarted before re-claiming it): the box is about to be given up, and minutes of
+            weight loading would take the memory the cluster needs;
+          * the operator has PARKED this lane: a parked box serves nobody.
+
+        The holds are this process's own; the rest are reads that fail OPEN, as the idle
+        stopper's park gate always has — a control-plane blip must not wedge every start on
+        the fleet."""
+        held = self._cluster_hold_reason()
+        if held is not None:
+            return held
+        try:
+            if (worker_control.desired_state_for(self.host, self.queue)
+                    == worker_control.STATE_OFF):
+                return "the box is PARKED"
+        except Exception:
+            log.debug("[claim-worker:gpu] control state unreadable — treated as ON",
+                      exc_info=True)
+        row = self._reservation_for_this_box()
+        if row:
+            return (f"cluster reservation {str(row.get('id') or '?')[:8]} is "
+                    f"{row.get('status') or '?'} for this box")
+        return None
+
+    def _reservation_for_this_box(self) -> dict | None:
+        """:func:`node_queue.cluster_reservation_for` for this lane and box; ``None`` on any
+        failure (a worker that cannot name its box reserves nothing)."""
+        try:
+            return node_queue.cluster_reservation_for(
+                host=self.host, box=self._physical_box(), queue=self.queue)
+        except Exception:
+            log.debug("[claim-worker:gpu] cluster-reservation read failed — none assumed",
+                      exc_info=True)
+            return None
+
+    def _reservation_queued_here(self) -> bool:
+        """Is a cluster reservation QUEUED for this box — the one claim a lane out of service
+        for LLM work still makes (:meth:`_claim_pool`)? Any failure is "no": the old refusal."""
+        row = self._reservation_for_this_box()
+        return bool(row) and str(row.get("status") or "") == "queued"
+
+    #: How often a held box re-checks that the broker's own servers are still down: the park
+    #: gate's cadence. The first check runs the moment the hold begins.
+    CLUSTER_HOLD_POLL_S = 5.0
+
+    def _cluster_hold_lock(self) -> threading.Lock:
+        lock = self.__dict__.get("_cluster_hold_lock_obj")
+        if lock is None:
+            lock = self.__dict__.setdefault("_cluster_hold_lock_obj", threading.Lock())
+        return lock
+
+    def _begin_cluster_hold(self, job: dict) -> _ClusterHold:
+        """THE CLUSTER RESERVATION: this lane has claimed a row that holds the box for a
+        server the engine does not run (``node_queue.CLUSTER_SERVER_KIND``). Register the hold
+        — from here every start path refuses (:meth:`_llm_starts_forbidden`) — and end any
+        switch in flight NOW, releasing the box lease it holds so the reservation's own
+        acquire is not denied by it. :meth:`_start_cluster_hold_watch` then stops whatever
+        runs, at once."""
+        from queue_workflows import llm_idle_unload
+
+        job_id = str(job.get("id") or "")
+        inputs = job.get("inputs")
+        if isinstance(inputs, str):
+            import json
+
+            try:
+                inputs = json.loads(inputs)
+            except ValueError:
+                inputs = None
+        purpose = str(inputs.get("purpose") or "") if isinstance(inputs, dict) else ""
+        disabled = env_get(llm_idle_unload._DISABLE_ENV)
+        # THE WORK ALREADY IN FLIGHT DRAINS, UNDER A CEILING. The reservation's own body uses
+        # no LLM, but the pool lane may have claimed an llm_chat a moment before the hold
+        # began and that job is streaming
+        # from this card. Evicting under it does not free the card anyway — ollama applies
+        # keep_alive:0 at the REQUEST BOUNDARY and the job's next call cold-reloads the same
+        # weights (ParkQuiesce's request-boundary lesson). So: let it finish, say so on
+        # every tick, and take the card regardless after CLUSTER_HOLD_DRAIN_MAX_S, because a
+        # request that never ends must not starve the cluster. The drain is guaranteed to
+        # terminate: no new work can arrive while the hold gates the claim (:meth:`_claim_pool`).
+        quiesce = None if disabled else llm_idle_unload.ParkQuiesce(
+            **self._llm_quiesce_levers(state="held"), voice="cluster-hold", label=self.host,
+            in_flight_fn=self._pool_jobs_beside_the_reservation,
+            hold_off_max_s=CLUSTER_HOLD_DRAIN_MAX_S,
+            now_fn=self._spill_clock)
+        hold = _ClusterHold(job_id=job_id, purpose=purpose, quiesce=quiesce)
+        with self._cluster_hold_lock():
+            self.__dict__.setdefault("_cluster_holds", {})[job_id] = hold
+        log.warning(
+            "[cluster-hold] %s: HOLDING this box for cluster reservation %s (%s) — the "
+            "broker's own vLLM is stopped and ollama's models unloaded, and neither starts "
+            "again until the job ends%s", self.host, job_id[:8], purpose or "no purpose given",
+            "" if quiesce is not None else
+            f" (NOTHING will be stopped: {llm_idle_unload._DISABLE_ENV} is set)")
+        self._abandon_switch(f"the box is HELD for cluster reservation {job_id[:8]}",
+                             stop_loading=False)
+        # The card is ours now; whoever else on this lane is still talking to its server must
+        # stop, or the next request reloads what the first tick unloads.
+        self._cancel_inflight_llm_pool_jobs(
+            f"the box is HELD for cluster reservation {job_id[:8]}", keep=job_id)
+        return hold
+
+    def _start_cluster_hold_watch(self, hold: _ClusterHold) -> None:
+        """Tick :meth:`_cluster_hold_tick` at once — shut down classic vllm first —
+        and then every :data:`CLUSTER_HOLD_POLL_S` until the hold ends, on a
+        thread of its own: the job's body blocks its pool thread for as long as it holds."""
+        def _watch() -> None:
+            while True:
+                try:
+                    self._cluster_hold_tick(hold)
+                except Exception:
+                    log.exception("[cluster-hold] %s: hold tick failed (retried)", self.host)
+                if hold.stop.wait(self.CLUSTER_HOLD_POLL_S):
+                    return
+
+        hold.thread = threading.Thread(target=_watch, daemon=True,
+                                       name=f"cluster-hold[{hold.job_id[:8]}]")
+        hold.thread.start()
+
+    def _cluster_hold_tick(self, hold: _ClusterHold | None = None) -> None:
+        """One pass over a held box: no switch in flight, the broker's ``vllm`` container down
+        (by container state — a vLLM still loading answers no probe), every ollama model
+        unloaded. A resurrection, engine-driven or out of band, is met on the next pass. No
+        exemption: the job being held uses no LLM."""
+        holds = self.__dict__.get("_cluster_holds") or {}
+        if hold is None:
+            hold = next(iter(holds.values()), None)
+        if hold is None or hold.job_id not in holds:
+            return
+        self._abandon_switch(f"the box is HELD for cluster reservation {hold.job_id[:8]}")
+        if hold.quiesce is not None:
+            hold.quiesce.tick()
+
+    def _end_cluster_hold(self, hold: _ClusterHold) -> None:
+        """The reservation's job ended (the LB cancelled its run; it failed or spilled): stop
+        the watch and drop the hold. Normal service resumes — the box claims what fits, and
+        the idle stopper may start a vLLM on demand again."""
+        with self._cluster_hold_lock():
+            removed = (self.__dict__.get("_cluster_holds") or {}).pop(hold.job_id, None)
+        hold.stop.set()
+        thread = hold.thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        if removed is not None:
+            log.warning("[cluster-hold] %s: RELEASED cluster reservation %s — normal service "
+                        "resumes", self.host, hold.job_id[:8])
 
     def _refuse_blind_gpu(self) -> bool:
         """True iff this is a GPU worker whose container cannot use the GPU
-        (``torch.cuda.is_available()`` is False) — the box-c post-recreate race
+        (``torch.cuda.is_available()`` is False) — the post-recreate race
         where the HOST GPU is healthy but the device cgroup was not injected.
 
         Such a worker MUST NOT claim GPU jobs: it would fast-fail every one with
         ``cudaErrorNoDevice`` ~1 s after claiming — a silent black hole that
-        poisons every run a lane fans onto it (seen on box-a2: ~70 min
-        GPU-blind, every ``remove_fence`` lane it drew failed while sibling lanes
-        on healthy hosts completed). ``run_forever`` calls this right after the
+        poisons every run a lane fans onto it (a GPU-blind box can fail
+        every lane it draws for an hour while sibling lanes on healthy hosts complete). ``run_forever`` calls this right after the
         park-gate and exits BEFORE ``heartbeat.start`` when it's True, so the
         worker also ages out of the capacity gauge. Recovery is a worker restart,
         which re-probes. cpu/ingest workers never probe and never refuse."""
@@ -3446,18 +4926,18 @@ class ClaimWorker:
         if not get_config().gpu_requires_local_device:
             # REMOTE/THIN gpu worker: its gpu nodes are HTTP calls to an external
             # inference server (never torch.cuda), so it legitimately has no local
-            # device and the box-c-blind guard does not apply. Never refuse.
+            # device and the GPU-blind guard does not apply. Never refuse.
             return False
         usable = _probe_gpu_usable()
         if usable is None or usable:
             # None ⇒ can't judge (no torch — NOT the blind condition); True ⇒ the
             # GPU is fine. Either way, don't refuse. Only a definitive False (torch
-            # present but no usable device) is the box-c-blind black hole.
+            # present but no usable device) is the GPU-blind black hole.
             return False
         log.error(
             "[claim-worker:gpu] host=%s: torch.cuda is unavailable in this "
             "container (the host GPU may be healthy but the device cgroup was "
-            "not injected — box-c recreate race). REFUSING to claim GPU jobs so "
+            "not injected — container recreate race). REFUSING to claim GPU jobs so "
             "this worker does not fast-fail every job it draws. Restart this "
             "worker to re-probe the GPU.",
             self.host,
@@ -3474,6 +4954,13 @@ class ClaimWorker:
             return
         fn = get_config().inference_server_start_fn
         if fn is None:
+            return
+        why = self._llm_starts_forbidden()
+        if why:
+            # A lane that restarts under a cluster reservation gets here BEFORE it re-claims
+            # the row its predecessor held; the box is not the broker's to serve from.
+            log.warning("[claim-worker:gpu] %s: NOT starting the inference server — %s",
+                        self.host, why)
             return
         try:
             fn()
@@ -3507,13 +4994,28 @@ class ClaimWorker:
 
         Resolution order, most specific first:
 
+        0. A CLUSTER RESERVATION (``node_queue.CLUSTER_SERVER_KIND``) holds the card for a
+           server the engine does not run: a slot of its own
+           (:data:`~queue_workflows.gpu_model_lease.CLUSTER_RESERVATION_SLOT`), neither the
+           LLM server's nor ComfyUI's, whatever else the row carries.
         1. ``required_model`` — a diffusion / ModelCache job IS its model.
         2. A SELF-MANAGING node (its module is registered in
            ``gpu_self_load_node_modules``): it puts its own thing on the card and
            wants no server at all, so it occupies a slot of its OWN
            (``__gpu__:<module>``).
-        3. Otherwise the box's SERVER-KIND slot — ComfyUI's when this worker
+        3. The JOB's own server kind: a row that names an LLM server
+           (``server_types`` / the claim's ``resolved_server``) is the LLM
+           server's occupant, whatever else the box can serve.
+        4. Otherwise the BOX's server-kind slot — ComfyUI's when this worker
            serves ComfyUI, else the ollama LLM server's.
+
+        Step 3 was missing and unified-memory GPU boxes exposed it: they serve ComfyUI (a configured
+        URL) AND the LLM lanes, which step 4 alone never anticipated. Every no-model
+        job there took the ComfyUI slot — ``system.vllm_lease`` and every LLM dispatch
+        included — so the panel showed "ComfyUI render" beside vLLM's real model and
+        warned of two residents while ComfyUI's queue was empty; worse, an LLM dispatch
+        and a real render then shared ONE slot and the lease granted both, putting two
+        models on one card.
 
         Step 2 is the one that was missing, and its absence was not cosmetic. A
         self-managing job fell through to :data:`LLM_SERVER_SLOT`, so it SHARED
@@ -3528,15 +5030,30 @@ class ClaimWorker:
         video-model-a render must not.
         """
         from queue_workflows.gpu_model_lease import (
-            COMFYUI_SERVER_SLOT, LLM_SERVER_SLOT, self_managed_slot,
+            CLUSTER_RESERVATION_SLOT, COMFYUI_SERVER_SLOT, LLM_SERVER_SLOT, self_managed_slot,
         )
+        if node_queue.is_cluster_reservation(job):
+            return CLUSTER_RESERVATION_SLOT
         required = job.get("required_model")
         if required:
             return required
         module = (job.get("node_module") or "").strip()
         if module and module in self._self_managing_modules():
             return self_managed_slot(module)
+        if self._job_serves_llm(job):
+            return LLM_SERVER_SLOT
         return COMFYUI_SERVER_SLOT if self._box_serves_comfyui() else LLM_SERVER_SLOT
+
+    @staticmethod
+    def _job_serves_llm(job: dict) -> bool:
+        """Does THIS row go to an LLM server? The kind the claim stamped
+        (``resolved_server``, 0023) if it has one, else the kinds it asked for
+        (``server_types``, 0022). Only the kinds the engine knows as LLM servers
+        count — an unrecognised one says nothing about the card."""
+        kinds = [str(job.get("resolved_server") or "").strip().lower()]
+        kinds += [str(k or "").strip().lower() for k in (job.get("server_types") or [])]
+        return any(k in (worker_control.SERVER_TYPE_OLLAMA, worker_control.SERVER_TYPE_VLLM)
+                   for k in kinds)
 
     def _self_managing_modules(self) -> frozenset[str]:
         """Modules that declare they manage their own GPU work.
@@ -3556,11 +5073,10 @@ class ClaimWorker:
         server's weights are not entitled to the card — unload them.
 
         The lease alone could not achieve this, because a resident model is not
-        the same thing as a held lease: ollama's keep-alive holds ~29 GB of
+        the same thing as a held lease: ollama's keep-alive holds its model's
         weights AFTER its job finished and its lease was released. So a Blender
-        render would acquire the box legitimately, and run alongside 29 GB it had
-        just been granted exclusive use of (operator: "why still
-        loaded ollama when render_blender is running?"). Exclusivity that only
+        render would acquire the box legitimately, and run alongside those weights on
+        the card it had just been granted exclusive use of. Exclusivity that only
         covers the bookkeeping and not the VRAM is not exclusivity.
 
         The same lever the park watchdog uses, for the same reason — the daemon
@@ -3644,14 +5160,67 @@ class ClaimWorker:
             except Exception:
                 log.exception("[claim-worker:gpu] spill re-queue failed for %s", job.get("id"))
             return False
-        # Granted: the box is ours, so whatever was denying us is gone. Clear the brake
-        # or a box that spilled once would stay slowed down after it got the card.
+        self._box_acquire_granted(model)
+        return True
+
+    def _box_acquire_granted(self, model: str) -> None:
+        """The bookkeeping every GRANTED box acquire does, whichever path asked for it.
+
+        Granted means the box is ours, so whatever was denying us is gone: clear the brake, or
+        a box that spilled once would stay slowed down after it got the card."""
         self._spill_streak = 0
         self._spill_pause_until = 0.0
         self._box_held_model = model
         self._box_active_jobs += 1     # hold the box for this job's whole lifetime
         self._release_llm_ram_unless_llm_owns_the_card(model)
-        return True
+
+    def _acquire_box_for_reservation(self, job: dict, hold: _ClusterHold) -> bool:
+        """Take the card for a CLUSTER RESERVATION — WAITING for the occupant its own hold is
+        clearing, instead of spilling behind it.
+
+        THE FLAP. The lease was held by the resident
+        ``chat-model-a:latest``, so the reservation was DENIED, spilled, and ended its hold —
+        ``normal service resumes`` — which re-opened the box to LLM claims. It then re-claimed
+        and repeated: HOLDING/RELEASED cycles every few seconds, the spill brake backing off 1 s →
+        30 s, while the card never actually changed hands.
+
+        The reservation is the decision that this box belongs to the cluster, and
+        the thing denying it is usually the very model the hold is unloading. So it ticks the
+        hold — that is what frees the card — and asks again, until
+        :data:`CLUSTER_RESERVATION_ACQUIRE_MAX_S`. Only something the hold CANNOT clear
+        (another project's render) is still there at the ceiling, and that is a real spill."""
+        model = self._effective_gpu_model(job)
+        deadline = self._spill_clock() + CLUSTER_RESERVATION_ACQUIRE_MAX_S
+        waited = False
+        while True:
+            lease = self._get_box_lease()
+            if lease is None or lease.acquire(model):
+                if waited:
+                    log.warning("[cluster-hold] %s: the card came free — the reservation has "
+                                "the box", self.host)
+                self._box_acquire_granted(model)
+                return True
+            if self._spill_clock() >= deadline:
+                held = None
+                try:
+                    held = lease.current().model
+                except Exception:                   # pragma: no cover - a probe that raises
+                    log.debug("[cluster-hold] %s: lease read failed", self.host, exc_info=True)
+                log.error(
+                    "[cluster-hold] %s: the card is STILL held by %r after %.0fs — the "
+                    "reservation gives the box back and spills; this is an occupant the hold "
+                    "cannot clear (another project's work), not the broker's own LLM.",
+                    self.host, held, CLUSTER_RESERVATION_ACQUIRE_MAX_S)
+                return False
+            if not waited:
+                waited = True
+                log.warning(
+                    "[cluster-hold] %s: the card is still occupied — WAITING for it (up to "
+                    "%.0fs) rather than handing the box back; the hold is what clears it.",
+                    self.host, CLUSTER_RESERVATION_ACQUIRE_MAX_S)
+            self._cluster_hold_tick(hold)
+            if hold.stop.wait(CLUSTER_RESERVATION_ACQUIRE_POLL_S):
+                return False                        # the hold ended under us
 
     def _box_job_done(self) -> None:
         """A job that held the box has finished — decrement the active count (floor 0).
@@ -3681,6 +5250,238 @@ class ClaimWorker:
             return bool(url) and llm_probe.comfyui_loaded(url)
         return getattr(self.model_cache, "current_model", None) == held
 
+    #: After shedding, how long before a still-dying box is shed again. Memory comes
+    #: back over seconds (a docker stop, a model unload); a second stop racing the
+    #: first helps nobody. The KILL floor ignores this.
+    SHED_COOLDOWN_S = 60.0
+
+    def _shed_llm_if_box_is_dying(self, available: int | None = None) -> bool:
+        """THE RULE: a box out of memory gives its LLM servers back and is
+        NEVER parked. Returns True when something was shed this call.
+
+        Two lines on MemAvailable: the danger floor (12 GB) sheds at most once per
+        :data:`SHED_COOLDOWN_S`; the kill floor (512 MB) sheds
+        at once, cooldown or not. Shedding is: stop the vLLM container whether it is
+        serving or still loading, unload every model ollama holds, and abandon a warm
+        in flight so the tick does not go on to probe for a server it just gave back.
+        The lane stays ON — the next start is planned against what is then free
+        (:meth:`_vllm_start_plan`), and every job that fits keeps flowing. Nothing here
+        writes worker_controls, and nothing may."""
+        from queue_workflows import llm_context, memory_sentinel
+
+        if available is None:
+            available = llm_context.mem_available_bytes()
+        if available is None:
+            return False                        # a KNOWN shortage only
+        available = int(available)
+        kill = available < memory_sentinel.kill_floor_bytes()
+        if not kill and available >= _danger_floor_bytes():
+            return False
+        now = time.monotonic()
+        last = self.__dict__.get("_shed_at")
+        if not kill and last is not None and now - last < self.SHED_COOLDOWN_S:
+            return False
+        self.__dict__["_shed_at"] = now
+        why = (f"{available / 2**30:.1f} GB available — "
+               + (f"under the {memory_sentinel.kill_floor_bytes() / 2**20:.0f} MB KILL floor"
+                  if kill else f"under the {_danger_floor_bytes() / 2**30:.0f} GB danger floor")
+               + "; the box keeps its lane and starts again sized to what is free")
+        log.error("[llm-memory] %s: SHEDDING the LLM servers%s — %s", self.host,
+                  " NOW" if kill else "", why)
+        shed = False
+        from queue_workflows import server_switch as _sw
+
+        if self._switch.state == _sw.WARMING:
+            started = self.__dict__.get("_warm_started_at")
+            cost = f"{(now - started) / 60.0:.1f} min into the load" if started else "mid-load"
+            self._switch.abandon(f"{why} ({cost})")
+            self.__dict__.pop("_vllm_decision", None)
+            self.__dict__.pop("_warm_started_at", None)
+            self._note_startup_loss(f"{why} — {cost}")
+        if self._stop_loading_vllm(why, what="serving or loading"):
+            shed = True
+        try:
+            from queue_workflows import llm_probe
+            from queue_workflows.llm_backends import factory as _llm_factory
+
+            base = _llm_factory.resolve_base_url("ollama")
+            names = sorted({str(m.get("name")) for m in (llm_probe.loaded_models_info(base) or [])
+                            if m.get("name")})
+            if names:
+                llm_probe.unload_ollama_models(base, names)
+                log.error("[llm-memory] %s: UNLOADED %s from ollama — %s", self.host,
+                          ", ".join(names), why)
+                shed = True
+        except Exception:
+            log.exception("[llm-memory] %s: could not unload ollama's models", self.host)
+        self._stop_gpu_outsiders_if_still_short()
+        return shed
+
+    def _stop_gpu_outsiders_if_still_short(self) -> list[str]:
+        """THE ESCALATION, in the order etiquette demands. The broker has just given
+        back its OWN servers; if the box is STILL below the danger floor, something else
+        is taking it down and "whose work is it" stops being the question — every GPU
+        container the allow-list does not name is stopped (:func:`rogue_llm.stop_gpu_outsiders`).
+
+        Presence on the box was never the offence — memory is: GPU work outside the
+        engine is stopped only by the RAM guard, never for merely existing. So this runs ONLY here, after our own memory went back and did not
+        save the box."""
+        from queue_workflows import llm_context, rogue_llm
+
+        available = llm_context.mem_available_bytes()
+        if available is None or int(available) >= _danger_floor_bytes():
+            return []
+        why = f"{int(available) / 2**30:.1f} GB available"
+        stopped = rogue_llm.stop_gpu_outsiders(host=self.host, why=why)
+        if stopped:
+            log.error("[llm-memory] %s: the box is STILL short (%s) after the broker gave "
+                      "back its own LLM servers — stopped the GPU work outside the "
+                      "allow-list: %s", self.host, why, ", ".join(stopped))
+        return stopped
+
+    #: A vLLM load can cost many minutes. A start KILLED mid-load is that
+    #: time wasted, and evidence: the box could not hold this server while everything
+    #: else was happening. Each loss raises the headroom the next start demands over the
+    #: bare need, so a retry that would only just fit waits instead of burning the time
+    #: again. Cleared the moment a start completes (its cache allocated) — the newer,
+    #: better evidence.
+    STARTUP_LOSS_HEADROOM = 0.25
+    STARTUP_LOSS_HEADROOM_MAX = 1.5
+
+    #: How long MemAvailable must cover a worthwhile vLLM before a memory hold lifts.
+    MEMORY_RECOVERY_S = 60.0
+    #: How often the need is recomputed (a catalog read); the comparison is per second.
+    MEMORY_NEED_TTL_S = 60.0
+
+    def _memory_tick(self, available: int | None) -> None:
+        """What the sentinel does with one reading, once a second: shed if the box is
+        dying, and notice when it has recovered."""
+        self._shed_llm_if_box_is_dying(available)
+        self._note_memory_recovery(available)
+
+    def _mark_warm_clock(self) -> None:
+        """When did the server now WARMING begin? Only so a kill can say what it cost —
+        "4.7 min into the load" is the number that tells an operator whether the guard
+        is saving time or wasting it."""
+        from queue_workflows import server_switch as _sw
+
+        if self._switch.state == _sw.WARMING:
+            self.__dict__.setdefault("_warm_started_at", time.monotonic())
+        else:
+            self.__dict__.pop("_warm_started_at", None)
+
+    def _vllm_startup_headroom(self) -> float:
+        """How much MORE than the bare need a start must see, given how many loads this
+        box has already lost mid-way. ``1.0`` with a clean history."""
+        losses = int(self.__dict__.get("_vllm_startup_losses") or 0)
+        return min(1.0 + self.STARTUP_LOSS_HEADROOM * losses, self.STARTUP_LOSS_HEADROOM_MAX)
+
+    def _note_startup_loss(self, why: str) -> None:
+        """A vLLM load was killed before it finished. Count it and say what it cost."""
+        losses = int(self.__dict__.get("_vllm_startup_losses") or 0) + 1
+        self.__dict__["_vllm_startup_losses"] = losses
+        self.__dict__.pop("_vllm_need_cache", None)
+        self.__dict__.pop("_vllm_decision", None)
+        log.error("[llm-memory] %s: that vLLM load is time wasted (%d lost start(s) since "
+                  "one last completed) — the next start needs %.0f%% more than the bare "
+                  "minimum before it is worth trying: %s", self.host, losses,
+                  (self._vllm_startup_headroom() - 1.0) * 100, why)
+
+    def _clear_startup_losses(self) -> None:
+        if self.__dict__.get("_vllm_startup_losses"):
+            log.info("[llm-memory] %s: a vLLM start completed — the lost-start history "
+                     "is cleared", self.host)
+        self.__dict__["_vllm_startup_losses"] = 0
+        self.__dict__.pop("_vllm_need_cache", None)
+
+    def _vllm_memory_need_bytes(self) -> int | None:
+        """What a vLLM WORTH STARTING needs on this box, plus the reserve: with the
+        remembered profile, weights + overhead + the minimum concurrency's worth of
+        cache (+ the plan's margin); without one, the minimum pool. ``None`` when the
+        box cannot say. Cached for :data:`MEMORY_NEED_TTL_S` — one catalog read a
+        minute, one comparison a second."""
+        from queue_workflows import llm_context, llm_context_lever
+
+        now = time.monotonic()
+        cached = self.__dict__.get("_vllm_need_cache")
+        if cached is not None and now - cached[0] < self.MEMORY_NEED_TTL_S:
+            return cached[1]
+        need: int | None = None
+        try:
+            total = llm_context.mem_total_bytes()
+            reserve = llm_context.reserve_bytes()
+            info = llm_context_lever.describe(worker_control.SERVER_TYPE_VLLM)
+            profile = self._vllm_remembered_profile(info) if info.exists else None
+            if total:
+                if profile is not None and profile.per_token_bytes > 0:
+                    window = (info.configured or self._vllm_model_max_context()
+                              or profile.window)
+                    per_seq = int(window) * profile.per_token_bytes
+                    wanted = max(1, _vllm_min_concurrency())
+                    need = int((profile.weights_bytes + profile.overhead_bytes
+                                + wanted * per_seq) * (1.0 + llm_context.VLLM_PLAN_MARGIN)) + reserve
+                else:
+                    need = int(_vllm_min_utilization() * int(total)) + reserve
+            if need is not None:
+                need = int(need * self._vllm_startup_headroom())
+        except Exception:
+            log.debug("[memory-sentinel] %s: could not compute the vLLM need", self.host,
+                      exc_info=True)
+        self.__dict__["_vllm_need_cache"] = (now, need)
+        return need
+
+    def _note_memory_recovery(self, available: int | None) -> None:
+        """THE RULE: if RAM frees for more than a minute and the box can switch from
+        ollama to vLLM, do it. A hold the plan placed over MEMORY is lifted
+        once MemAvailable has covered what a worthwhile vLLM needs for
+        :data:`MEMORY_RECOVERY_S` continuously; the demand logic then requests the
+        switch as it always does and the plan sizes the start to what is free. A dip
+        starts the count again. A hold for any other reason is left alone."""
+        from queue_workflows import llm_context
+
+        kind = worker_control.SERVER_TYPE_VLLM
+        reason = self._switch.quarantine_reason(kind)
+        if available is None or reason is None or llm_context.MEMORY_REFUSAL not in reason:
+            self.__dict__["_mem_ok_since"] = None
+            return
+        need = self._vllm_memory_need_bytes()
+        if need is None or int(available) < need:
+            self.__dict__["_mem_ok_since"] = None
+            return
+        now = time.monotonic()
+        since = self.__dict__.get("_mem_ok_since")
+        if since is None:
+            self.__dict__["_mem_ok_since"] = now
+            return
+        if now - since < self.MEMORY_RECOVERY_S:
+            return
+        self.__dict__["_mem_ok_since"] = None
+        log.warning("[memory-sentinel] %s: %.1f GB available for %.0f s — more than the "
+                    "%.1f GB a vLLM needs here; lifting the memory hold so the switch may "
+                    "ask for it again (%s)", self.host, int(available) / 2**30,
+                    self.MEMORY_RECOVERY_S, need / 2**30, reason[:120])
+        self._switch.clear_quarantine(kind)
+
+    def _arm_memory_sentinel(self) -> None:
+        """Start the 1 Hz memory sentinel (gpu lane only): every second, MemAvailable is
+        read and handed to :meth:`_memory_tick` — shed if dying, recover if it can.
+        Env-gated; never breaks worker startup."""
+        from queue_workflows import llm_context, memory_sentinel
+
+        if memory_sentinel.disabled():
+            log.info("[memory-sentinel] %s: disabled (%s)", self.host, memory_sentinel.DISABLE_ENV)
+            return
+        try:
+            self._memory_sentinel = memory_sentinel.MemorySentinel(
+                read_fn=llm_context.mem_available_bytes,
+                act_fn=self._memory_tick, label=self.host).start()
+            log.info("[memory-sentinel] %s: watching MemAvailable every %.0fs — danger "
+                     "floor %.0f GB, kill floor %.0f MB", self.host,
+                     memory_sentinel.INTERVAL_S, _danger_floor_bytes() / 2**30,
+                     memory_sentinel.kill_floor_bytes() / 2**20)
+        except Exception:
+            log.exception("[memory-sentinel] %s: could not start (ignored)", self.host)
+
     def _box_lease_tick(self) -> None:
         """Heartbeat hook (gpu only): refresh the box's observed LLM state for the
         0022 affinity sort, then keep holding the box lease while our model is
@@ -3688,10 +5489,28 @@ class ClaimWorker:
         for a peer's model only when this one is actually gone. Best-effort."""
         # Piggy-backed on the existing gpu heartbeat hook rather than adding a second
         # daemon: both want the same ~10 s cadence and the same residency probe.
+        try:
+            # ONE LLM DAEMON PER BOX, enforced where a second one can be SEEN — the
+            # docker socket — and before the residency probe below looks, so it sees a
+            # box already cleaned. A no-socket box answers instantly (see rogue_llm).
+            from queue_workflows import rogue_llm
+            rogue_llm.sweep(host=self.host)
+        except Exception:
+            log.debug("[rogue-llm] %s: sweep failed (ignored)", self.host, exc_info=True)
         self._refresh_box_llm_state()
+        # The sentinel does this every second; the tick repeats it so a box whose
+        # sentinel is disabled (or not yet armed) still sheds within ~10 s.
+        self._shed_llm_if_box_is_dying()
         self._drive_server_switch()
+        try:
+            # 0028: only once the switch above has settled — a box already out of
+            # service must not be asked to go out of service for a window as well.
+            self._maybe_request_context_switch()
+        except Exception:
+            log.exception("[llm-context] %s: context-switch check failed (ignored)",
+                          self.host)
         if self._switch.blocks_claims():
-            # ROUND-3 AUDIT, HIGH: while a switch is in flight the box lease belongs
+            # While a switch is in flight the box lease belongs
             # to the SWITCH (SWITCH_SLOT, acquired in _drive_server_switch). This
             # method's held-model renew ran one line later and — renew() being
             # acquire() on the single-slot store — CLOBBERED it, so peers were
@@ -3773,14 +5592,20 @@ class ClaimWorker:
                 # of service until vLLM actually answers.
                 if not self._box_has_vllm_endpoint():
                     return          # capability gate: no distinct vLLM URL, no chase
-                self.request_server_switch("vllm")
+                # R4 (0028): it is being started anyway, so start it at the window the
+                # queue needs — else a sized job waits out this cold start and then a
+                # second one for the resize. None ⇒ its configured default, as before.
+                self.request_server_switch("vllm", self._queued_context_for("vllm"))
 
             def _pending_vllm() -> int:
-                """Jobs queued for vLLM that THIS box could serve. The same threshold
-                the dispatch-time amortisation gate uses, so "is a cold start worth
-                it?" has one answer wherever it is asked."""
+                """Jobs queued for vLLM that THIS box could serve — by its placement too:
+                a row pinned to another box, or avoiding this one, can never run here and
+                must not start a server here. The same threshold the dispatch-time
+                amortisation gate uses, so "is a cold start worth it?" has one answer
+                wherever it is asked."""
                 from queue_workflows import node_queue as _nq
-                return _nq.count_pending_for_server(None, "vllm", any_model=True)
+                return _nq.count_pending_for_server(None, "vllm", any_model=True,
+                                                    box=self._physical_box())
 
             self._vllm_idle_stopper = llm_idle_unload.VLLMIdleStopper(
                 active_fn=self._gpu_active_count,
@@ -3789,21 +5614,24 @@ class ClaimWorker:
                 stop_fn=_stop_vllm,
                 # The START half. Without it the stopper is a one-way door: stopped
                 # ⇒ unadvertised ⇒ no job can prefer it ⇒ never used ⇒ stays stopped.
-                # Observed live — vLLM sat exited with 0 requests while 2403 jobs
-                # preferring it queued behind ollama.
+                # Without it vLLM can sit exited with 0 requests while thousands of jobs
+                # preferring it queue behind ollama.
                 start_fn=_start_vllm,
                 pending_fn=_pending_vllm,
-                min_queue=_llm_factory.resolve_cold_start_min_queue(),
+                # THE RESOLVER, not its value: the topology file's vllm_min_queue is
+                # operator policy documented to need no restart, and reading it once
+                # here froze a box under a threshold the operator had already lowered
+                # (a queued vLLM job could sit unassignable for hours).
+                min_queue=_llm_factory.resolve_cold_start_min_queue,
                 label=self.host,
                 # PARK RELEASES THE CARD: a worker whose control
                 # row has gone OFF (drain pending, or racing its own hard stop)
                 # must not ignite a multi-minute vLLM start the parked box can
-                # never use. Fail-open inside the stopper: a control-plane blip
-                # degrades to the pre-gate behaviour.
-                may_start_fn=lambda: (
-                    worker_control.desired_state_for(self.host, self.queue)
-                    != worker_control.STATE_OFF
-                ),
+                # never use — nor may a box HELD for a cluster reservation, or one a
+                # reservation is queued for. One rule for every start path
+                # (_llm_starts_forbidden), failing open on an unreadable read: a
+                # control-plane blip degrades to the pre-gate behaviour.
+                may_start_fn=lambda: self._llm_starts_forbidden() is None,
             )
             self._vllm_idle_stopper.ensure_started()
         except Exception:
@@ -3818,8 +5646,19 @@ class ClaimWorker:
         stay out of service forever."""
         from queue_workflows import server_switch as _sw
         if self._switch.state == _sw.IDLE:
+            self._mark_warm_clock()          # an abandoned warm leaves no clock running
             return
-        # HOLD THE BOX for the whole switch (analysis #1, cross-process half). The
+        # A BOX THAT MUST START NOTHING ENDS ITS SWITCH — parked, held for a cluster
+        # reservation, or one queued for it (_llm_starts_forbidden). First, before this tick
+        # re-acquires the switch's box lease or, WARMING, re-issues START on its 30 s retry:
+        # that retry, ticked by the heartbeat a drain-park keeps, is how a PARKED box
+        # could start its vLLM again.
+        why = self._llm_starts_forbidden()
+        if why:
+            self._abandon_switch(why)
+            self._mark_warm_clock()
+            return
+        # HOLD THE BOX for the whole switch (the cross-process half). The
         # switch state is per-process, but the VRAM it protects is per-BOX — and the
         # flock box lease is the one primitive every project on the box already
         # honours. Holding a DISTINCT sentinel means every peer worker asking for
@@ -3834,20 +5673,38 @@ class ClaimWorker:
         except Exception:
             log.debug("[server-switch] %s: box-lease hold failed (per-process "
                       "guarantee only this tick)", self.host, exc_info=True)
+        if self._abandon_warm_if_box_is_dying():
+            return
+        self._mark_warm_clock()
         try:
             from queue_workflows import llm_probe, server_switch
             from queue_workflows.llm_backends import factory as _f
 
             target = self._switch.target
+            target_context = self._switch.target_context
+            resize = self._switch.resize
             ollama_url = _f.resolve_base_url("ollama")
             vllm_url = _f.resolve_base_url("vllm")
-            # "outgoing" is whatever is NOT the target.
-            if target == "vllm":
+            # "outgoing" is whatever is NOT the target — and on a RESIZE there is no
+            # outgoing server at all: the lever replaces the one being resized.
+            if resize:
+                outgoing_loaded = False
+                # ANSWERING and serving the window. A container configured for it that
+                # never came up is the failure this switch has to survive, so the
+                # configured value alone must never read as ready.
+                incoming_ready = (
+                    llm_probe.probe_llm_servers(_f.resolve_base_url(target)) == [target]
+                    and self._serves_window(target, target_context))
+            elif target == "vllm":
                 outgoing_loaded = bool(llm_probe.loaded_models(ollama_url))
-                incoming_ready = llm_probe.probe_llm_servers(vllm_url) == [llm_probe.VLLM]
+                incoming_ready = (
+                    llm_probe.probe_llm_servers(vllm_url) == [llm_probe.VLLM]
+                    and self._serves_window(target, target_context))
             else:
                 outgoing_loaded = bool(llm_probe.vllm_served_models(vllm_url))
-                incoming_ready = llm_probe.probe_llm_servers(ollama_url) == [llm_probe.OLLAMA]
+                incoming_ready = (
+                    llm_probe.probe_llm_servers(ollama_url) == [llm_probe.OLLAMA]
+                    and self._serves_window(target, target_context))
 
             actions = self._switch.tick(
                 in_flight=self._gpu_active_count(),
@@ -3873,16 +5730,63 @@ class ClaimWorker:
                         if stop is not None:
                             stop()
                 elif action == server_switch.START_INCOMING:
+                    if self._cluster_hold_reason() is not None:
+                        # A reservation was claimed between this tick's check and its
+                        # action (the pool lane runs beside the heartbeat): the start it
+                        # asks for is exactly the one the hold forbids.
+                        self._abandon_switch("the box was HELD for a cluster reservation "
+                                             "mid-tick")
+                        break
                     # THE SEAM. Whatever the lever tells us goes straight back into the
                     # machine, in THIS tick — a definitive failure (no such container,
                     # an OCI error, no lever at all) then ends the out-of-service window
                     # now instead of at the warm timeout 1800 s later. A lever that
                     # returns None says nothing, which is UNKNOWN and behaves exactly as
                     # before, so an un-upgraded host is unaffected.
-                    if target == "vllm":
+                    plan = self._vllm_start_decision() if target == "vllm" else None
+                    utilization = plan.utilization if plan is not None else None
+                    max_seqs = plan.max_num_seqs if plan is not None else None
+                    refusal = plan.refusal if plan is not None else None
+                    if refusal is not None:
+                        # THE MEMORY GATE. No start into memory the box does not have:
+                        # a vLLM pool is taken at start, and on a unified-memory box it
+                        # is taken from the same RAM the OS and every other container
+                        # live in. The switch is told the start CANNOT succeed, so it
+                        # aborts now and quarantines vLLM here instead of warming for
+                        # half an hour — and the demand goes to a box that can.
+                        log.error("[llm-memory] %s: NOT starting vLLM — %s",
+                                  self.host, refusal)
+                        # A vLLM ALREADY LOADING into that memory is the very thing the
+                        # verdict says cannot fit — a start issued before the verdict (an
+                        # earlier engine, a hand start). Otherwise the refusal aborts
+                        # the switch and leaves one loading toward the pool it had just
+                        # refused, with ollama's model beside it. A vLLM that is SERVING
+                        # never reaches this branch — the switch completes on it instead.
+                        self._stop_loading_vllm(refusal)
+                        outcome: Any = server_switch.StartOutcome.permanent(refusal)
+                        followups.extend(self._switch.report_start_outcome(outcome))
+                    elif target_context is not None or utilization is not None:
+                        # THE WINDOW (0028), the POOL and the CONCURRENCY (a plan that
+                        # names a concurrency always names the pool) are set by recreating the
+                        # server's container with the values it reads at start — which
+                        # also STARTS it, so this replaces the plain start lever rather
+                        # than following it. Used for a resize, for a kind switch that
+                        # named a window, and for a vLLM whose operator pool would not
+                        # fit in what the box has free; an ollama target with no window
+                        # needs nothing at all.
+                        from queue_workflows import llm_context_lever
+                        try:
+                            outcome = llm_context_lever.set_context(
+                                target, target_context, utilization=utilization,
+                                max_num_seqs=max_seqs)
+                        except Exception as exc:
+                            outcome = server_switch.StartOutcome.transient(
+                                f"{type(exc).__name__}: {exc}")
+                        followups.extend(self._switch.report_start_outcome(outcome))
+                    elif target == "vllm":
                         start = get_config().vllm_start_fn
                         if start is None:
-                            outcome: Any = server_switch.StartOutcome.permanent(
+                            outcome = server_switch.StartOutcome.permanent(
                                 "no vllm start lever wired "
                                 "(set_vllm_lifecycle(stop_fn, start_fn))")
                         else:
@@ -3905,21 +5809,148 @@ class ClaimWorker:
                 except Exception:
                     log.debug("[server-switch] %s: box-lease release failed "
                               "(TTL will expire it)", self.host, exc_info=True)
+            if (resize and not incoming_ready
+                    and server_switch.ABORT in list(actions) + followups):
+                # A GIVEN-UP RESIZE THAT LEFT NOTHING SERVING. The container was
+                # recreated for a window its server could not honour (vLLM refuses a
+                # max_model_len past the model's own and exits; ollama can fail to load
+                # at all), so aborting alone would leave the box with NO LLM until an
+                # operator noticed. Put the operator's own value back — the one
+                # configuration this box is known to be able to run.
+                self._restore_llm_context(target)
         except Exception:
             log.exception("[server-switch] %s: tick failed (will retry)", self.host)
+        finally:
+            # AFTER the transitions: the tick that ENTERS warming starts the clock, so a
+            # kill can say what the load had already cost.
+            self._mark_warm_clock()
 
-    def request_server_switch(self, target: str) -> bool:
-        """Ask this box to move to ``target``. Returns True iff a switch started."""
-        return self._switch.request(target)
+    def _serves_window(self, kind: str | None, target_context: int | None) -> bool:
+        """Is ``kind`` serving a window at least ``target_context`` wide? True when no
+        window was asked for — then only the server answering matters.
+
+        A window the box cannot READ reads as not-yet: a switch must not complete on an
+        assumption, because completing means resuming claims for jobs that need it."""
+        if not kind or target_context is None:
+            return True
+        current, _ceiling = self._llm_context_for_kind(kind)
+        return current is not None and int(current) >= int(target_context)
+
+    def _restore_llm_context(self, kind: str | None) -> None:
+        """Put ``kind``'s server back to the window the operator configured."""
+        if not kind:
+            return
+        from queue_workflows import llm_context_lever
+        try:
+            outcome = llm_context_lever.set_context(kind, None)
+        except Exception:
+            log.exception("[llm-context] %s: could not restore %s's own window",
+                          self.host, kind)
+            return
+        log.error(
+            "[llm-context] %s: the resize of %s failed and left it not answering — "
+            "restored the configured window (%s)", self.host, kind,
+            (outcome or {}).get("reason") or (outcome or {}).get("status"),
+        )
+
+    def request_server_switch(self, target: str, context_length: int | None = None,
+                              *, resize: bool = False) -> bool:
+        """Ask this box to move to ``target``. Returns True iff a switch started.
+
+        ``context_length`` is the window the incoming server should be STARTED at
+        (0028); ``resize=True`` keeps the kind and changes only that window.
+
+        Refused while this box must start nothing (:meth:`_llm_starts_forbidden`): parked,
+        held for a cluster reservation, or one is queued for it."""
+        why = self._llm_starts_forbidden()
+        if why:
+            log.info("[server-switch] %s: NOT %s %s — %s", self.host,
+                     "resizing" if resize else "switching to", target, why)
+            return False
+        return self._switch.request(target, context_length, resize=resize)
+
+    def _maybe_request_context_switch(self) -> bool:
+        """Open a RESIZE when the queue needs a window this box could serve but does
+        not. Runs on the heartbeat tick; returns True iff a switch started.
+
+        Every condition here is a way of NOT restarting a healthy server: the box must
+        have a lever, its last resize must not have failed, the kill switch must be off,
+        no switch may be in flight, and the demand read
+        (:func:`node_queue.context_switch_need`) must say this box is the one that
+        should grow — nobody is serving that window, the job has waited, and of the
+        boxes that could reach it this is the tightest fit."""
+        from queue_workflows import llm_context, llm_context_lever, server_switch as _sw
+
+        if self.queue != "gpu" or self._switch.state != _sw.IDLE:
+            return False
+        if llm_context_lever.disabled():
+            return False
+        serving, ceiling = getattr(self, "_llm_context_state", (None, None))
+        if ceiling is None or (serving is not None and int(ceiling) <= int(serving)):
+            return False
+        # The kind to resize: the one whose ceiling this is. With two kinds co-resident
+        # (rare — the switch exists to keep it to one) the roomier one is the one the
+        # ceiling was advertised from.
+        kinds = [k for k in self._served_llm_types() if k]
+        kind = max(kinds, key=lambda k: self._ctx_ceiling_by_kind.get(k, 0),
+                   default=None)
+        if not kind or not llm_context_lever.available(kind):
+            return False
+        if self._switch.resize_quarantined(kind):
+            return False
+        if self._llm_starts_forbidden():
+            return False                # a resize restarts a server; this box starts none
+        try:
+            need = node_queue.context_switch_need(
+                host=self.host, serving=serving, ceiling=ceiling,
+                box=self._physical_box(), min_age_s=CONTEXT_SWITCH_MIN_AGE_S,
+            )
+        except Exception:
+            log.exception("[llm-context] %s: demand read failed (no switch)", self.host)
+            return False
+        target = llm_context.switch_target([need], current=serving, ceiling=ceiling)
+        if not target:
+            return False
+        log.warning(
+            "[llm-context] %s: queued work needs a %s-token window and this box serves "
+            "%s — resizing %s (it goes out of service until the server answers there)",
+            self.host, need, serving, kind,
+        )
+        return self.request_server_switch(kind, target, resize=True)
+
+    def _queued_context_for(self, kind: str) -> int | None:
+        """The window to START ``kind`` at: the highest queued need this box could
+        reach on it, or ``None`` for "whatever it is configured for" — the operator's
+        default, which is what an un-sized queue should get (R4).
+
+        Its ceiling comes from the last time that kind was observed serving here: a
+        stopped server reports nothing, and guessing would risk starting it at a window
+        it cannot honour."""
+        from queue_workflows import llm_context, llm_context_lever
+
+        if llm_context_lever.disabled() or not llm_context_lever.available(kind):
+            return None
+        ceiling = self._ctx_ceiling_by_kind.get(kind)
+        if not ceiling:
+            return None
+        try:
+            need = node_queue.context_switch_need(
+                host=self.host, serving=None, ceiling=ceiling,
+                box=self._physical_box(), min_age_s=0.0, elect=False,
+            )
+        except Exception:
+            log.exception("[llm-context] %s: demand read failed (default window)",
+                          self.host)
+            return None
+        return llm_context.switch_target([need], current=None, ceiling=ceiling)
 
     def _handover_to_vllm(self) -> bool:
         """Hand the box OVER to vLLM: unload ollama FIRST, then start. Returns True
         iff a start was issued.
 
         ONE SERVER AT A TIME. Two servers each hold their own full copy of the
-        weights (~34 GB each here), so starting vLLM while ollama was still resident
-        took the box to ~118/121 GB — about 3 GB from OOM on a box that has already
-        died of OOM once. The start is therefore a HANDOVER, not an addition: free
+        weights, so starting vLLM while ollama is still resident can take a
+        unified-memory box to within a few GB of OOM. The start is therefore a HANDOVER, not an addition: free
         the outgoing server before the incoming one allocates, in that order, every
         time.
 
@@ -4069,7 +6100,7 @@ class ClaimWorker:
         # GPU only: arm the LLM-backend factory's config-change LISTEN invalidator
         # so an operator's ollama↔vllm / tunable edit (worker_controls, 0013) is
         # picked up instantly by the co-tenant VLM backend. Cheap, isolated, and
-        # env-gated (AI_LEADS_DISABLE_LLM_CONFIG_LISTENER) so it's inert in tests.
+        # env-gated (QUEUE_WORKFLOWS_DISABLE_LLM_CONFIG_LISTENER) so it's inert in tests.
         # Wrapped because the LLM backend is an OPTIONAL subsystem (a host may run
         # no VLM at all) — its arming must never take down the claim worker.
         if self.queue == "gpu":
@@ -4081,10 +6112,11 @@ class ClaimWorker:
                     "[claim-worker:gpu] LLM backend factory start failed (ignored)"
                 )
             self._arm_llm_idle_reaper()
+            self._arm_memory_sentinel()
             self._arm_model_residency_enforcer()
         # Operator control watcher: HARD-stop this worker the instant it's turned
         # OFF (re-queue in-flight + os._exit to free RAM; the supervisor restart
-        # re-enters the park gate above). Honours AI_LEADS_DISABLE_WORKER_CONTROL.
+        # re-enters the park gate above). Honours QUEUE_WORKFLOWS_DISABLE_WORKER_CONTROL.
         self._control_watcher = worker_control.WorkerControlWatcher(worker=self)
         self._control_watcher.start()
         # GPU VLM pool lane (NEW, additive): start the PAR-sized executor + feeder

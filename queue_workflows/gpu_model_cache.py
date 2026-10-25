@@ -84,8 +84,8 @@ def _box_load_gate(model_id: str) -> None:
     #
     # `ModelSpec.served_by` marks ids an ollama/vLLM serves (the sentinel specs a project
     # registers for its LLM tags: their "loader" returns the id and puts nothing in VRAM).
-    # Running the clear-then-load gate for one is actively harmful in two ways, both measured
-    # on a live fleet:
+    # Running the clear-then-load gate for one is actively harmful in two ways, both observed
+    # in practice:
     #
     #   1. It EVICTS the very server-resident copy the node is about to call. The node then
     #      dials ollama for a model this gate just unloaded — the "one flag, two meanings"
@@ -97,7 +97,7 @@ def _box_load_gate(model_id: str) -> None:
     #        MODEL LOAD BLOCKED on box-c-gpu: cleared the box for 'chat-expert-a' (inprocess)
     #        but chat-expert-a:latest[ollama] is STILL resident after eviction
     #
-    # 482 `chat-model-a:latest` failures on that fleet share this shape. The residency comparison
+    # Every such failure shares this shape. The residency comparison
     # is canonicalised below as defence in depth, but the real fix is not entering the gate:
     # nothing is about to occupy VRAM here, so there is no second model to prevent.
     _spec = model_registry.MODELS.get(model_id)
@@ -169,7 +169,7 @@ def _publish_current_model(model_id: str | None) -> None:
     loaded. Called by ``ModelCache.require_model`` — once with ``None``
     mid-swap, then with the new model_id after the loader returns.
 
-    No-op when ``AI_LEADS_DISABLE_WORKER_HEARTBEAT`` is set (tests).
+    No-op when ``QUEUE_WORKFLOWS_DISABLE_WORKER_HEARTBEAT`` is set (tests).
     ``current_model`` is GPU-only by design, and the GPU cache is only ever
     constructed by a gpu-queue worker, so this always upserts the ``gpu``
     row. Failures are swallowed: a transient DB blip should not crash a
