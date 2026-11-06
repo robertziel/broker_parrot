@@ -1,0 +1,4 @@
+# Paths that exist only on a private development branch; the release step (strip_local.py)
+# removes them from the public tree (fnmatch globs, one per line, relative to the repo root).
+scripts/release/private_terms.txt
+worklog/*.local.md
