@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] — 2026-11-06
+
+### Added
+- **CI.** A `Jenkinsfile` plus `scripts/ci/test.sh` run the whole suite on SQLite and on a throwaway Postgres
+  container (`scripts/ci/test.sh sqlite|pg|all`; Docker only, checkout mounted read-only, the database on tmpfs
+  with fsync off, every container removed on any exit) and report one `jenkins/ci` commit status. The repo is
+  read from the origin remote; nothing deployment-specific is committed.
+- **Release tooling.** `scripts/release/strip_local.py` removes local-only blocks (whole-line marker pairs) and
+  `.publish-ignore` paths from a working tree before a public release commit, never writing through a symlink;
+  `tests/test_publish_markers.py` keeps the markers balanced and alone on their lines. Development tooling only,
+  with no change to the `queue_workflows` package or its schema.
+
 ## [1.5.0] — 2026-10-26
 
 ### Breaking

@@ -8,7 +8,7 @@ build-backend = "hatchling.build"
 # not by index name, and one consumer's wheel build globs `queue_workflows-*.whl`,
 # so renaming the dist would break it for zero benefit.
 name = "queue_workflows"
-version = "1.5.0"
+version = "1.6.0"
 description = "broker_parrot — a self-hosted job fleet on the database you already run (Postgres or SQLite): DAG workflows, SKIP LOCKED claims, lease-based crash recovery, GPU warm-model routing, LLM server management. Import package `queue_workflows`."
 readme = "README.md"
 requires-python = ">=3.10"
