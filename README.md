@@ -354,6 +354,7 @@ QUEUE_WORKFLOWS_TEST_DB_URL=postgresql://user:pw@host:port/queue_workflows_test 
 ```
 
 The Postgres suite forces a `*_test` database name (suffixing `_test` if the DSN lacks it) and creates it if missing.
+The suite runs on all CPU cores by default (`-n auto`, pytest-xdist): each worker uses its own database (`<name>_gw0_test`, …) or SQLite file. `-n 0` runs serially.
 
 ---
 

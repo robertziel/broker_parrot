@@ -23,6 +23,9 @@ pip install -e '.[test]'        # add [metrics] for the psutil-based hw_metrics 
 QUEUE_WORKFLOWS_TEST_DB_URL=postgresql://user:pw@host:port/queue_workflows_test python -m pytest
 #   (falls back to QUEUE_WORKFLOWS_DB_URL with its db-name suffixed _test if the above is unset)
 #   QUEUE_WORKFLOWS_TEST_SQLITE=1 runs the whole suite hermetically on SQLite (no server).
+#   Runs on ALL CPU cores by default (pyproject addopts `-n auto`, pytest-xdist): each worker gets its own
+#   <name>_gwN_test DB / SQLite file. `-n 0` = serial (pdb, one quick test).
+#   scripts/ci/test.sh sqlite|pg|all = the CI gates in docker (one worker per usable CPU; CI_PYTEST_WORKERS=N, 0 = serial).
 
 python -m pytest tests/test_node_queue.py            # one module
 python -m pytest tests/test_node_queue.py::test_name # one test

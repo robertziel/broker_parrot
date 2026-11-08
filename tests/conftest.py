@@ -34,6 +34,25 @@ os.environ.setdefault("QUEUE_WORKFLOWS_DISABLE_LLM_CONFIG_LISTENER", "1")
 # The env var the engine reads its DSN from, for THIS test session.
 _TEST_DB_ENV = "QUEUE_WORKFLOWS_TEST_DB_URL"
 
+# pytest-xdist: each worker process (gw0, gw1, …) gets its OWN database / SQLite
+# file, so the per-test TRUNCATE, the migration round-trips and every
+# LISTEN/NOTIFY channel stay private to one worker. "" when not under xdist.
+XDIST_WORKER = os.environ.get("PYTEST_XDIST_WORKER", "")
+
+
+def _per_worker_db_url(url: str) -> str:
+    """``…/<name>_test`` → ``…/<name>_<worker>_test`` under xdist (the name still
+    ends in ``_test``, so every refuse-a-non-test-DB guard keeps holding);
+    unchanged in a serial run."""
+    if not XDIST_WORKER:
+        return url
+    parsed = urllib.parse.urlparse(url)
+    name = parsed.path.lstrip("/")
+    if not name.endswith("_test"):
+        raise RuntimeError(f"refusing a non-_test DB for the test suite: {name!r}")
+    name = f"{name[: -len('_test')]}_{XDIST_WORKER}_test"
+    return urllib.parse.urlunparse(parsed._replace(path="/" + name))
+
 
 def _resolve_test_db_url() -> str:
     """Resolve the test DSN: ``QUEUE_WORKFLOWS_TEST_DB_URL`` verbatim, else
@@ -41,7 +60,9 @@ def _resolve_test_db_url() -> str:
     suite if neither is set (Postgres is required)."""
     raw = os.environ.get(_TEST_DB_ENV)
     if raw:
-        return raw
+        url = _per_worker_db_url(raw)
+        os.environ[_TEST_DB_ENV] = url
+        return url
     base = os.environ.get("QUEUE_WORKFLOWS_DB_URL")
     if not base:
         pytest.skip(
@@ -52,7 +73,7 @@ def _resolve_test_db_url() -> str:
     db_name = parsed.path.lstrip("/")
     if not db_name.endswith("_test"):
         parsed = parsed._replace(path="/" + db_name + "_test")
-    url = urllib.parse.urlunparse(parsed)
+    url = _per_worker_db_url(urllib.parse.urlunparse(parsed))
     os.environ[_TEST_DB_ENV] = url
     return url
 
