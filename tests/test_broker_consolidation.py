@@ -124,7 +124,9 @@ def test_concurrent_bootstrap_on_shared_broker_is_safe():
     raced from scratch by N threads (so it never touches the shared test DB)."""
     parsed = urllib.parse.urlparse(db.db_url())
     maint = urllib.parse.urlunparse(parsed._replace(path="/postgres"))
-    fresh = "qw_concurrent_boot_test"
+    # per xdist worker: two workers racing DROP/CREATE on one name would collide
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "")
+    fresh = f"qw_concurrent_boot_{worker}_test" if worker else "qw_concurrent_boot_test"
     import psycopg
     with psycopg.connect(maint, autocommit=True) as c:
         c.execute(f"DROP DATABASE IF EXISTS {fresh}")

@@ -26,17 +26,31 @@ pipeline {
         checkout scm
         script {
           env.GIT_SHA = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
-          env.GH_REPO = sh(returnStdout: true, script: '''
+          def remoteRepo = sh(returnStdout: true, script: '''
             url=$(git config --get remote.origin.url)
             repo=$(printf '%s' "$url" | sed -nE 's#^(https://|git@|ssh://git@)github\\.com[:/]([^/]+/[^/]+)$#\\2#p' | sed 's#\\.git$##')
             [ -n "$repo" ] || { echo "origin $url is not a GitHub repo — nowhere to post the status" >&2; exit 1; }
             printf '%s' "$repo"
           ''').trim()
+          // The remote may name the repo by a pre-rename name: git follows GitHub's redirect, but a status POST to the
+          // old name gets HTTP 307. Ask GitHub for the repo's CURRENT full_name (GET follows the redirect) and post there.
+          withCredentials([string(credentialsId: 'github-pat', variable: 'GH_TOKEN')]) {
+            env.GH_REPO = sh(returnStdout: true, script: """
+              set +x
+              name=\$(curl -sSfL -H "Authorization: Bearer \$GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${remoteRepo}" | sed -nE 's#^  \"full_name\": \"([^\"]+)\",\$#\\1#p')
+              [ -n "\$name" ] || { echo "GitHub did not resolve repo ${remoteRepo} — check credential github-pat" >&2; exit 1; }
+              printf '%s' "\$name"
+            """).trim()
+          }
           echo "Building ${env.GH_REPO}@${env.GIT_SHA}"
         }
         notifyGitHub('pending', 'SQLite + Postgres suites running')
       }
     }
+
+    // the suite image (deps cached by a pyproject hash) once, so the two parallel gates reuse it instead of racing to build it
+    stage('Suite image') { steps { sh 'scripts/ci/test.sh image' } }
 
     stage('Gates') {
       parallel {

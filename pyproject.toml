@@ -33,7 +33,7 @@ dependencies = [
 [project.optional-dependencies]
 metrics = ["psutil"]               # hw_metrics CPU/RAM probe (GPU probe shells out, no dep)
 topology = ["PyYAML>=6"]           # per-box LLM topology YAML (config llm_topology_path); absent ⇒ env/default
-test = ["pytest", "pytest-cov", "PyYAML>=6"]
+test = ["pytest", "pytest-cov", "pytest-xdist", "PyYAML>=6"]
 
 [project.scripts]
 queue-claim-worker   = "queue_workflows.claim_worker:main"   # generic CLIs (used standalone / other projects)
@@ -50,3 +50,6 @@ packages = ["queue_workflows"]
 testpaths = ["tests"]
 # One distribution lives in this repo: the client (queue_workflows, at root).
 pythonpath = ["."]
+# every run uses all CPU cores by default (pytest-xdist, [test] extra); each worker gets its own
+# database / SQLite file (tests/conftest.py). `-n 0` runs serially, e.g. to use pdb.
+addopts = "-n auto"
